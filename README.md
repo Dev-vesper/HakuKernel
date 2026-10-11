@@ -33,8 +33,8 @@ BIOS (0x7C00)
   └─ boot/boot.asm (16-bit): save DL → single-track read to 0x10000
      → A20 (Linux-style: test after BIOS/KBC/fast methods) → GDT → CR0.PE=1
         └─ far jump to KERNEL_ENTRY (= PE entry point from link.exe)
-              └─ kernel/entry.asm (_entry stub) → call _kernel_main
-                    └─ kernel/kernel.c: VGA + COM1 output, then hlt loop
+              └─ kernel/entry.asm (_entry stub) → call kernel_main
+                    └─ kernel/kernel.c: console → idt_init → INT3 self-test → hlt
 ```
 
 Memory map:
@@ -45,6 +45,18 @@ Memory map:
 | `0x10000–0x12000` | kernel PE image (~2.5 KiB, linked `/BASE:0x10000 /ALIGN:16`) |
 | `0x90000` | kernel stack top (grows down) |
 | `0xB8000` | VGA text buffer |
+
+### Interrupts (IDT)
+
+`kernel/isr.asm` builds a uniform stack frame for all 256 vectors (dummy
+error code where the CPU pushes none) and calls into C. `kernel/idt.c`
+installs 32 exception gates (0–31), 16 IRQ gates (32–47, used once the
+8259 is remapped) and a catch-all for 48–255 that reports instead of
+triple-faulting. All gates are interrupt gates (`0x8E`), so handlers never
+nest. The boot proves the whole path with an `INT3` self-test: the serial
+log must show `EXC-03-BP` followed by `INT3-RESUMED`.
+
+Next: 8259 remap + PIT timer (ticks), then the PS/2 keyboard driver.
 
 ### Why `link.exe` + `tools/pe2bin.py`?
 
@@ -66,7 +78,11 @@ loop), and the COM1 init mirrors Linux `early_serial_init`.
 MyOS/
   boot/boot.asm        16-bit bootloader (disk → Linux-style A20 → GDT → protected mode)
   kernel/entry.asm     32-bit entry stub (_entry, linked first via /ENTRY)
-  kernel/kernel.c      the kernel: VGA driver, COM1 serial, halt loop
+  kernel/isr.asm       interrupt stubs: 32 exceptions + 16 IRQs + catch-all
+  kernel/cpu.h/cpu.c   types, port I/O, tiny libc (memset & friends, no CRT)
+  kernel/console.h/.c  VGA text + COM1 serial drivers
+  kernel/idt.h/idt.c   IDT gates, exception/IRQ dispatchers
+  kernel/kernel.c      kernel_main: console → IDT → INT3 self-test → halt
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       size/signature checks + floppy padding
   build.py             the whole build: cl/link/nasm/qemu orchestration
@@ -80,6 +96,12 @@ MyOS/
   `…\bin\Hostx64\x86\cl.exe` automatically, don't override it.
 - **unresolved external (e.g. `_memset`)** — a CRT helper leaked in; add it
   to `kernel.c` (or simplify the code that triggered it).
+- **NASM win32 drops all `global` symbols without `section .text`** — code
+  assembles fine but the .obj has no definitions (found by dumping symbols).
+  Every NASM-for-link file needs an explicit section directive.
+- **MSVC prepends `_`, NASM doesn't** — write bare names in C (`isr0`,
+  `idt_load`) to meet NASM's `_isr0`, `_idt_load`. Spelling `_isr0` in C
+  asks the linker for `__isr0`.
 - **QEMU triple-faults / reboots** — run `python build.py headless` and read
   `build/serial.log`; no `MYOS-BOOT-OK` means the kernel never started
   (check disk load / GDT / entry address).

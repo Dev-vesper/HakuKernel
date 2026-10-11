@@ -72,30 +72,38 @@ def main():
     log(f"NASM: {nasm}")
     log(f"CL:   {cl}")
 
-    kernel_c = os.path.join(ROOT, "kernel", "kernel.c")
-    entry_asm = os.path.join(ROOT, "kernel", "entry.asm")
+    kernel_dir = os.path.join(ROOT, "kernel")
+    c_files = sorted(glob.glob(os.path.join(kernel_dir, "*.c")))
+    if not c_files:
+        sys.exit("no kernel/*.c files found")
+    entry_asm = os.path.join(kernel_dir, "entry.asm")
+    isr_asm = os.path.join(kernel_dir, "isr.asm")
     boot_asm = os.path.join(ROOT, "boot", "boot.asm")
-    kernel_obj = os.path.join(BUILD, "kernel.obj")
     entry_obj = os.path.join(BUILD, "entry.obj")
+    isr_obj = os.path.join(BUILD, "isr.obj")
     kernel_pe = os.path.join(BUILD, "kernel.pe")
     kernel_bin = os.path.join(BUILD, "kernel.bin")
     boot_bin = os.path.join(BUILD, "boot.bin")
     img = os.path.join(ROOT, "myos.img")
 
-    # 1. kernel C -> COFF
-    run([cl, "/nologo", "/c", "/GS-", "/Os", "/W3",
-         "/Fo" + kernel_obj, kernel_c])
-    log("kernel.obj built")
+    # 1. kernel C files -> COFF objects
+    c_objs = []
+    for src in c_files:
+        obj = os.path.join(BUILD, os.path.splitext(os.path.basename(src))[0] + ".obj")
+        run([cl, "/nologo", "/c", "/GS-", "/Os", "/W3", "/Fo" + obj, src])
+        c_objs.append(obj)
+    log(f"{len(c_objs)} C objects built")
 
-    # 2. entry stub -> COFF (linked FIRST so the image starts here)
+    # 2. asm stubs -> COFF (entry linked FIRST so the image starts there)
     run([nasm, "-f", "win32", entry_asm, "-o", entry_obj])
-    log("entry.obj built")
+    run([nasm, "-f", "win32", isr_asm, "-o", isr_obj])
+    log("entry.obj + isr.obj built")
 
     # 3. link a fixed-base PE (/ENTRY:entry — link prepends _ for x86;
     #    /ALIGN:16 packs sections so the image fits a single-track read)
     run([link, "/NOLOGO", "/SUBSYSTEM:NATIVE", "/ENTRY:entry",
          "/BASE:0x10000", "/ALIGN:16", "/NODEFAULTLIB",
-         "/OUT:" + kernel_pe, entry_obj, kernel_obj])
+         "/OUT:" + kernel_pe, entry_obj, isr_obj] + c_objs)
     log("kernel.pe linked")
 
     # 4. PE -> flat binary, learn the entry address
@@ -143,10 +151,18 @@ def main():
             content = f.read()
         log("--- serial log ---")
         log(content)
-        if "MYOS-BOOT-OK" in content:
-            log("HEADLESS CHECK PASSED: kernel reached kernel_main")
+        # Commit-by-commit boot proof: every marker below must be present.
+        expected = [
+            "MYOS-BOOT-OK",  # kernel_main reached
+            "IDT-OK",        # 48 IDT gates loaded
+            "EXC-03-BP",     # INT3 self-test dispatched through the IDT
+            "INT3-RESUMED",  # handler returned, execution resumed
+        ]
+        missing = [m for m in expected if m not in content]
+        if not missing:
+            log("HEADLESS CHECK PASSED: " + ", ".join(expected))
         else:
-            sys.exit("HEADLESS CHECK FAILED: boot marker not found in serial log")
+            sys.exit("HEADLESS CHECK FAILED: missing markers: " + ", ".join(missing))
     elif mode != "build":
         sys.exit(f"unknown mode: {mode} (use: build | run | headless)")
 
