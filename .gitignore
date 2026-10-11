@@ -1,0 +1,7 @@
+# generated build outputs
+build/
+myos.img
+
+# python caches
+__pycache__/
+*.pyc
