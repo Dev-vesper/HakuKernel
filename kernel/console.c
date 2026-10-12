@@ -54,6 +54,29 @@ void vga_hex(uint32_t v) {
     put_hex(vga_putc, v);
 }
 
+static void put_dec(void (*emit)(char), uint32_t v) {
+    char rev[10];
+    int n = 0;
+    do {
+        rev[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    } while (v && n < 10);
+    while (n--) emit(rev[n]);
+}
+
+void vga_dec(uint32_t v) {
+    put_dec(vga_putc, v);
+}
+
+/* Draw a short status string at the top-right corner (overwrites in place). */
+void vga_corner(const char *s) {
+    size_t len = strlen(s);
+    if (len > VGA_COLS) len = VGA_COLS;
+    for (size_t i = 0; i < len; i++)
+        VGA[(VGA_COLS - len) + i] =
+            (uint16_t)(((uint16_t)0x0E << 8) | (uint8_t)s[i]); /* yellow */
+}
+
 #define COM1 0x3F8
 
 static int serial_ready(void) {
@@ -84,6 +107,10 @@ void serial_write(const char *s) {
 
 void serial_hex(uint32_t v) {
     put_hex(serial_putc, v);
+}
+
+void serial_dec(uint32_t v) {
+    put_dec(serial_putc, v);
 }
 
 void console_init(void) {

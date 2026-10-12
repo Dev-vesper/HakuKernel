@@ -13,9 +13,12 @@ void console_init(void);
 void vga_clear(uint8_t color);
 void vga_write(const char *s);
 void vga_hex(uint32_t v);
+void vga_dec(uint32_t v);
+void vga_corner(const char *s);
 void serial_init(void);
 void serial_putc(char c);
 void serial_write(const char *s);
 void serial_hex(uint32_t v);
+void serial_dec(uint32_t v);
 
 #endif

@@ -9,8 +9,9 @@ Usage:
 Pipeline:
     kernel.c --cl--> kernel.obj  +  entry.asm --nasm--> entry.obj
     entry.obj + kernel.obj --link--> kernel.pe --pe2bin--> kernel.bin
-    boot.asm --nasm (-DKERNEL_ENTRY from the PE)--> boot.bin (512 B)
-    boot.bin + kernel.bin --mkimg--> myos.img (1.44 MB floppy)
+    stage1.asm --nasm--> stage1.bin (512 B)
+    stage2.asm --nasm (-DKERNEL_ENTRY from the PE)--> stage2.bin
+    stage1 + stage2 + kernel.bin --mkimg--> myos.img (1.44 MB floppy)
 
 All tools are invoked with argument lists (never through cmd.exe), so paths
 with spaces just work.
@@ -31,6 +32,46 @@ os.makedirs(BUILD, exist_ok=True)
 
 def log(msg):
     print(msg, flush=True)
+
+
+def monitor_cmd(port, cmds, timeout=5):
+    """Run HMP commands over the TCP monitor, return the raw transcript."""
+    import socket
+    out = []
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        s.settimeout(timeout)
+        try:
+            out.append(s.recv(65536))
+        except OSError:
+            pass
+        for cmd in cmds:
+            s.sendall(cmd.encode() + b"\n")
+            time.sleep(0.7)
+            try:
+                while True:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    out.append(chunk)
+                    if b"(qemu)" in chunk:
+                        break
+            except OSError:
+                pass
+        s.close()
+    except OSError as e:
+        log(f"(monitor unavailable: {e})")
+    return b"".join(out)
+
+
+def take_screenshot(port, path):
+    """Ask QEMU's human monitor for a PPM screenshot (best effort)."""
+    blob = monitor_cmd(port, [f"screendump {path}"])
+    time.sleep(1.0)
+    if os.path.exists(path):
+        log(f"screenshot: {path}")
+    elif blob:
+        log(f"(screendump produced no file; monitor said: {blob[-200:]!r})")
 
 
 def find_tool(name, fallbacks, label):
@@ -78,12 +119,15 @@ def main():
         sys.exit("no kernel/*.c files found")
     entry_asm = os.path.join(kernel_dir, "entry.asm")
     isr_asm = os.path.join(kernel_dir, "isr.asm")
-    boot_asm = os.path.join(ROOT, "boot", "boot.asm")
+    boot_dir = os.path.join(ROOT, "boot")
+    stage1_asm = os.path.join(boot_dir, "stage1.asm")
+    stage2_asm = os.path.join(boot_dir, "stage2.asm")
     entry_obj = os.path.join(BUILD, "entry.obj")
     isr_obj = os.path.join(BUILD, "isr.obj")
     kernel_pe = os.path.join(BUILD, "kernel.pe")
     kernel_bin = os.path.join(BUILD, "kernel.bin")
-    boot_bin = os.path.join(BUILD, "boot.bin")
+    stage1_bin = os.path.join(BUILD, "stage1.bin")
+    stage2_bin = os.path.join(BUILD, "stage2.bin")
     img = os.path.join(ROOT, "myos.img")
 
     # 1. kernel C files -> COFF objects
@@ -100,9 +144,11 @@ def main():
     log("entry.obj + isr.obj built")
 
     # 3. link a fixed-base PE (/ENTRY:entry — link prepends _ for x86;
-    #    /ALIGN:16 packs sections so the image fits a single-track read)
+    #    /ALIGN:16 packs sections; /FIXED drops .reloc — we always load
+    #    at the linked base, so runtime relocation is meaningless)
     run([link, "/NOLOGO", "/SUBSYSTEM:NATIVE", "/ENTRY:entry",
-         "/BASE:0x10000", "/ALIGN:16", "/NODEFAULTLIB",
+         "/BASE:0x10000", "/ALIGN:16", "/FIXED", "/NODEFAULTLIB",
+         "/MAP:" + os.path.join(BUILD, "kernel.map"),
          "/OUT:" + kernel_pe, entry_obj, isr_obj] + c_objs)
     log("kernel.pe linked")
 
@@ -120,28 +166,47 @@ def main():
     entry = m.group(1)
     log(f"kernel entry: {entry}")
 
-    # 5. boot sector, with the real entry address
-    run([nasm, "-f", "bin", f"-DKERNEL_ENTRY={entry}", boot_asm, "-o", boot_bin])
+    # 5. boot stages (stage2 gets the real entry address)
+    run([nasm, "-f", "bin", stage1_asm, "-o", stage1_bin])
+    run([nasm, "-f", "bin", f"-DKERNEL_ENTRY={entry}", stage2_asm, "-o", stage2_bin])
 
-    # 6. floppy image (all size/signature checks live in mkimg.py)
+    # 6. floppy image (all size/signature/sector checks live in mkimg.py)
     run([py, os.path.join(ROOT, "tools", "mkimg.py"),
-         boot_bin, kernel_bin, img, boot_asm])
+         stage1_bin, stage2_bin, kernel_bin, img, stage1_asm, stage2_asm])
 
     mode = sys.argv[1] if len(sys.argv) > 1 else "build"
     disk = [qemu, "-drive", f"file={img},format=raw,if=floppy,index=0",
             "-boot", "order=a", "-no-reboot"]
+    # CPU exception trace: shows every #GP/#PF/triple-fault with EIP.
+    trace = ["-d", "int,cpu_reset", "-D", os.path.join(BUILD, "qemu.log")]
     if mode == "run":
         log("Booting MyOS in QEMU (close the window to return)...")
         subprocess.run(disk)
     elif mode == "headless":
         serial = os.path.join(BUILD, "serial.log")
+        shot = os.path.join(BUILD, "screen.png")
         if os.path.exists(serial):
             os.remove(serial)
-        proc = subprocess.Popen(disk + ["-display", "none",
-                                        "-serial", f"file:{serial}"])
+        # Human monitor on TCP (for screendump now, sendkey later).
+        MON_PORT = 5555
+        proc = subprocess.Popen(disk + trace + ["-display", "none",
+                                                 "-serial", f"file:{serial}",
+                                        "-monitor", f"tcp:127.0.0.1:{MON_PORT},server=on,wait=off"])
         try:
             proc.wait(timeout=12)
         except subprocess.TimeoutExpired:
+            # Still alive: interrogate the CPU state, grab a screenshot, stop it.
+            regs = monitor_cmd(MON_PORT, ["info registers", f"screendump {shot}",
+                                              "xp /3wx 0x500",
+                                              "xp /64wx 0x11240",
+                                              "xp /64wx 0x11980"])
+            with open(os.path.join(BUILD, "regs.txt"), "wb") as f:
+                f.write(regs)
+            for line in regs.decode("utf-8", "replace").splitlines():
+                if line.startswith(("EIP", "EAX", "CS ", "CR0", "EFL")):
+                    log("  " + line.strip())
+            if os.path.exists(shot):
+                log(f"screenshot: {shot}")
             proc.kill()
             proc.wait()
         time.sleep(0.5)
@@ -157,6 +222,11 @@ def main():
             "IDT-OK",        # 48 IDT gates loaded
             "EXC-03-BP",     # INT3 self-test dispatched through the IDT
             "INT3-RESUMED",  # handler returned, execution resumed
+            "PIC-OK",        # 8259 remapped to 0x20/0x28
+            "PIT-OK",        # 100 Hz timer programmed
+            "T+1s",          # hardware timer IRQs arriving
+            "T+2s",
+            "T+3s",
         ]
         missing = [m for m in expected if m not in content]
         if not missing:

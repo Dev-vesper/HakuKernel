@@ -6,6 +6,7 @@
  */
 #include "console.h"
 #include "idt.h"
+#include "pic.h"
 
 static idt_entry_t idt[IDT_ENTRIES];
 static idtr_t idtr;
@@ -72,9 +73,8 @@ void idt_init(void) {
         idt_set_gate((uint8_t)(32 + i), (uint32_t)irq_addrs[i], KERNEL_CS, GATE_INT32);
     for (uint16_t i = 48; i < 256; i++)
         idt_set_gate((uint8_t)i, (uint32_t)isr_default, KERNEL_CS, GATE_INT32);
-    /* Mask the PIC until pic.c remaps it (exceptions don't need it). */
-    outb(0x21, 0xFF);
-    outb(0xA1, 0xFF);
+    /* Mask the PIC until drivers unmask what they own (pic.c remaps first). */
+    pic_mask_all();
     idtr.limit = (uint16_t)(sizeof(idt) - 1);
     idtr.base = (uint32_t)&idt;
     idt_load((uint32_t)&idtr);
@@ -123,13 +123,22 @@ void isr_handler(regs_t *r) {
 
 void irq_handler(regs_t *r) {
     uint8_t irq = (uint8_t)(r->int_no - 32);
-    if (irq < 16 && irq_handlers[irq])
-        irq_handlers[irq](r);
-    else {
-        vga_write("Unexpected IRQ\n");
-        serial_write("IRQ-UNEXPECTED\n");
+    if (irq >= 16) {
+        serial_write("IRQ-BAD-VECTOR\n");
+        pic_send_eoi(15);
+        return;
     }
-    /* Pre-remap safety EOI on both controllers (pic.c takes over later). */
-    outb(0xA0, 0x20);
-    outb(0x20, 0x20);
+    if (irq_handlers[irq])
+        irq_handlers[irq](r);
+    else if (pic_is_spurious(irq)) {
+        serial_write("IRQ-SPURIOUS ");
+        serial_hex(irq);
+        serial_write("\n");
+    } else {
+        vga_write("Unexpected IRQ\n");
+        serial_write("IRQ-UNEXPECTED ");
+        serial_hex(irq);
+        serial_write("\n");
+    }
+    pic_send_eoi(irq);
 }

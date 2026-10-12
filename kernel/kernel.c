@@ -7,6 +7,8 @@
 #include "cpu.h"
 #include "console.h"
 #include "idt.h"
+#include "pic.h"
+#include "pit.h"
 
 void kernel_main(void) {
     console_init();
@@ -25,7 +27,16 @@ void kernel_main(void) {
     __asm int 3 /* #BP self-test: the handler prints, then we resume here */
     serial_write("INT3-RESUMED after breakpoint handler\n");
 
-    vga_write("System halted. Press the QEMU close button (or power off).\n");
+    /* Remap the 8259 (IRQs were colliding with CPU exceptions 8..15),
+     * start the 100 Hz timer and open IRQ0 only. */
+    pic_remap(0x20, 0x28);
+    serial_write("PIC-OK remap=20/28\n");
+    pit_init(100);
+    serial_write("PIT-OK 100Hz\n");
+    pic_clear_mask(0);
+    cpu_sti();
+
+    vga_write("Timer running (see the corner clock). Idling on hlt...\n");
     for (;;) {
         __asm hlt
     }
