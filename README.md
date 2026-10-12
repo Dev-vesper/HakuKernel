@@ -47,7 +47,7 @@ Memory map:
 |---|---|
 | `0x7C00` | boot sector (512 B) |
 | `0x10000–0x13000` | kernel PE image (~8.5 KiB, linked `/BASE:0x10000 /ALIGN:16`) |
-| `0x6000–0x7000` | E820 map from stage2 (INT 15h, count at `0x6FFC`) |
+| `0x7000–0x7240` | E820 map from stage2 (INT 15h, count at `0x6FFC`) |
 | `0x20000–0x23000` | page directory + initial tables (8 MiB supervisor identity map) |
 | `0x100000–0x400000` | kernel heap (kmalloc/kfree, 16 B aligned) |
 | `0x90000` | kernel stack top (grows down) |
@@ -65,6 +65,18 @@ installs 32 exception gates (0–31), 16 IRQ gates (32–47, used once the
 triple-faulting. The syscall gate at vector 128 is DPL 3; all other gates
 remain ring-0-only. All are interrupt gates, so handlers run with IF clear.
 The boot proves the exception path with an `INT3` self-test.
+
+### Physical frame allocator
+
+`kernel/frame.c` now builds its usable-frame bitmap from the 64-bit base and
+length fields in the E820 entries. Only complete 4 KiB pages wholly inside
+type-1 usable ranges are admitted; invalid entries and overlapping reserved
+ranges are excluded. The allocator explicitly reserves low boot/firmware
+memory, the kernel's 32 KiB load buffer, page tables, the boot stack, the ISA
+hole, and the 1–4 MiB heap. `frame_usable_count()` reports E820-usable pages
+tracked up to 128 MiB, while allocations are currently restricted to the
+identity-mapped first 8 MiB. Freeing validates alignment, usability, and
+allocation state so reserved pages cannot accidentally be released.
 
 ### User mode (ring 3)
 
@@ -112,7 +124,7 @@ Haku/
   kernel/gdt.h/.c      flat ring-0/ring-3 GDT and dedicated TSS stack
   kernel/usermode.h/.c user mappings, bounded write/exit syscall ABI
   kernel/paging.h/.c   i386 page tables: 8 MiB identity map + user pages
-  kernel/frame.h/.c    bitmap frame allocator (4 KiB frames, E820 handoff at 0x6FFC/0x7000)
+  kernel/frame.h/.c    E820-backed frame inventory (128 MiB tracked, allocations within mapped 8 MiB)
   kernel/kernel.c      kernel startup, ring-3 demo, PIC/PIT + keyboard loop
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       size/signature checks + floppy padding
@@ -142,5 +154,5 @@ Haku/
 
 ## Next steps (v0.2 ideas)
 
-E820-driven frame allocation and dynamic mappings beyond 8 MiB, process
+Dynamic frame allocation beyond the identity-mapped 8 MiB, process
 isolation/address-space switching, and an ATA driver to leave floppies behind.

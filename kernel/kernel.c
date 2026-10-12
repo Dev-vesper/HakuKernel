@@ -72,10 +72,8 @@ void kernel_main(void) {
         }
     }
 
-    /* Frame allocator: bitmap-based physical memory manager.
-     * Must come after paging so the MMU can safely read/write physical
-     * addresses.  For now we only mark known regions; E820 parsing
-     * will be added once the basic allocator is proven. */
+    /* E820-backed frame inventory. Allocation is limited to the identity-
+     * mapped 8 MiB until temporary mappings support higher physical frames. */
     frame_init();
     if (!frame_self_test()) {
         for (;;) {

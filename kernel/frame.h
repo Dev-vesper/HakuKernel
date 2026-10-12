@@ -1,8 +1,8 @@
-/* Haku frame allocator interface.
+/* Haku E820-backed physical frame allocator.
  *
- * One bit per 4 KiB frame: 0 = free, 1 = used.  The bitmap (4096 bytes
- * for 32768 frames = 128 MiB) is allocated from the heap at init —
- * frame_init() must run after heap_init().
+ * Two bitmaps describe up to 128 MiB of physical memory: one marks frames
+ * usable according to E820, the other tracks allocation. The current direct
+ * mapping only permits allocations from the first 8 MiB.
  */
 #ifndef HAKU_FRAME_H
 #define HAKU_FRAME_H
@@ -17,18 +17,19 @@
 /* E820 type values (Intel/SMBI spec). */
 #define E820_RAM 1
 
-/* Macros to reach the E820 map that stage2 left in low memory.
- * Paging is identity-mapped, so physical 0x7000 == virtual 0x7000. */
+/* E820 entry count left by stage2. Its 24-byte entries start at physical
+ * 0x7000, which remains identity-mapped after paging is enabled. */
 #define E820_COUNT (*(volatile uint32_t *)(0x6FFC))
 
 /* Public API. */
-void frame_init(void);
+void frame_init(void); /* call after heap_init and paging_enable */
 void *frame_alloc(void);
 void frame_free(void *phys);
 void *frame_alloc_pages(uint32_t n);
 void frame_free_pages(void *phys, uint32_t n);
-uint32_t frame_total_count(void);
-uint32_t frame_free_count(void);
+uint32_t frame_total_count(void);  /* tracked physical frames (up to 128 MiB) */
+uint32_t frame_usable_count(void); /* usable frames reported by E820 */
+uint32_t frame_free_count(void);   /* free frames currently allocatable (< 8 MiB) */
 int frame_self_test(void);
 
 #endif
