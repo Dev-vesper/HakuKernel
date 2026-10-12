@@ -77,6 +77,34 @@ stage2:
     mov si, msg_loaded
     call print
 
+    ; --- collect E820 memory map (INT 15h AX=E820h) ---------------------------
+    ; Must happen in real mode (BIOS). Entries land at 0x7000 (24 B each,
+    ; up to 24 entries = 576 B). Count stored at 0x6FFC (dword).
+    ; Layout per entry: base(8) + length(8) + type(4) + acpi(4) = 24 bytes.
+    ; type 1 = usable RAM, 2 = reserved, 3 = ACPI reclaimable, 5 = bad.
+    xor ax, ax
+    mov es, ax                  ; ES:DI = 0x0000:0x7000 = physical 0x7000
+    mov di, 0x7000
+    xor ebx, ebx                ; continuation value (0 = first call)
+    xor ebp, ebp                ; entry counter
+.e820_loop:
+    cmp ebp, 24                 ; max entries (fits below 0x7C00)
+    jae .e820_done
+    mov eax, 0xE820
+    mov edx, 0x534D4150         ; 'SMAP' — BIOS checks this
+    mov ecx, 24                 ; buffer size per entry
+    mov dword [di + 20], 1      ; ACPI 3.0: force "valid" attribute
+    int 0x15
+    jc .e820_done               ; CF set = error or no more entries
+    cmp eax, 0x534D4150         ; BIOS must echo 'SMAP' in EAX
+    jne .e820_done
+    inc ebp
+    add di, 24
+    test ebx, ebx               ; EBX = 0 means last entry
+    jnz .e820_loop
+.e820_done:
+    mov [0x6FFC], ebp           ; store entry count for the kernel
+
     ; --- enable A20, Linux-style (test after every method) --------------------
     call enable_a20
     cmp ax, 1

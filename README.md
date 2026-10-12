@@ -43,7 +43,9 @@ Memory map:
 |---|---|
 | `0x7C00` | boot sector (512 B) |
 | `0x10000–0x13000` | kernel PE image (~8.5 KiB, linked `/BASE:0x10000 /ALIGN:16`) |
-| `0x20000–0x22000` | page directory + page table (4 MiB identity map, P+W) |
+| `0x6000–0x7000` | E820 map from stage2 (INT 15h, count at `0x6FFC`) |
+| `0x20000–0x23000` | page directory + 2 page tables (8 MiB identity map, P+W) |
+| `0x100000–0x400000` | kernel heap (kmalloc/kfree, 16 B aligned) |
 | `0x90000` | kernel stack top (grows down) |
 | `0xB8000` | VGA text buffer |
 
@@ -57,7 +59,7 @@ triple-faulting. All gates are interrupt gates (`0x8E`), so handlers never
 nest. The boot proves the whole path with an `INT3` self-test: the serial
 log must show `EXC-03-BP` followed by `INT3-RESUMED`.
 
-Next: the PS/2 keyboard driver, then a heap allocator on top of paging.
+Next: E820-driven freeing past 8 MiB (needs dynamic page mapping), then user mode (ring 3).
 
 ### Why `link.exe` + `tools/pe2bin.py`?
 
@@ -83,7 +85,8 @@ MyOS/
   kernel/cpu.h/cpu.c   types, port I/O, tiny libc (memset & friends, no CRT)
   kernel/console.h/.c  VGA text + COM1 serial drivers
   kernel/idt.h/idt.c   IDT gates, exception/IRQ dispatchers (+ #PF handler)
-  kernel/paging.h/.c   i386 2-level tables (Linux-style): 4 MiB identity map, CR0.PG
+  kernel/paging.h/.c   i386 2-level tables (Linux-style): 8 MiB identity map, CR0.PG
+  kernel/frame.h/.c    bitmap frame allocator (4 KiB frames, E820 handoff at 0x6FFC/0x7000)
   kernel/kernel.c      kernel_main: console → IDT → INT3 self-test → paging → PIC/PIT → halt
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       size/signature checks + floppy padding

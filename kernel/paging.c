@@ -2,14 +2,15 @@
  *
  * Linux (arch/x86/kernel/head_32.S, __startup_32) builds swapper_pg_dir
  * with PG0 identity entries, loads CR3, then sets CR0.PG. We do the same,
- * except our tables live at fixed physical 0x20000/0x21000 (identity
- * mapped, so virtual == physical and plain C pointers work before and
- * after the switch).
+ * except our tables live at fixed physical 0x20000/0x21000/0x22000
+ * (identity mapped, so virtual == physical and plain C pointers work
+ * before and after the switch).
  */
 #include "paging.h"
 
 #define DIR  ((uint32_t *)PAGING_DIR_PHYS)
 #define TAB  ((uint32_t *)PAGING_TABLE_PHYS)
+#define TAB1 ((uint32_t *)PAGING_TABLE1_PHYS)
 
 void paging_init(void) {
     /* Fresh tables: stale TLB state cannot exist yet (PG was off), but
@@ -17,12 +18,17 @@ void paging_init(void) {
      * a random physical page. */
     memset(DIR, 0, 4096);
     memset(TAB, 0, 4096);
-    /* PDE 0 -> our single page table (present + writable, supervisor). */
+    memset(TAB1, 0, 4096);
+    /* PDE 0/1 -> our two page tables (present + writable, supervisor). */
     DIR[0] = (PAGING_TABLE_PHYS & 0xFFFFF000u) | PAGE_PRESENT | PAGE_RW;
-    /* 1024 x 4 KiB = first 4 MiB identity mapped: kernel (0x10000),
-     * VGA (0xB8000), tables themselves, the 0x90000 stack, ISA hole. */
-    for (uint32_t i = 0; i < PAGING_ENTRIES; i++)
+    DIR[1] = (PAGING_TABLE1_PHYS & 0xFFFFF000u) | PAGE_PRESENT | PAGE_RW;
+    /* 2 x 1024 x 4 KiB = first 8 MiB identity mapped: kernel (0x10000),
+     * VGA (0xB8000), tables themselves, the 0x90000 stack, ISA hole, and
+     * room for frames the frame allocator hands out (starts at 4 MiB). */
+    for (uint32_t i = 0; i < PAGING_ENTRIES; i++) {
         TAB[i] = (i * 0x1000u) | PAGE_PRESENT | PAGE_RW;
+        TAB1[i] = ((i + 1024u) * 0x1000u) | PAGE_PRESENT | PAGE_RW;
+    }
 }
 
 void paging_enable(void) {

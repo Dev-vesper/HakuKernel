@@ -10,6 +10,7 @@
 #include "idt.h"
 #include "kbd.h"
 #include "paging.h"
+#include "frame.h"
 #include "pic.h"
 #include "pit.h"
 
@@ -43,12 +44,14 @@ void kernel_main(void) {
             __asm hlt
         }
     }
-    {   /* R/W probe through the tables: low RAM, the tables, 3 MiB. */
+    {   /* R/W probe through the tables: low RAM, 3 MiB, 7 MiB. */
         volatile uint32_t *p1 = (volatile uint32_t *)0x2000u;
         volatile uint32_t *p2 = (volatile uint32_t *)0x300000u;
+        volatile uint32_t *p3 = (volatile uint32_t *)0x700000u;
         *p1 = 0x12345678u;
         *p2 = 0xA5A5A5A5u;
-        if (*p1 != 0x12345678u || *p2 != 0xA5A5A5A5u) {
+        *p3 = 0x5A5A5A5Au;
+        if (*p1 != 0x12345678u || *p2 != 0xA5A5A5A5u || *p3 != 0x5A5A5A5Au) {
             vga_write("PAGING probe mismatch, halting\n");
             serial_write("PAGING-FAIL probe\n");
             for (;;) {
@@ -56,11 +59,10 @@ void kernel_main(void) {
             }
         }
     }
-    vga_write("PAGING: 4 MiB identity mapped, CR0.PG on\n");
-    serial_write("PAGING-OK idmap=4MB cr3=0x20000\n");
+    vga_write("PAGING: 8 MiB identity mapped, CR0.PG on\n");
+    serial_write("PAGING-OK idmap=8MB cr3=0x20000\n");
 
-    /* Heap: free-list allocator over the identity-mapped 1–4 MiB range.
-     * Must come after paging so the whole region is walkable. */
+    /* Heap: free-list allocator over the identity-mapped 1–4 MiB range. */
     heap_init();
     if (!heap_self_test()) {
         for (;;) {
@@ -68,17 +70,28 @@ void kernel_main(void) {
         }
     }
 
+    /* Frame allocator: bitmap-based physical memory manager.
+     * Must come after paging so the MMU can safely read/write physical
+     * addresses.  For now we only mark known regions; E820 parsing
+     * will be added once the basic allocator is proven. */
+    frame_init();
+    if (!frame_self_test()) {
+        for (;;) {
+            __asm hlt
+        }
+    }
+
+    /* PS/2 keyboard on IRQ1 (US layout, shift/caps handled in irq). */
+    kbd_init();
+    serial_write("KBD-OK irq1 irq1=unmasked\n");
+    vga_write("PS/2 keyboard ready (IRQ1). Type in QEMU window.\n");
+
     /* Remap the 8259 (IRQs were colliding with CPU exceptions 8..15),
      * start the 100 Hz timer and open IRQ0 only. */
     pic_remap(0x20, 0x28);
     serial_write("PIC-OK remap=20/28\n");
     pit_init(100);
     serial_write("PIT-OK 100Hz\n");
-
-    /* PS/2 keyboard on IRQ1 (US layout, shift/caps handled in irq). */
-    kbd_init();
-    serial_write("KBD-OK irq1 irq1=unmasked\n");
-    vga_write("PS/2 keyboard ready (IRQ1). Type in QEMU window.\n");
 
     pic_clear_mask(0);
     cpu_sti();

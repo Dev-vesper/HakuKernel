@@ -222,8 +222,10 @@ def main():
             "IDT-OK",        # 48 IDT gates loaded
             "EXC-03-BP",     # INT3 self-test dispatched through the IDT
             "INT3-RESUMED",  # handler returned, execution resumed
-            "PAGING-OK",     # 4 MiB identity map, CR0.PG on, R/W probe passed
+            "PAGING-OK",     # 8 MiB identity map, CR0.PG on, R/W probe passed
             "HEAP-OK",       # kmalloc/kfree/krealloc self-test passed
+            "E820-OK",       # stage2 INT 15h map handoff verified
+            "FRAME-OK",      # frame_alloc/free self-test passed
             "PIC-OK",        # 8259 remapped to 0x20/0x28
             "PIT-OK",        # 100 Hz timer programmed
             "KBD-OK",        # PS/2 keyboard IRQ1 handler installed
