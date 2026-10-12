@@ -9,6 +9,14 @@ void outb(uint16_t port, uint8_t val) {
     }
 }
 
+void outw(uint16_t port, uint16_t val) {
+    __asm {
+        mov dx, port
+        mov ax, val
+        out dx, ax
+    }
+}
+
 uint8_t inb(uint16_t port) {
     uint8_t value;
     __asm {
@@ -17,6 +25,31 @@ uint8_t inb(uint16_t port) {
         mov value, al
     }
     return value;
+}
+
+uint16_t inw(uint16_t port) {
+    uint16_t value;
+    __asm {
+        mov dx, port
+        in ax, dx
+        mov value, ax
+    }
+    return value;
+}
+
+uint32_t cpu_irq_save(void) {
+    uint32_t flags;
+    __asm {
+        pushfd
+        pop eax
+        mov flags, eax
+        cli
+    }
+    return flags;
+}
+
+void cpu_irq_restore(uint32_t flags) {
+    if (flags & 0x200u) __asm sti
 }
 
 void io_wait(void) {

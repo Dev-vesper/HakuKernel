@@ -3,6 +3,7 @@
 #include "frame.h"
 #include "gdt.h"
 #include "paging.h"
+#include "vfs.h"
 
 #define TASK_KERNEL_STACK_PAGES 2u
 
@@ -210,6 +211,7 @@ regs_t *scheduler_exit_current(regs_t *frame) {
         current_task >= (int)task_count)
         return frame;
 
+    vfs_close_all(tasks[current_task].pid);
     tasks[current_task].state = TASK_ZOMBIE;
     tasks[current_task].frame = frame;
     next = find_next_task();

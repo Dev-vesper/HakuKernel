@@ -1,9 +1,9 @@
 # Haku v0.1 — a tiny x86 operating system in C
 
 Bootloader (NASM) loads a C kernel and switches the CPU to 32-bit protected
-mode. The kernel initializes paging, interrupts and a GDT/TSS, then runs a
-small user program at ring 3 which writes through `int 0x80` before returning
-to the kernel.
+mode. The kernel initializes paging, interrupts and a GDT/TSS, then reads
+user ELF programs from a FAT12 filesystem on an ATA disk and schedules them
+at ring 3.
 
 ## Prerequisites (Windows 11)
 
@@ -23,9 +23,10 @@ python build.py run        :: build + boot in a QEMU window
 python build.py headless   :: build + boot headless, verify via serial log
 ```
 
-`python build.py headless` verifies ring-3 process entry, timer preemption,
-per-process kernel stacks, syscall handling, process exit/reaping, and timer
-IRQs through the serial log.
+`python build.py headless` verifies ATA detection, FAT12 mounting and
+multi-cluster file reads, ring-3 process entry, timer preemption, per-process
+kernel stacks, syscall handling, process exit/reaping, and timer IRQs through
+the serial log.
 The build is one Python script on purpose — `cmd.exe` quoting of spaced
 paths (e.g. `C:\Program Files\...`) is fragile, while `subprocess` argument
 lists just work.
@@ -100,14 +101,17 @@ user permissions.
 `kernel/user.asm` is built as an ELF32 image, loaded separately for each
 process and entered via `iret` at CPL 3. The initial syscall ABI follows the
 i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
-`read` (3), `write` (4), and `getpid` (20), with arguments in `ebx`, `ecx`,
-and `edx` and syscall number/result in `eax`.
+`read` (3), `write` (4), `open` (5), `close` (6), `lseek` (19), and `getpid`
+(20), with arguments in `ebx`, `ecx`, and `edx` and syscall number/result in
+`eax`.
 
 ### User-mode system calls
 
-`read` supports stdin from the PS/2 keyboard; `write` supports stdout/stderr
-to VGA and serial. Reads and writes are bounded to 4096 bytes, and errors
-return negative errno values (a future libc can translate these to `errno`).
+`read` supports stdin from the PS/2 keyboard and regular files; `write`
+supports stdout/stderr to VGA and serial as well as writable regular files.
+`open`, `close`, `lseek`, and per-process file descriptors are backed by the
+VFS/FAT12 layer. Reads and writes are bounded to 4096 bytes, and errors return
+negative errno values (a future libc can translate these to `errno`).
 
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It
@@ -117,28 +121,53 @@ blocking keyboard reads can make progress; the keyboard wait is atomic
 against the interrupt/wakeup race. Ring-3 page faults are contained and
 reported rather than halting the kernel. These syscalls are an initial
 POSIX-inspired kernel interface, not full POSIX conformance. Run
-`python build.py headless` to test read/write/getpid/exit, bad pointers,
-descriptor errors, input copying, and continued timer operation.
+`python build.py headless` to test read/write/open/close/lseek/getpid/exit,
+bad pointers, descriptor errors, input copying, disk-backed create/write/read
+across a sector boundary, and continued timer operation.
+
+### ATA PIO and FAT12
+
+`kernel/ata.c` detects the primary-master ATA device with IDENTIFY and reads
+and writes LBA28 sectors using bounded polling PIO. `kernel/fat12.c` mounts a
+FAT12 superfloppy and supports creating, reading, writing, truncating and
+seeking 8.3-named files in its root directory, with cluster allocation,
+release, mirrored FAT updates and volume/chain bounds checks.
+`kernel/vfs.c` supplies per-process descriptors and the user `open`, `close`,
+`read`, `write`, and `lseek` interface. Disk I/O is serialized against the
+preemptive scheduler; file contents and directory/FAT metadata are written
+through to the ATA disk. The current VFS supports up to five simultaneously
+open regular files per process and the `O_RDONLY`, `O_WRONLY`, `O_RDWR`,
+`O_CREAT`, `O_EXCL`, `O_TRUNC`, and `O_APPEND` flags.
+
+The filesystem remains intentionally small: no partition tables, subfolders,
+long filenames, unlink/rename, permissions, mount points, journaling, FAT16,
+or FAT32. This is a minimal single-volume VFS, not full POSIX filesystem
+conformance. The QEMU headless test creates separate `P1.TXT` and `P2.TXT`
+files from the two user processes and verifies multi-sector writes, reads,
+seeks, close, and reopen.
+
+`tools/mkfat12.py` puts the assembled `HAKU.ELF` test program on a generated
+1.44 MB FAT12 image. QEMU attaches this image as the primary-master IDE disk
+while the existing boot floppy still starts the kernel. At startup, the
+kernel reads the ELF file into temporary heap memory, loads it into separate
+user address spaces and releases the temporary buffer.
 
 ### ELF32 program loading
 
-`kernel/elf.c` loads static ELF32 little-endian i386 `ET_EXEC` images.
-It validates the ELF header and program-header bounds, accepts non-overlapping
-readable `PT_LOAD` segments, checks address arithmetic and file ranges, and
-rejects dynamic/interpreted images and writable-executable segments. Each
-segment is mapped according to its ELF permissions; the loader zeroes
-`p_memsz - p_filesz` for BSS and creates a two-page user stack.
+`kernel/elf.c` loads static ELF32 little-endian i386 `ET_EXEC` images read
+from FAT12. It validates the ELF header and program-header bounds, accepts
+non-overlapping readable `PT_LOAD` segments, checks address arithmetic and
+file ranges, and rejects dynamic/interpreted images and writable-executable
+segments. Each segment is mapped according to its ELF permissions; the loader
+zeroes `p_memsz - p_filesz` for BSS and creates a two-page user stack.
 
 Each loaded image receives a fresh page directory containing supervisor-only
 kernel identity mappings plus only that image's user pages. The scheduler
 activates each process's CR3 on dispatch and returns to the kernel page
 directory for its idle context. Exited process mappings and page tables are
-released after switching away from their kernel stacks. `kernel/user.asm` is
-a small ELF32 test executable; `build.py`
-assembles it and embeds its bytes into the kernel so the normal headless QEMU
-test exercises the actual ELF parser and loader. This initial loader does
-not yet support ELF dynamic linking, relocations, shared libraries, or
-loading from a filesystem.
+released after switching away from their kernel stacks. Dynamic linking,
+relocations, shared libraries, and ELF files larger than the current 256 KiB
+loader buffer are not supported.
 
 ### Why `link.exe` + `tools/pe2bin.py`?
 
@@ -165,7 +194,10 @@ Haku/
   boot/stage2.asm      CHS kernel loader (up to 448 KiB) → A20 → GDT → protected mode
   kernel/entry.asm     32-bit entry stub (_entry, linked first via /ENTRY)
   kernel/isr.asm       interrupt stubs, GDT/TSS load, ring-3 transition + syscalls
-  kernel/user.asm      minimal ring-3 demo payload
+  kernel/user.asm      minimal ELF32 ring-3 test program
+  kernel/ata.h/.c      primary-master ATA LBA28 polling PIO driver
+  kernel/fat12.h/.c    writable FAT12 root-directory file operations
+  kernel/vfs.h/.c      per-process descriptors and file syscalls
   kernel/elf.h/.c      validated ELF32 PT_LOAD loader and fresh user address spaces
   kernel/cpu.h/cpu.c   types, port I/O, tiny libc (memset & friends, no CRT)
   kernel/console.h/.c  VGA text + COM1 serial drivers
@@ -176,10 +208,12 @@ Haku/
   kernel/frame.h/.c    E820-backed frame inventory (128 MiB tracked, allocations within mapped 8 MiB)
   kernel/kernel.c      kernel startup, ring-3 demo, PIC/PIT + keyboard loop
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
-  tools/mkimg.py       size/signature checks + floppy padding
+  tools/mkimg.py       boot floppy size/signature checks
+  tools/mkfat12.py     FAT12 image builder for the user ELF
   build.py             the whole build: cl/link/nasm/qemu orchestration
   build/               generated files (stage*.bin, kernel.obj/pe, haku.img, ...)
-  haku.img             bootable 1.44 MB floppy image
+  haku.img             bootable floppy image
+  build/haku_fs.img    1.44 MB FAT12 ATA disk image with HAKU.ELF
 ```
 
 ## Troubleshooting
@@ -204,5 +238,6 @@ Haku/
 
 ## Next steps (v0.2 ideas)
 
-Dynamic frame allocation beyond the identity-mapped 8 MiB, process
-isolation/address-space switching, and an ATA driver to leave floppies behind.
+Writable filesystem operations and directories, then a VFS layer and
+`open`/`close` syscalls; ATA DMA/interrupt support and booting directly from
+the hard disk can follow.

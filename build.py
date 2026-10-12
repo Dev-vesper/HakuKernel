@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Haku v0.1 build — one straightforward script, no shell-quoting games.
+"""Haku build — one straightforward script, no shell-quoting games.
 
 Usage:
     python build.py            build haku.img only
@@ -7,11 +7,13 @@ Usage:
     python build.py headless   build + boot headless, verify via serial log
 
 Pipeline:
-    kernel.c --cl--> kernel.obj  +  entry.asm --nasm--> entry.obj
-    entry.obj + kernel.obj --link--> kernel.pe --pe2bin--> kernel.bin
+    user.asm --nasm--> user.elf --mkfat12--> haku_fs.img
+    kernel/*.c --cl--> kernel objects + entry/isr.asm --nasm--> entry objects
+    kernel objects + entry objects --link--> kernel.pe --pe2bin--> kernel.bin
     stage1.asm --nasm--> stage1.bin (512 B)
-    stage2.asm --nasm (-DKERNEL_ENTRY from the PE)--> stage2.bin
-    stage1 + stage2 + kernel.bin --mkimg--> haku.img (1.44 MB floppy)
+    stage2.asm --nasm (kernel entry + size from PE)--> stage2.bin
+    stage1 + stage2 + kernel.bin --mkimg--> haku.img (boot floppy)
+    QEMU boots haku.img and attaches haku_fs.img as primary-master ATA disk
 
 All tools are invoked with argument lists (never through cmd.exe), so paths
 with spaces just work.
@@ -98,20 +100,6 @@ def run(cmd):
     subprocess.run(cmd, check=True)
 
 
-def embed_binary_as_c(binary_path, source_path):
-    with open(binary_path, "rb") as f:
-        payload = f.read()
-    with open(source_path, "w", newline="\n") as f:
-        f.write("typedef unsigned int uint32_t;\n")
-        f.write("const unsigned char user_elf_image[] = {\n")
-        for offset in range(0, len(payload), 16):
-            row = payload[offset:offset + 16]
-            f.write("    " + ", ".join(f"0x{byte:02X}" for byte in row))
-            f.write(",\n" if offset + len(row) < len(payload) else "\n")
-        f.write("};\n")
-        f.write(f"const uint32_t user_elf_image_size = {len(payload)}u;\n")
-
-
 def main():
     nasm = find_tool("nasm", [
         os.path.join(os.environ.get("LOCALAPPDATA", ""), r"bin\NASM\nasm.exe"),
@@ -137,20 +125,21 @@ def main():
     boot_dir = os.path.join(ROOT, "boot")
     stage1_asm = os.path.join(boot_dir, "stage1.asm")
     stage2_asm = os.path.join(boot_dir, "stage2.asm")
+    fat12_script = os.path.join(ROOT, "tools", "mkfat12.py")
     entry_obj = os.path.join(BUILD, "entry.obj")
     isr_obj = os.path.join(BUILD, "isr.obj")
     user_elf = os.path.join(BUILD, "user.elf")
-    user_elf_source = os.path.join(BUILD, "user_elf_blob.c")
+    filesystem_image = os.path.join(BUILD, "haku_fs.img")
     kernel_pe = os.path.join(BUILD, "kernel.pe")
     kernel_bin = os.path.join(BUILD, "kernel.bin")
     stage1_bin = os.path.join(BUILD, "stage1.bin")
     stage2_bin = os.path.join(BUILD, "stage2.bin")
     img = os.path.join(ROOT, "haku.img")
 
-    # 1. Build the test ELF and embed it in the kernel as a C byte array.
+    # 1. Build the user ELF and put it on a FAT12 ATA disk image.
     run([nasm, "-f", "bin", user_asm, "-o", user_elf])
-    embed_binary_as_c(user_elf, user_elf_source)
-    log(f"embedded ELF test image ({os.path.getsize(user_elf)} bytes)")
+    run([py, fat12_script, user_elf, filesystem_image])
+    log(f"FAT12 program disk ready ({os.path.getsize(filesystem_image)} bytes)")
 
     # 2. kernel C files -> COFF objects
     c_objs = []
@@ -158,10 +147,6 @@ def main():
         obj = os.path.join(BUILD, os.path.splitext(os.path.basename(src))[0] + ".obj")
         run([cl, "/nologo", "/c", "/GS-", "/Os", "/W3", "/Fo" + obj, src])
         c_objs.append(obj)
-    user_elf_obj = os.path.join(BUILD, "user_elf_blob.obj")
-    run([cl, "/nologo", "/c", "/GS-", "/Os", "/W3",
-         "/Fo" + user_elf_obj, user_elf_source])
-    c_objs.append(user_elf_obj)
     log(f"{len(c_objs)} C objects built")
 
     # 3. asm stubs -> COFF (entry linked FIRST so the image starts there)
@@ -205,6 +190,7 @@ def main():
 
     mode = sys.argv[1] if len(sys.argv) > 1 else "build"
     disk = [qemu, "-drive", f"file={img},format=raw,if=floppy,index=0",
+            "-drive", f"file={filesystem_image},format=raw,if=ide,index=0,media=disk",
             "-boot", "order=a", "-no-reboot"]
     # CPU exception trace: shows every #GP/#PF/triple-fault with EIP.
     trace = ["-d", "int,cpu_reset", "-D", os.path.join(BUILD, "qemu.log")]
@@ -264,6 +250,9 @@ def main():
             "ELF-REJECT-OK", # malformed images and W+X segments were rejected
             "ELF-LOAD-OK",   # valid ELF32 PT_LOAD segments loaded to fresh CR3
             "USERMODE-READY",# user stack mapped in its own address space
+            "ATA-OK primary-master LBA28",
+            "FAT12-MOUNT-OK",
+            "FAT12-READ-OK name=HAKU.ELF",
             "USERMODE-ENTER",# iret entered CPL 3
             "SCHED-READY tasks=2 kernel-stack=per-task",
             "SCHED-START pid=1",
@@ -271,6 +260,7 @@ def main():
             "USERMODE-OK",   # ELF32 user image executed POSIX-style syscalls
             "USER-SYSCALL-CHECKS-OK", # EFAULT/EBADF/EINVAL/ENOSYS paths passed
             "USER-READ-OK",  # blocking read copied keyboard input to user memory
+            "USER-FILE-IO-OK", # FAT12 create/write/read/seek/close passed
             "USER-EXIT-OK status=0 pid=1",
             "USER-EXIT-OK status=0 pid=2",
             "SCHED-REAP-OK",
@@ -284,6 +274,8 @@ def main():
         missing = [m for m in expected if m not in content]
         if content.count("SCHED-REAP-OK") < 2:
             missing.append("two exited processes reaped")
+        if content.count("USER-FILE-IO-OK") < 2:
+            missing.append("file I/O passed in both user processes")
         unexpected = [m for m in ("USER-SYSCALL-FAIL",) if m in content]
         if not missing and not unexpected:
             log("HEADLESS CHECK PASSED: " + ", ".join(expected))

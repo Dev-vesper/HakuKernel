@@ -3,29 +3,33 @@
 #include "kbd.h"
 #include "paging.h"
 #include "scheduler.h"
+#include "fat12.h"
+#include "heap.h"
+#include "vfs.h"
 
-extern const uint8_t user_elf_image[];
-extern const uint32_t user_elf_image_size;
+#define USER_ELF_MAX_SIZE (256u * 1024u)
 
 static loaded_elf_t programs[2];
 #define USER_PROGRAM_COUNT (sizeof(programs) / sizeof(programs[0]))
 
-static int elf_rejection_self_test(void) {
+static int elf_rejection_self_test(const uint8_t *image,
+                                   uint32_t image_size) {
     uint8_t invalid[116];
     loaded_elf_t rejected;
 
-    memcpy(invalid, user_elf_image, sizeof(invalid));
+    if (image_size < sizeof(invalid)) return 0;
+    memcpy(invalid, image, sizeof(invalid));
     invalid[0] = 0;
     if (elf_load_executable(invalid, sizeof(invalid), &rejected)) return 0;
 
-    memcpy(invalid, user_elf_image, sizeof(invalid));
+    memcpy(invalid, image, sizeof(invalid));
     invalid[28] = 0xF0;
     invalid[29] = 0xFF;
     invalid[30] = 0xFF;
     invalid[31] = 0xFF;
     if (elf_load_executable(invalid, sizeof(invalid), &rejected)) return 0;
 
-    memcpy(invalid, user_elf_image, sizeof(invalid));
+    memcpy(invalid, image, sizeof(invalid));
     invalid[76] = 7; /* first PT_LOAD would be writable and executable */
     if (elf_load_executable(invalid, sizeof(invalid), &rejected)) return 0;
 
@@ -35,20 +39,41 @@ static int elf_rejection_self_test(void) {
 
 int usermode_init(void) {
     uint32_t loaded = 0;
-    if (!elf_rejection_self_test()) {
+    uint32_t image_size = 0;
+    uint8_t *image;
+
+    if (!fat12_mount()) return 0;
+    vfs_init();
+    image = (uint8_t *)kmalloc(USER_ELF_MAX_SIZE);
+    if (!image) {
+        serial_write("ELF-DISK-FAIL kernel heap exhausted\n");
+        return 0;
+    }
+    if (!fat12_read_file("HAKU.ELF", image, USER_ELF_MAX_SIZE,
+                         &image_size)) {
+        kfree(image);
+        return 0;
+    }
+    serial_write("FAT12-READ-OK name=HAKU.ELF size=");
+    serial_dec(image_size);
+    serial_write("\n");
+
+    if (!elf_rejection_self_test(image, image_size)) {
         serial_write("ELF-REJECT-FAIL\n");
+        kfree(image);
         return 0;
     }
     for (; loaded < USER_PROGRAM_COUNT; loaded++) {
-        if (!elf_load_executable(user_elf_image, user_elf_image_size,
-                                 &programs[loaded])) {
+        if (!elf_load_executable(image, image_size, &programs[loaded])) {
             serial_write("ELF-LOAD-FAIL invalid or unsupported ELF32 image\n");
             while (loaded)
                 paging_destroy_user_space(
                     &programs[--loaded].address_space);
+            kfree(image);
             return 0;
         }
     }
+    kfree(image);
     serial_write("ELF-LOAD-OK entry=");
     serial_hex(programs[0].entry);
     serial_write(" cr3=");
@@ -91,15 +116,33 @@ static int copy_to_user(uint32_t destination, const void *source,
 
 static uint32_t sys_write(uint32_t fd, uint32_t user_buffer,
                           uint32_t count) {
-    char chunk[128];
+    uint8_t chunk[128];
     uint32_t offset = 0;
 
-    if (fd != 1u && fd != 2u)
-        return copy_from_user_error(HAKU_EBADF);
     if (count > USER_IO_MAX)
         return copy_from_user_error(HAKU_EINVAL);
     if (!paging_user_range_valid(user_buffer, count, 0))
         return copy_from_user_error(HAKU_EFAULT);
+    if (fd > 2u) {
+        int32_t result;
+        if (count == 0)
+            return (uint32_t)vfs_write(scheduler_current_pid(), fd, 0, 0);
+        while (offset < count) {
+            uint32_t amount = count - offset;
+            if (amount > sizeof(chunk)) amount = sizeof(chunk);
+            if (!copy_from_user(chunk, user_buffer + offset, amount))
+                return offset ? offset : copy_from_user_error(HAKU_EFAULT);
+            result = vfs_write(scheduler_current_pid(), fd, chunk, amount);
+            if (result < 0)
+                return offset ? offset : (uint32_t)result;
+            offset += (uint32_t)result;
+            if ((uint32_t)result < amount) break;
+        }
+        return offset;
+    }
+    if (fd == 0u) return copy_from_user_error(HAKU_EBADF);
+    if (fd != 1u && fd != 2u)
+        return copy_from_user_error(HAKU_EBADF);
 
     while (offset < count) {
         uint32_t amount = count - offset;
@@ -118,12 +161,31 @@ static uint32_t sys_write(uint32_t fd, uint32_t user_buffer,
 static uint32_t sys_read(uint32_t fd, uint32_t user_buffer,
                          uint32_t count) {
     uint32_t copied = 0;
+    uint8_t chunk[128];
 
-    if (fd != 0u) return copy_from_user_error(HAKU_EBADF);
     if (count > USER_IO_MAX) return copy_from_user_error(HAKU_EINVAL);
-    if (count == 0) return 0;
+    if (count == 0)
+        return fd == 0u ? 0u :
+               (uint32_t)vfs_read(scheduler_current_pid(), fd, 0, 0);
     if (!paging_user_range_valid(user_buffer, count, 1))
         return copy_from_user_error(HAKU_EFAULT);
+    if (fd != 0u) {
+        while (copied < count) {
+            uint32_t amount = count - copied;
+            int32_t result;
+            if (amount > sizeof(chunk)) amount = sizeof(chunk);
+            result = vfs_read(scheduler_current_pid(), fd, chunk, amount);
+            if (result < 0)
+                return copied ? copied : (uint32_t)result;
+            if (result == 0) break;
+            if (!copy_to_user(user_buffer + copied, chunk,
+                              (uint32_t)result))
+                return copied ? copied : copy_from_user_error(HAKU_EFAULT);
+            copied += (uint32_t)result;
+            if ((uint32_t)result < amount) break;
+        }
+        return copied;
+    }
 
     /* The PS/2 console is canonical: return after newline or count bytes. */
     while (copied < count) {
@@ -134,6 +196,21 @@ static uint32_t sys_read(uint32_t fd, uint32_t user_buffer,
         if (ch == '\n') break;
     }
     return copied;
+}
+
+static uint32_t sys_open(uint32_t user_path, uint32_t flags) {
+    char path[13];
+    for (uint32_t i = 0; i < sizeof(path); i++) {
+        if (user_path > 0xFFFFFFFFu - i ||
+            !paging_user_range_valid(user_path + i, 1, 0))
+            return copy_from_user_error(HAKU_EFAULT);
+        path[i] = *(const char *)(user_path + i);
+        if (!path[i]) {
+            int32_t result = vfs_open(scheduler_current_pid(), path, flags);
+            return (uint32_t)result;
+        }
+    }
+    return copy_from_user_error(HAKU_ENAMETOOLONG);
 }
 
 regs_t *user_syscall(regs_t *r) {
@@ -151,6 +228,16 @@ regs_t *user_syscall(regs_t *r) {
         return r;
     case SYS_WRITE:
         r->eax = sys_write(r->ebx, r->ecx, r->edx);
+        return r;
+    case SYS_OPEN:
+        r->eax = sys_open(r->ebx, r->ecx);
+        return r;
+    case SYS_CLOSE:
+        r->eax = (uint32_t)vfs_close(scheduler_current_pid(), r->ebx);
+        return r;
+    case SYS_LSEEK:
+        r->eax = (uint32_t)vfs_seek(scheduler_current_pid(), r->ebx,
+                                    (int32_t)r->ecx, r->edx);
         return r;
     case SYS_GETPID:
         r->eax = scheduler_current_pid();
