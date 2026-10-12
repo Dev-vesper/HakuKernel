@@ -31,23 +31,24 @@ typedef struct {
 } idtr_t;
 #pragma pack(pop)
 
-/* Stack frame built by isr.asm: saved segments, pusha dump, vector info,
- * then what the CPU pushed (error code or dummy, eip/cs/eflags). */
+/* Stack frame built by isr.asm, followed by the CPU's privilege-transition
+ * ESP and SS when interrupted from ring 3. */
 typedef struct {
     uint32_t gs, fs, es, ds;
     uint32_t edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax;
     uint32_t int_no;
     uint32_t err_code;
     uint32_t eip, cs, eflags;
+    uint32_t user_esp, user_ss;
 } regs_t;
 
 void idt_init(void);
 void idt_set_gate(uint8_t n, uint32_t handler, uint16_t sel, uint8_t flags);
 
 /* C dispatchers called from isr.asm. */
-void isr_handler(regs_t *r);
-void irq_handler(regs_t *r);
-void syscall_handler(regs_t *r);
+regs_t *isr_handler(regs_t *r);
+regs_t *irq_handler(regs_t *r);
+regs_t *syscall_handler(regs_t *r);
 
 /* IRQ subscribers (drivers register here; vectors 32..47 map to IRQ 0..15). */
 typedef void (*irq_fn_t)(regs_t *r);
@@ -58,7 +59,6 @@ void irq_install(uint8_t irq, irq_fn_t fn);
 void idt_load(uint32_t idtr_addr);
 void cpu_sti(void);
 void cpu_cli(void);
-void user_enter(uint32_t eip, uint32_t user_esp);
-void user_mode_return(void);
+void scheduler_enter_frame(regs_t *frame);
 
 #endif

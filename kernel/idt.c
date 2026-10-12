@@ -8,6 +8,7 @@
 #include "idt.h"
 #include "paging.h"
 #include "pic.h"
+#include "scheduler.h"
 #include "usermode.h"
 
 static idt_entry_t idt[IDT_ENTRIES];
@@ -95,12 +96,12 @@ static void halt(void) {
     }
 }
 
-static void abort_user(regs_t *r) {
+static regs_t *abort_user(regs_t *r) {
     vga_write("USER exception vector=");
     vga_dec(r->int_no);
     vga_write(" eip=");
     vga_hex(r->eip);
-    vga_write("\nReturning to kernel.\n");
+    vga_write("\nTerminating process.\n");
     serial_write("USER-FAULT vector=");
     serial_dec(r->int_no);
     serial_write(" eip=");
@@ -110,20 +111,18 @@ static void abort_user(regs_t *r) {
         serial_hex(paging_get_cr2());
     }
     serial_write("\n");
-    r->eip = (uint32_t)user_mode_return;
-    r->cs = KERNEL_CS;
+    return scheduler_exit_current(r);
 }
 
-void isr_handler(regs_t *r) {
+regs_t *isr_handler(regs_t *r) {
     if (r->int_no < 32 && (r->cs & 3u) == 3u) {
-        abort_user(r);
-        return;
+        return abort_user(r);
     }
     if (r->int_no == 3) {
         /* #BP from INT3: resumable, used as the IDT self-test. */
         vga_write("INT3 ok\n");
         serial_write("EXC-03-BP BREAKPOINT-OK\n");
-        return;
+        return r;
     }
     if (r->int_no == 14) {
         /* #PF: early-fault behaviour like Linux mm/fault.c before the
@@ -142,11 +141,13 @@ void isr_handler(regs_t *r) {
         serial_hex(r->err_code);
         serial_write("\nhalting\n");
         halt();
+        return r;
     }
     if (r->int_no == 255) {
         vga_write("UNEXPECTED INTERRUPT, halting\n");
         serial_write("EXC-FF-UNEXPECTED halting\n");
         halt();
+        return r;
     }
     const char *name = r->int_no < 32 ? exc_names[r->int_no] : "???";
     vga_write("CPU EXCEPTION: ");
@@ -164,23 +165,24 @@ void isr_handler(regs_t *r) {
     serial_hex(r->eip);
     serial_write("\nhalting\n");
     halt();
+    return r;
 }
 
-void syscall_handler(regs_t *r) {
+regs_t *syscall_handler(regs_t *r) {
     if ((r->cs & 3u) != 3u) {
         serial_write("SYSCALL-REJECT non-user caller\n");
         r->eax = (uint32_t)-1;
-        return;
+        return r;
     }
-    user_syscall(r);
+    return user_syscall(r);
 }
 
-void irq_handler(regs_t *r) {
+regs_t *irq_handler(regs_t *r) {
     uint8_t irq = (uint8_t)(r->int_no - 32);
     if (irq >= 16) {
         serial_write("IRQ-BAD-VECTOR\n");
         pic_send_eoi(15);
-        return;
+        return r;
     }
     if (irq_handlers[irq])
         irq_handlers[irq](r);
@@ -195,4 +197,7 @@ void irq_handler(regs_t *r) {
         serial_write("\n");
     }
     pic_send_eoi(irq);
+    if (irq == 0)
+        return scheduler_preempt(r);
+    return r;
 }

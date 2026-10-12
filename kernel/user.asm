@@ -50,12 +50,14 @@ _user_program_start:
     cmp eax, edx
     jne .fail
 
-    ; getpid() -> 1 for the initial process.
+    ; Both scheduled processes must receive distinct valid PIDs.
     mov esi, 2
     mov eax, SYS_GETPID
     int 0x80
     cmp eax, 1
-    jne .fail
+    jb .fail
+    cmp eax, 2
+    ja .fail
 
     ; The data segment's BSS tail must be zero-filled by the ELF loader.
     mov esi, 2

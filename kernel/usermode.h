@@ -24,6 +24,6 @@
 
 int usermode_init(void);
 void usermode_run(void);
-void user_syscall(regs_t *r);
+regs_t *user_syscall(regs_t *r);
 
 #endif

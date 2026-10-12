@@ -23,8 +23,9 @@ python build.py run        :: build + boot in a QEMU window
 python build.py headless   :: build + boot headless, verify via serial log
 ```
 
-`python build.py headless` verifies the ring-3 entry, syscall, exit back to
-ring 0, and timer IRQs through the serial log.
+`python build.py headless` verifies ring-3 process entry, timer preemption,
+per-process kernel stacks, syscall handling, process exit/reaping, and timer
+IRQs through the serial log.
 The build is one Python script on purpose — `cmd.exe` quoting of spaced
 paths (e.g. `C:\Program Files\...`) is fragile, while `subprocess` argument
 lists just work.
@@ -37,8 +38,8 @@ BIOS (0x7C00)
      → A20 (Linux-style: test after BIOS/KBC/fast methods) → GDT → CR0.PE=1
         └─ far jump to KERNEL_ENTRY (= PE entry point from link.exe)
               └─ kernel/entry.asm (_entry stub) → call kernel_main
-                    └─ kernel/kernel.c: paging/IDT → GDT+TSS → ring-3 demo
-                          └─ int 0x80 write/exit → resume ring 0
+                    └─ kernel/kernel.c: paging/IDT → GDT+TSS → scheduler
+                          └─ timer-preempted ring-3 processes → int 0x80
 ```
 
 Memory map:
@@ -50,8 +51,9 @@ Memory map:
 | `0x7000–0x7240` | E820 map from stage2 (INT 15h, count at `0x6FFC`) |
 | `0x20000–0x23000` | page directory + initial tables (8 MiB supervisor identity map) |
 | `0x100000–0x400000` | kernel heap (kmalloc/kfree, 16 B aligned) |
-| `0x90000` | kernel stack top (grows down) |
-| `0x40000000` | user program page (user-readable/writable, supervisor identity alias) |
+| `0x90000` | bootstrap kernel stack top (grows down) |
+| below `0x800000` | allocated per-process 8 KiB kernel stacks |
+| `0x40000000` | user program code/data virtual base (per-process mapping) |
 | `0xBFFFE000–0xC0000000` | two user stack pages |
 | `0xB8000` | VGA text buffer |
 
@@ -78,19 +80,31 @@ tracked up to 128 MiB, while allocations are currently restricted to the
 identity-mapped first 8 MiB. Freeing validates alignment, usability, and
 allocation state so reserved pages cannot accidentally be released.
 
-### User mode (ring 3)
+### Processes and preemptive scheduling
+
+`kernel/scheduler.c` runs two instances of the ELF test program with separate
+address spaces and kernel stacks. The 100 Hz PIT preempts runnable processes
+by saving the complete interrupt frame and restoring another process's frame
+through `iret`. Each process has an 8 KiB ring-0 stack; `gdt_set_kernel_stack`
+updates `TSS.esp0` at every switch so the next ring-3 interrupt or syscall
+enters on the correct stack. User exceptions and `exit` mark a process for
+reaping; its address space and kernel stack are reclaimed after execution has
+moved to another stack. When all processes exit, the scheduler runs a
+dedicated kernel idle context.
 
 `kernel/gdt.c` installs flat ring-0/ring-3 code and data descriptors plus a
-32-bit TSS. The TSS points to a dedicated ring-0 interrupt/syscall stack;
-the bootloader's original kernel stack is not reused for privilege
-transitions. `kernel/paging.c` maps the sample program and its two-page stack
-with the user bit set only on those pages, leaving kernel identity mappings
-supervisor-only.
+32-bit TSS. `kernel/paging.c` gives each process supervisor-only kernel
+identity mappings and maps its user program and two-page user stack with
+user permissions.
 
-`kernel/user.asm` is copied to `0x40000000` and entered via `iret` at CPL 3.
-The initial syscall ABI follows the i386 Linux syscall numbers for a small
-POSIX-oriented subset: `exit` (1), `read` (3), `write` (4), and `getpid` (20),
-with arguments in `ebx`, `ecx`, and `edx` and syscall number/result in `eax`.
+`kernel/user.asm` is built as an ELF32 image, loaded separately for each
+process and entered via `iret` at CPL 3. The initial syscall ABI follows the
+i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
+`read` (3), `write` (4), and `getpid` (20), with arguments in `ebx`, `ecx`,
+and `edx` and syscall number/result in `eax`.
+
+### User-mode system calls
+
 `read` supports stdin from the PS/2 keyboard; `write` supports stdout/stderr
 to VGA and serial. Reads and writes are bounded to 4096 bytes, and errors
 return negative errno values (a future libc can translate these to `errno`).
@@ -116,10 +130,11 @@ segment is mapped according to its ELF permissions; the loader zeroes
 `p_memsz - p_filesz` for BSS and creates a two-page user stack.
 
 Each loaded image receives a fresh page directory containing supervisor-only
-kernel identity mappings plus only that image's user pages. The kernel
-activates the new CR3 for ring-3 execution, switches back to the kernel page
-directory on exit, and releases the image pages, page tables, stack, and
-directory. `kernel/user.asm` is a small ELF32 test executable; `build.py`
+kernel identity mappings plus only that image's user pages. The scheduler
+activates each process's CR3 on dispatch and returns to the kernel page
+directory for its idle context. Exited process mappings and page tables are
+released after switching away from their kernel stacks. `kernel/user.asm` is
+a small ELF32 test executable; `build.py`
 assembles it and embeds its bytes into the kernel so the normal headless QEMU
 test exercises the actual ELF parser and loader. This initial loader does
 not yet support ELF dynamic linking, relocations, shared libraries, or

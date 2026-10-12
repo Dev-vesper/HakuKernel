@@ -76,3 +76,7 @@ int gdt_init(void) {
     tss_load(TSS_SELECTOR);
     return 1;
 }
+
+void gdt_set_kernel_stack(uint32_t stack_top) {
+    tss.esp0 = stack_top;
+}

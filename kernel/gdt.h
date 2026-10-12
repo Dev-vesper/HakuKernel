@@ -9,6 +9,7 @@
 #define TSS_SELECTOR 0x28
 
 int gdt_init(void);
+void gdt_set_kernel_stack(uint32_t stack_top);
 
 /* Implemented in isr.asm. */
 void gdt_load(uint32_t gdtr_addr);

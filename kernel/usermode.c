@@ -2,12 +2,13 @@
 #include "console.h"
 #include "kbd.h"
 #include "paging.h"
+#include "scheduler.h"
 
 extern const uint8_t user_elf_image[];
 extern const uint32_t user_elf_image_size;
 
-static loaded_elf_t initial_program;
-static uint32_t current_pid = 1;
+static loaded_elf_t programs[2];
+#define USER_PROGRAM_COUNT (sizeof(programs) / sizeof(programs[0]))
 
 static int elf_rejection_self_test(void) {
     uint8_t invalid[116];
@@ -33,32 +34,41 @@ static int elf_rejection_self_test(void) {
 }
 
 int usermode_init(void) {
+    uint32_t loaded = 0;
     if (!elf_rejection_self_test()) {
         serial_write("ELF-REJECT-FAIL\n");
         return 0;
     }
-    if (!elf_load_executable(user_elf_image, user_elf_image_size,
-                             &initial_program)) {
-        serial_write("ELF-LOAD-FAIL invalid or unsupported ELF32 image\n");
-        return 0;
+    for (; loaded < USER_PROGRAM_COUNT; loaded++) {
+        if (!elf_load_executable(user_elf_image, user_elf_image_size,
+                                 &programs[loaded])) {
+            serial_write("ELF-LOAD-FAIL invalid or unsupported ELF32 image\n");
+            while (loaded)
+                paging_destroy_user_space(
+                    &programs[--loaded].address_space);
+            return 0;
+        }
     }
     serial_write("ELF-LOAD-OK entry=");
-    serial_hex(initial_program.entry);
+    serial_hex(programs[0].entry);
     serial_write(" cr3=");
-    serial_hex(initial_program.address_space.directory_phys);
+    serial_hex(programs[0].address_space.directory_phys);
     serial_write("\n");
     serial_write("USERMODE-READY stack=");
-    serial_hex(initial_program.user_stack);
+    serial_hex(programs[0].user_stack);
     serial_write("\n");
+    if (!scheduler_init(programs, USER_PROGRAM_COUNT)) {
+        serial_write("SCHED-INIT-FAIL\n");
+        for (uint32_t i = 0; i < USER_PROGRAM_COUNT; i++)
+            paging_destroy_user_space(&programs[i].address_space);
+        return 0;
+    }
     return 1;
 }
 
 void usermode_run(void) {
-    paging_activate_user_space(&initial_program.address_space);
     serial_write("USERMODE-ENTER\n");
-    user_enter(initial_program.entry, initial_program.user_stack);
-    paging_destroy_user_space(&initial_program.address_space);
-    serial_write("USERMODE-RETURNED address-space-freed\n");
+    scheduler_start();
 }
 
 static uint32_t copy_from_user_error(uint32_t error) {
@@ -126,27 +136,27 @@ static uint32_t sys_read(uint32_t fd, uint32_t user_buffer,
     return copied;
 }
 
-void user_syscall(regs_t *r) {
+regs_t *user_syscall(regs_t *r) {
     switch (r->eax) {
     case SYS_EXIT:
+        cpu_cli();
         serial_write("USER-EXIT-OK status=");
         serial_dec(r->ebx);
+        serial_write(" pid=");
+        serial_dec(scheduler_current_pid());
         serial_write("\n");
-        r->eip = (uint32_t)user_mode_return;
-        r->cs = KERNEL_CS;
-        r->eflags = 0x202u;
-        return;
+        return scheduler_exit_current(r);
     case SYS_READ:
         r->eax = sys_read(r->ebx, r->ecx, r->edx);
-        return;
+        return r;
     case SYS_WRITE:
         r->eax = sys_write(r->ebx, r->ecx, r->edx);
-        return;
+        return r;
     case SYS_GETPID:
-        r->eax = current_pid;
-        return;
+        r->eax = scheduler_current_pid();
+        return r;
     default:
         r->eax = copy_from_user_error(HAKU_ENOSYS);
-        return;
+        return r;
     }
 }

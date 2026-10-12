@@ -112,22 +112,8 @@ void kernel_main(void) {
     pic_clear_mask(0);
     cpu_sti();
 
-    vga_write("ELF32 loaded; press any key for user read() test...\n");
+    vga_write("ELF32 processes loaded; press two keys for read() tests...\n");
     usermode_run();
-    vga_write("Returned to ring 0 from user program.\n");
-
-    vga_write("Timer + keyboard running. Idling on hlt...\n");
-    /* Echo loop: drain the ring buffer, print what the user types. */
-    for (;;) {
-        int c = kbd_poll();
-        if (c >= 0 && c != 0) {
-            char ch = (char)c;
-            if (ch == '\n') vga_write("\n");
-            else if (ch >= 0x20 && ch < 0x7F) {
-                char s[2] = { ch, 0 };
-                vga_write(s);
-            }
-        }
-        __asm hlt
-    }
+    vga_write("Scheduler returned unexpectedly; halting.\n");
+    for (;;) __asm hlt
 }

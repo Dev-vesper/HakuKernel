@@ -219,9 +219,11 @@ def main():
                                                  "-serial", f"file:{serial}",
                                         "-monitor", f"tcp:127.0.0.1:{MON_PORT},server=on,wait=off"])
         try:
-            # The ring-3 syscall test blocks in read(0, ..., 1); any key works.
+            # Two instances block in read(0, ..., 1); each needs a key.
             time.sleep(1.0)
             monitor_cmd(MON_PORT, ["sendkey x"])
+            time.sleep(0.25)
+            monitor_cmd(MON_PORT, ["sendkey y"])
             proc.wait(timeout=12)
         except subprocess.TimeoutExpired:
             # Still alive: interrogate the CPU state, grab a screenshot, stop it.
@@ -260,11 +262,15 @@ def main():
             "ELF-LOAD-OK",   # valid ELF32 PT_LOAD segments loaded to fresh CR3
             "USERMODE-READY",# user stack mapped in its own address space
             "USERMODE-ENTER",# iret entered CPL 3
+            "SCHED-READY tasks=2 kernel-stack=per-task",
+            "SCHED-START pid=1",
+            "SCHED-PREEMPT-OK",
             "USERMODE-OK",   # ELF32 user image executed POSIX-style syscalls
             "USER-SYSCALL-CHECKS-OK", # EFAULT/EBADF/EINVAL/ENOSYS paths passed
             "USER-READ-OK",  # blocking read copied keyboard input to user memory
-            "USER-EXIT-OK status=0",
-            "USERMODE-RETURNED address-space-freed",
+            "USER-EXIT-OK status=0 pid=1",
+            "USER-EXIT-OK status=0 pid=2",
+            "SCHED-REAP-OK",
             "PIC-OK",        # 8259 remapped to 0x20/0x28
             "PIT-OK",        # 100 Hz timer programmed
             "KBD-OK",        # PS/2 keyboard IRQ1 handler installed
@@ -273,6 +279,8 @@ def main():
             "T+3s",
         ]
         missing = [m for m in expected if m not in content]
+        if content.count("SCHED-REAP-OK") < 2:
+            missing.append("two exited processes reaped")
         unexpected = [m for m in ("USER-SYSCALL-FAIL",) if m in content]
         if not missing and not unexpected:
             log("HEADLESS CHECK PASSED: " + ", ".join(expected))
