@@ -1,12 +1,12 @@
 ; =============================================================================
 ; Haku stage 2 — second-stage loader (NASM, 16-bit, loaded at 0x7E00)
 ;
-; Loaded by stage 1 (8 sectors, no size pressure here — up to 4 KiB).
+; Loaded by stage 1 (8 sectors, up to 4 KiB).
 ; Steps: load kernel (track-safe CHS loop) to 0x10000 -> enable A20
 ; (Linux-style: test after BIOS/KBC/fast methods) -> load GDT ->
 ; enter 32-bit protected mode -> jump to KERNEL_ENTRY.
 ;
-; Disk layout (see mkimg.py): [stage1: 1 sector][stage2: 8][kernel: 64].
+; Disk layout (see mkimg.py): [stage1: 1 sector][stage2: 8][kernel].
 ; So the kernel starts at LBA 9 = track 0, sector 10.
 ; A20 logic mirrors Linux arch/x86/boot/a20.c.
 ; KERNEL_ENTRY is passed by build.py (-DKERNEL_ENTRY=...) from the real
@@ -22,7 +22,10 @@
 
 KERNEL_LOAD_SEG    equ 0x1000     ; kernel destination = 0x1000:0x0000
 KERNEL_LOAD_OFF    equ 0x0000     ;   = linear 0x10000 (link.exe /BASE:0x10000)
-KERNEL_SECTORS     equ 64         ; 32 KiB max kernel (mkimg.py enforces this)
+%ifndef KERNEL_SECTORS
+%define KERNEL_SECTORS 896        ; maximum 448 KiB, ending below 0x80000
+%endif
+KERNEL_MAX_SECTORS equ 896        ; leave 64 KiB below the bootstrap stack
 KERNEL_FIRST_SECTOR equ 10        ; 1 + 8 stage-2 sectors + 1 (mkimg cross-checks)
 SECTORS_PER_TRACK  equ 18
 HEADS              equ 2
@@ -52,18 +55,59 @@ stage2:
     int 0x13
     jc disk_error
 
-    ; --- load kernel with INT 13h AH=0x02 (CHS) -------------------------------
-    mov ax, KERNEL_LOAD_SEG      ; 0x1000
+    ; --- load kernel with track-safe INT 13h AH=0x02 reads --------------------
+    ; Read one track fragment at a time; each request stays within a track
+    ; and under the BIOS 64 KiB transfer boundary. ES advances by 32
+    ; paragraphs per sector, so the destination can grow beyond 64 KiB.
+    mov word [kernel_sectors_left], KERNEL_SECTORS
+    mov word [kernel_dest_segment], KERNEL_LOAD_SEG
+    mov byte [kernel_sector], KERNEL_FIRST_SECTOR
+    mov byte [kernel_head], 0
+    mov byte [kernel_cylinder], 0
+.kernel_read_loop:
+    cmp word [kernel_sectors_left], 0
+    je .kernel_read_done
+
+    mov al, SECTORS_PER_TRACK + 1
+    sub al, [kernel_sector]      ; sectors left in this track
+    xor ah, ah
+    mov bx, ax
+    mov ax, [kernel_sectors_left]
+    cmp ax, bx
+    jae .kernel_chunk_ready
+    mov bx, ax                   ; final request may be shorter than a track
+.kernel_chunk_ready:
+    mov [kernel_chunk], bl
+    mov ax, [kernel_dest_segment]
     mov es, ax
-    mov bx, KERNEL_LOAD_OFF      ; 0x0000  -> linear 0x10000
-    mov ah, 0x02                 ; read sectors (CHS)
-    mov al, 64                   ; 64 sectors to read
-    mov ch, 0                    ; cylinder 0
-    mov cl, KERNEL_FIRST_SECTOR  ; sector 10 (1-based)
-    mov dh, 0                    ; head 0
+    xor bx, bx                   ; request is at most one 9 KiB track
+    mov ah, 0x02
+    mov al, [kernel_chunk]
+    mov ch, [kernel_cylinder]
+    mov cl, [kernel_sector]
+    mov dh, [kernel_head]
     mov dl, [boot_drive]
+    push ds
     int 0x13
+    pop ds
     jc disk_error
+
+    xor ax, ax
+    mov al, [kernel_chunk]
+    sub [kernel_sectors_left], ax
+    shl ax, 5                    ; 512 bytes = 32 paragraphs
+    add [kernel_dest_segment], ax
+
+    mov byte [kernel_sector], 1
+    cmp byte [kernel_head], HEADS - 1
+    jb .kernel_next_head
+    mov byte [kernel_head], 0
+    inc byte [kernel_cylinder]
+    jmp .kernel_read_loop
+.kernel_next_head:
+    inc byte [kernel_head]
+    jmp .kernel_read_loop
+.kernel_read_done:
 
     ; debug – read loop finished
     mov al, 'R'
@@ -317,6 +361,12 @@ enable_a20:
 
 ; ---------------------------------------------------------------- data
 boot_drive:   db 0
+kernel_sector: db 0
+kernel_head: db 0
+kernel_cylinder: db 0
+kernel_chunk: db 0
+kernel_sectors_left: dw 0
+kernel_dest_segment: dw 0
 msg_loading:  db 'Haku stage2: loading kernel...', 13, 10, 0
 msg_loaded:   db 'Haku stage2: kernel at 0x10000', 13, 10, 0
 msg_a20:      db 'Haku stage2: A20 gate open (tested)', 13, 10, 0

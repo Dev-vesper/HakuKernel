@@ -194,11 +194,14 @@ def main():
 
     # 5. boot stages (stage2 gets the real entry address)
     run([nasm, "-f", "bin", stage1_asm, "-o", stage1_bin])
-    run([nasm, "-f", "bin", f"-DKERNEL_ENTRY={entry}", stage2_asm, "-o", stage2_bin])
+    kernel_sectors = (os.path.getsize(kernel_bin) + 511) // 512
+    run([nasm, "-f", "bin", f"-DKERNEL_ENTRY={entry}",
+         f"-DKERNEL_SECTORS={kernel_sectors}", stage2_asm, "-o", stage2_bin])
 
     # 6. floppy image (all size/signature/sector checks live in mkimg.py)
     run([py, os.path.join(ROOT, "tools", "mkimg.py"),
-         stage1_bin, stage2_bin, kernel_bin, img, stage1_asm, stage2_asm])
+         stage1_bin, stage2_bin, kernel_bin, str(kernel_sectors), img,
+         stage1_asm, stage2_asm])
 
     mode = sys.argv[1] if len(sys.argv) > 1 else "build"
     disk = [qemu, "-drive", f"file={img},format=raw,if=floppy,index=0",

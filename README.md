@@ -47,7 +47,7 @@ Memory map:
 | Address | Use |
 |---|---|
 | `0x7C00` | boot sector (512 B) |
-| `0x10000–0x13000` | kernel PE image (~8.5 KiB, linked `/BASE:0x10000 /ALIGN:16`) |
+| `0x10000–0x80000` | kernel load window (up to 448 KiB, linked `/BASE:0x10000 /ALIGN:16`) |
 | `0x7000–0x7240` | E820 map from stage2 (INT 15h, count at `0x6FFC`) |
 | `0x20000–0x23000` | page directory + initial tables (8 MiB supervisor identity map) |
 | `0x100000–0x400000` | kernel heap (kmalloc/kfree, 16 B aligned) |
@@ -74,7 +74,7 @@ The boot proves the exception path with an `INT3` self-test.
 length fields in the E820 entries. Only complete 4 KiB pages wholly inside
 type-1 usable ranges are admitted; invalid entries and overlapping reserved
 ranges are excluded. The allocator explicitly reserves low boot/firmware
-memory, the kernel's 32 KiB load buffer, page tables, the boot stack, the ISA
+memory, the kernel's 448 KiB load window, page tables, the boot stack, the ISA
 hole, and the 1–4 MiB heap. `frame_usable_count()` reports E820-usable pages
 tracked up to 128 MiB, while allocations are currently restricted to the
 identity-mapped first 8 MiB. Freeing validates alignment, usability, and
@@ -148,8 +148,10 @@ MSVC-specific relocations, so we let the **real linker** do its job:
 (`/BASE:0x10000 /ENTRY:entry`),
 then the Python script only copies section bytes to their RVA — zero
 relocation math on our side, zero MSVC quirks to chase. The reported
-`ENTRY=` address is baked into `boot.asm` via `nasm -DKERNEL_ENTRY=...`
-(`/ALIGN:16` packs sections so the image fits the single-track read).
+`ENTRY=` address and exact padded kernel sector count are passed to stage 2.
+The stage-2 CHS loop reads track-bounded chunks into the 448 KiB load window,
+leaving 64 KiB below it for the bootstrap stack; `mkimg.py` enforces both
+the memory and floppy-image limits.
 
 The A20 routine mirrors Linux `arch/x86/boot/a20.c` (test → BIOS →
 test → keyboard controller → long test → fast gate, with the KBC drain
@@ -159,7 +161,8 @@ loop), and the COM1 init mirrors Linux `early_serial_init`.
 
 ```
 Haku/
-  boot/boot.asm        16-bit bootloader (disk → Linux-style A20 → GDT → protected mode)
+  boot/stage1.asm      16-bit boot sector; loads stage 2
+  boot/stage2.asm      CHS kernel loader (up to 448 KiB) → A20 → GDT → protected mode
   kernel/entry.asm     32-bit entry stub (_entry, linked first via /ENTRY)
   kernel/isr.asm       interrupt stubs, GDT/TSS load, ring-3 transition + syscalls
   kernel/user.asm      minimal ring-3 demo payload
@@ -175,7 +178,7 @@ Haku/
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       size/signature checks + floppy padding
   build.py             the whole build: cl/link/nasm/qemu orchestration
-  build/               generated files (boot.bin, kernel.obj/pe, haku.img, ...)
+  build/               generated files (stage*.bin, kernel.obj/pe, haku.img, ...)
   haku.img             bootable 1.44 MB floppy image
 ```
 
@@ -195,8 +198,9 @@ Haku/
   `build/serial.log`; no `HAKU-BOOT-OK` means the kernel never started
   (check disk load / GDT / entry address).
 - **NASM not found** — install it, then open a fresh terminal (PATH refresh).
-- **kernel grows past one track (17 sectors)** — extend `boot.asm` with a
-  multi-track CHS loop (`mkimg.py` tells you exactly this).
+- **kernel exceeds 448 KiB** — the stage-2 loader deliberately stops below
+  the bootstrap stack. Move to a memory-backed or later-stage loading design
+  before increasing this limit.
 
 ## Next steps (v0.2 ideas)
 
