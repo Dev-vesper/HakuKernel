@@ -236,8 +236,11 @@ Haku/
   the bootstrap stack. Move to a memory-backed or later-stage loading design
   before increasing this limit.
 
-## Next steps (v0.2 ideas)
+## Project documentation
 
-Writable filesystem operations and directories, then a VFS layer and
-`open`/`close` syscalls; ATA DMA/interrupt support and booting directly from
-the hard disk can follow.
+- [Roadmap](ROADMAP.md) — current status, milestones, and acceptance criteria.
+- [Contributing](CONTRIBUTING.md) — development setup and pull request guidance.
+- [Security policy](SECURITY.md) — private vulnerability reporting guidance.
+- [Support](SUPPORT.md) — where to ask questions and report reproducible issues.
+- [Code of Conduct](CODE_OF_CONDUCT.md) — expectations for project spaces.
+- [Agent instructions](AGENTS.md) — repository-wide coding and validation rules.
