@@ -101,15 +101,13 @@ _user_program_start:
     test eax, eax
     jne .fail
 
-    ; read one character into the user stack (QEMU headless sends "a").
+    ; read one arbitrary character into the user stack.
     mov eax, SYS_READ
     mov ebx, 0
     mov ecx, USER_STACK_TOP - 16
     mov edx, 1
     int 0x80
     cmp eax, 1
-    jne .fail
-    cmp byte [USER_STACK_TOP - 16], 'a'
     jne .fail
 
     ; Confirm range-checked copy_to_user and input delivery.

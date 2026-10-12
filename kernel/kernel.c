@@ -112,7 +112,7 @@ void kernel_main(void) {
     pic_clear_mask(0);
     cpu_sti();
 
-    vga_write("Entering ring 3 user program...\n");
+    vga_write("Entering ring 3; press any key for the read() test...\n");
     serial_write("USERMODE-ENTER\n");
     user_enter(USER_CODE_BASE, USER_STACK_TOP);
     vga_write("Returned to ring 0 from user program.\n");

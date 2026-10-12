@@ -196,9 +196,9 @@ def main():
                                                  "-serial", f"file:{serial}",
                                         "-monitor", f"tcp:127.0.0.1:{MON_PORT},server=on,wait=off"])
         try:
-            # The ring-3 syscall test blocks in read(0, ..., 1).
+            # The ring-3 syscall test blocks in read(0, ..., 1); any key works.
             time.sleep(1.0)
-            monitor_cmd(MON_PORT, ["sendkey a"])
+            monitor_cmd(MON_PORT, ["sendkey x"])
             proc.wait(timeout=12)
         except subprocess.TimeoutExpired:
             # Still alive: interrogate the CPU state, grab a screenshot, stop it.
