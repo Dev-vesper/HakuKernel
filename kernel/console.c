@@ -38,6 +38,10 @@ static void vga_putc(char c) {
     }
 }
 
+void console_putc(char c) {
+    vga_putc(c);
+}
+
 void vga_write(const char *s) {
     while (*s) vga_putc(*s++);
 }

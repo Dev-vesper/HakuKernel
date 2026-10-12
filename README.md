@@ -88,12 +88,23 @@ with the user bit set only on those pages, leaving kernel identity mappings
 supervisor-only.
 
 `kernel/user.asm` is copied to `0x40000000` and entered via `iret` at CPL 3.
-The minimal ABI uses `eax=1, ebx=user_string, int 0x80` for bounded serial
-output and `eax=0, int 0x80` to return to ring 0. The kernel validates the
-caller privilege and string range before copying user data. Exceptions from
-ring 3 are reported and terminate the demo program rather than halting the
-kernel. Run `python build.py headless` and look for `USERMODE-OK`,
-`USER-EXIT-OK`, and `USERMODE-RETURNED`.
+The initial syscall ABI follows the i386 Linux syscall numbers for a small
+POSIX-oriented subset: `exit` (1), `read` (3), `write` (4), and `getpid` (20),
+with arguments in `ebx`, `ecx`, and `edx` and syscall number/result in `eax`.
+`read` supports stdin from the PS/2 keyboard; `write` supports stdout/stderr
+to VGA and serial. Reads and writes are bounded to 4096 bytes, and errors
+return negative errno values (a future libc can translate these to `errno`).
+
+Before copying, the kernel validates every covered page in the current page
+tables for presence, user access, and write permission where required. It
+rejects unmapped/kernel pointers, wraparound, invalid descriptors and
+oversized I/O. The syscall entry enables interrupts while in kernel code so
+blocking keyboard reads can make progress; the keyboard wait is atomic
+against the interrupt/wakeup race. Ring-3 page faults are contained and
+reported rather than halting the kernel. These syscalls are an initial
+POSIX-inspired kernel interface, not full POSIX conformance. Run
+`python build.py headless` to test read/write/getpid/exit, bad pointers,
+descriptor errors, input copying, and continued timer operation.
 
 ### Why `link.exe` + `tools/pe2bin.py`?
 

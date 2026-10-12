@@ -118,3 +118,42 @@ int paging_map_user(uint32_t virtual_addr, uint32_t physical_addr) {
     paging_flush_all();
     return 1;
 }
+
+int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
+                            int write_access) {
+    uint32_t last_addr;
+    uint32_t page_addr;
+
+    if (length == 0) return 1;
+    if (virtual_addr < 0x40000000u ||
+        virtual_addr >= PAGING_USER_LIMIT ||
+        length - 1u > 0xFFFFFFFFu - virtual_addr)
+        return 0;
+    last_addr = virtual_addr + length - 1u;
+    if (last_addr >= PAGING_USER_LIMIT) return 0;
+
+    page_addr = virtual_addr & 0xFFFFF000u;
+    for (;;) {
+        uint32_t pde = DIR[page_addr >> 22];
+        uint32_t table_phys;
+        uint32_t pte;
+
+        if ((pde & (PAGE_PRESENT | PAGE_USER)) !=
+            (PAGE_PRESENT | PAGE_USER))
+            return 0;
+        if (write_access && !(pde & PAGE_RW)) return 0;
+
+        table_phys = pde & 0xFFFFF000u;
+        if (table_phys >= PAGING_IDMAP_MB * 1024u * 1024u)
+            return 0;
+        pte = ((uint32_t *)table_phys)[(page_addr >> 12) & 0x3FFu];
+        if ((pte & (PAGE_PRESENT | PAGE_USER)) !=
+            (PAGE_PRESENT | PAGE_USER))
+            return 0;
+        if (write_access && !(pte & PAGE_RW)) return 0;
+
+        if (page_addr == (last_addr & 0xFFFFF000u)) break;
+        page_addr += 0x1000u;
+    }
+    return 1;
+}

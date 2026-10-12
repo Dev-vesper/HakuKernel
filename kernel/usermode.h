@@ -1,4 +1,4 @@
-/* First ring-3 address space and its minimal syscall ABI. */
+/* i386 POSIX-inspired syscall ABI for the first user process. */
 #ifndef HAKU_USERMODE_H
 #define HAKU_USERMODE_H
 
@@ -7,9 +7,19 @@
 #define USER_CODE_BASE  0x40000000u
 #define USER_STACK_TOP  0xC0000000u
 #define USER_PAGE_SIZE  0x1000u
+#define USER_IO_MAX     4096u
 
-#define SYS_EXIT  0u
-#define SYS_WRITE 1u
+/* i386 Linux syscall numbers for the POSIX read/write/exit subset. */
+#define SYS_EXIT  1u
+#define SYS_READ  3u
+#define SYS_WRITE 4u
+#define SYS_GETPID 20u
+
+/* Raw syscall errors are returned as -errno; a future libc sets errno. */
+#define HAKU_EBADF  9u
+#define HAKU_EFAULT 14u
+#define HAKU_EINVAL 22u
+#define HAKU_ENOSYS 38u
 
 int usermode_init(void);
 void user_syscall(regs_t *r);

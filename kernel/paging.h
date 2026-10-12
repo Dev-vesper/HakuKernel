@@ -46,5 +46,7 @@ uint32_t paging_get_cr3(void); /* raw CR3 (== PAGING_DIR_PHYS after enable) */
 uint32_t paging_get_cr2(void); /* fault address (for the #PF handler) */
 void paging_flush_all(void);   /* reload CR3: full TLB flush (Linux flush_tlb_all) */
 int paging_map_user(uint32_t virtual_addr, uint32_t physical_addr);
+int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
+                            int write_access);
 
 #endif

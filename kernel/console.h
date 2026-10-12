@@ -10,6 +10,7 @@
 #define VGA_ROWS 25
 
 void console_init(void);
+void console_putc(char c);
 void vga_clear(uint8_t color);
 void vga_write(const char *s);
 void vga_hex(uint32_t v);

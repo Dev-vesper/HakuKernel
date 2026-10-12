@@ -72,9 +72,18 @@ int kbd_has_char(void) {
 
 char kbd_getchar(void) {
     for (;;) {
-        int c = kbd_poll();
-        if (c >= 0) return (char)c;
-        __asm hlt /* sleep until next interrupt */
+        int c;
+        cpu_cli();
+        c = kbd_poll();
+        if (c >= 0) {
+            cpu_sti();
+            return (char)c;
+        }
+        /* STI's interrupt shadow makes the check-and-sleep race-free. */
+        __asm {
+            sti
+            hlt
+        }
     }
 }
 

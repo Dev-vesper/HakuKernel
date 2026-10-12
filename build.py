@@ -196,6 +196,9 @@ def main():
                                                  "-serial", f"file:{serial}",
                                         "-monitor", f"tcp:127.0.0.1:{MON_PORT},server=on,wait=off"])
         try:
+            # The ring-3 syscall test blocks in read(0, ..., 1).
+            time.sleep(1.0)
+            monitor_cmd(MON_PORT, ["sendkey a"])
             proc.wait(timeout=12)
         except subprocess.TimeoutExpired:
             # Still alive: interrogate the CPU state, grab a screenshot, stop it.
@@ -232,8 +235,10 @@ def main():
             "GDT-OK",        # kernel/user selectors and ring-0 TSS stack loaded
             "USERMODE-READY",# user text + stack pages mapped user-accessible
             "USERMODE-ENTER",# iret entered CPL 3
-            "USERMODE-OK",   # ring-3 program reached the int 0x80 write syscall
-            "USER-EXIT-OK",  # syscall returned execution to the kernel
+            "USERMODE-OK",   # POSIX-style write/getpid syscalls passed
+            "USER-SYSCALL-CHECKS-OK", # EFAULT/EBADF/EINVAL/ENOSYS paths passed
+            "USER-READ-OK",  # blocking read copied keyboard input to user memory
+            "USER-EXIT-OK status=0",
             "USERMODE-RETURNED",
             "PIC-OK",        # 8259 remapped to 0x20/0x28
             "PIT-OK",        # 100 Hz timer programmed
@@ -243,10 +248,16 @@ def main():
             "T+3s",
         ]
         missing = [m for m in expected if m not in content]
-        if not missing:
+        unexpected = [m for m in ("USER-SYSCALL-FAIL",) if m in content]
+        if not missing and not unexpected:
             log("HEADLESS CHECK PASSED: " + ", ".join(expected))
         else:
-            sys.exit("HEADLESS CHECK FAILED: missing markers: " + ", ".join(missing))
+            failures = []
+            if missing:
+                failures.append("missing markers: " + ", ".join(missing))
+            if unexpected:
+                failures.append("unexpected markers: " + ", ".join(unexpected))
+            sys.exit("HEADLESS CHECK FAILED: " + "; ".join(failures))
     elif mode != "build":
         sys.exit(f"unknown mode: {mode} (use: build | run | headless)")
 

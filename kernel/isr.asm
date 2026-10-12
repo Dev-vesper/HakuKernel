@@ -40,6 +40,7 @@ _gdt_load:                       ; void gdt_load(uint32_t gdtr_addr)
     mov es, ax
     mov fs, ax
     mov gs, ax
+    cld                           ; kernel C code always runs with DF clear
     mov ss, ax
     jmp 0x08:.reload_cs
 .reload_cs:
@@ -186,6 +187,7 @@ _syscall128:
     mov es, ax
     mov fs, ax
     mov gs, ax
+    cld                           ; C code must not inherit user DF state
 %endmacro
 
 %macro RESTORE_SEGMENTS 0
@@ -221,7 +223,9 @@ irq_common:
 syscall_common:
     SAVE_SEGMENTS
     push esp
+    sti                           ; blocking syscalls need hardware IRQs
     call _syscall_handler
+    cli
     add esp, 4
     RESTORE_SEGMENTS
     add esp, 8
