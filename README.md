@@ -42,7 +42,8 @@ Memory map:
 | Address | Use |
 |---|---|
 | `0x7C00` | boot sector (512 B) |
-| `0x10000–0x12000` | kernel PE image (~2.5 KiB, linked `/BASE:0x10000 /ALIGN:16`) |
+| `0x10000–0x13000` | kernel PE image (~8.5 KiB, linked `/BASE:0x10000 /ALIGN:16`) |
+| `0x20000–0x22000` | page directory + page table (4 MiB identity map, P+W) |
 | `0x90000` | kernel stack top (grows down) |
 | `0xB8000` | VGA text buffer |
 
@@ -56,7 +57,7 @@ triple-faulting. All gates are interrupt gates (`0x8E`), so handlers never
 nest. The boot proves the whole path with an `INT3` self-test: the serial
 log must show `EXC-03-BP` followed by `INT3-RESUMED`.
 
-Next: 8259 remap + PIT timer (ticks), then the PS/2 keyboard driver.
+Next: the PS/2 keyboard driver, then a heap allocator on top of paging.
 
 ### Why `link.exe` + `tools/pe2bin.py`?
 
@@ -81,8 +82,9 @@ MyOS/
   kernel/isr.asm       interrupt stubs: 32 exceptions + 16 IRQs + catch-all
   kernel/cpu.h/cpu.c   types, port I/O, tiny libc (memset & friends, no CRT)
   kernel/console.h/.c  VGA text + COM1 serial drivers
-  kernel/idt.h/idt.c   IDT gates, exception/IRQ dispatchers
-  kernel/kernel.c      kernel_main: console → IDT → INT3 self-test → halt
+  kernel/idt.h/idt.c   IDT gates, exception/IRQ dispatchers (+ #PF handler)
+  kernel/paging.h/.c   i386 2-level tables (Linux-style): 4 MiB identity map, CR0.PG
+  kernel/kernel.c      kernel_main: console → IDT → INT3 self-test → paging → PIC/PIT → halt
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       size/signature checks + floppy padding
   build.py             the whole build: cl/link/nasm/qemu orchestration

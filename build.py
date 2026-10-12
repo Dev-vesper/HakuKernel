@@ -222,6 +222,7 @@ def main():
             "IDT-OK",        # 48 IDT gates loaded
             "EXC-03-BP",     # INT3 self-test dispatched through the IDT
             "INT3-RESUMED",  # handler returned, execution resumed
+            "PAGING-OK",     # 4 MiB identity map, CR0.PG on, R/W probe passed
             "PIC-OK",        # 8259 remapped to 0x20/0x28
             "PIT-OK",        # 100 Hz timer programmed
             "T+1s",          # hardware timer IRQs arriving

@@ -6,6 +6,7 @@
  */
 #include "console.h"
 #include "idt.h"
+#include "paging.h"
 #include "pic.h"
 
 static idt_entry_t idt[IDT_ENTRIES];
@@ -97,6 +98,24 @@ void isr_handler(regs_t *r) {
         vga_write("INT3 ok\n");
         serial_write("EXC-03-BP BREAKPOINT-OK\n");
         return;
+    }
+    if (r->int_no == 14) {
+        /* #PF: early-fault behaviour like Linux mm/fault.c before the
+         * full handler exists — report CR2 + error code, then halt.
+         * (The bit layout of err_code is Intel SDM vol 3: P=bit0,
+         * W/R=bit1, U/S=bit2.) */
+        uint32_t addr = paging_get_cr2();
+        vga_write("PAGE FAULT at ");
+        vga_hex(addr);
+        vga_write(" err=");
+        vga_hex(r->err_code);
+        vga_write("\nSystem halted.\n");
+        serial_write("PFAULT-OK addr=");
+        serial_hex(addr);
+        serial_write(" err=");
+        serial_hex(r->err_code);
+        serial_write("\nhalting\n");
+        halt();
     }
     if (r->int_no == 255) {
         vga_write("UNEXPECTED INTERRUPT, halting\n");
