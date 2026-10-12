@@ -1,11 +1,11 @@
-/* MyOS frame allocator interface.
+/* Haku frame allocator interface.
  *
  * One bit per 4 KiB frame: 0 = free, 1 = used.  The bitmap (4096 bytes
  * for 32768 frames = 128 MiB) is allocated from the heap at init —
  * frame_init() must run after heap_init().
  */
-#ifndef MYOS_FRAME_H
-#define MYOS_FRAME_H
+#ifndef HAKU_FRAME_H
+#define HAKU_FRAME_H
 
 #include "cpu.h"
 

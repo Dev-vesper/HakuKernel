@@ -1,4 +1,4 @@
-/* MyOS heap implementation.
+/* Haku heap implementation.
  *
  * Layout: [hdr1][payload1][hdr2][payload2]...[hdrN][payloadN]
  * All headers are linked in address order (sorted by address), so

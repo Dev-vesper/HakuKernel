@@ -1,4 +1,4 @@
-# MyOS v0.1 — a tiny x86 operating system in C
+# Haku v0.1 — a tiny x86 operating system in C
 
 Bootloader (NASM) loads a C kernel, switches the CPU to 32-bit protected
 mode, and the kernel prints to VGA text mode + serial port, then halts.
@@ -15,13 +15,13 @@ mode, and the kernel prints to VGA text mode + serial port, then halts.
 ## Build & run
 
 ```cmd
-cd D:\Source\MyOS
-python build.py            :: build myos.img only
+cd D:\Source\Haku
+python build.py            :: build haku.img only
 python build.py run        :: build + boot in a QEMU window
 python build.py headless   :: build + boot headless, verify via serial log
 ```
 
-Expected on screen: blue background, `MyOS v0.1 - hello from the C kernel`.
+Expected on screen: blue background, `Haku v0.1 - hello from the C kernel`.
 The build is one Python script on purpose — `cmd.exe` quoting of spaced
 paths (e.g. `C:\Program Files\...`) is fragile, while `subprocess` argument
 lists just work.
@@ -78,7 +78,7 @@ loop), and the COM1 init mirrors Linux `early_serial_init`.
 ## Project layout
 
 ```
-MyOS/
+Haku/
   boot/boot.asm        16-bit bootloader (disk → Linux-style A20 → GDT → protected mode)
   kernel/entry.asm     32-bit entry stub (_entry, linked first via /ENTRY)
   kernel/isr.asm       interrupt stubs: 32 exceptions + 16 IRQs + catch-all
@@ -91,8 +91,8 @@ MyOS/
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       size/signature checks + floppy padding
   build.py             the whole build: cl/link/nasm/qemu orchestration
-  build/               generated files (boot.bin, kernel.obj/pe, myos.img, ...)
-  myos.img             bootable 1.44 MB floppy image
+  build/               generated files (boot.bin, kernel.obj/pe, haku.img, ...)
+  haku.img             bootable 1.44 MB floppy image
 ```
 
 ## Troubleshooting
@@ -108,7 +108,7 @@ MyOS/
   `idt_load`) to meet NASM's `_isr0`, `_idt_load`. Spelling `_isr0` in C
   asks the linker for `__isr0`.
 - **QEMU triple-faults / reboots** — run `python build.py headless` and read
-  `build/serial.log`; no `MYOS-BOOT-OK` means the kernel never started
+  `build/serial.log`; no `HAKU-BOOT-OK` means the kernel never started
   (check disk load / GDT / entry address).
 - **NASM not found** — install it, then open a fresh terminal (PATH refresh).
 - **kernel grows past one track (17 sectors)** — extend `boot.asm` with a

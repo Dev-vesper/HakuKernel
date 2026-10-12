@@ -1,9 +1,9 @@
-/* MyOS cpu helpers: freestanding types, port I/O and tiny libc substitutes.
+/* Haku cpu helpers: freestanding types, port I/O and tiny libc substitutes.
  * No #include: works without vcvarsall INCLUDE paths. Provides the CRT
  * helpers (memset & friends) MSVC may emit calls to, so the link needs
  * no C runtime library. */
-#ifndef MYOS_CPU_H
-#define MYOS_CPU_H
+#ifndef HAKU_CPU_H
+#define HAKU_CPU_H
 
 typedef unsigned char  uint8_t;
 typedef unsigned short uint16_t;

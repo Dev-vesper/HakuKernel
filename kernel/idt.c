@@ -1,4 +1,4 @@
-/* MyOS IDT: gate setup plus the C exception/IRQ dispatchers.
+/* Haku IDT: gate setup plus the C exception/IRQ dispatchers.
  *
  * Vectors 0..31 are CPU exceptions, 32..47 are hardware IRQs (used once
  * pic.c remaps the 8259 there), 48..255 point at a catch-all that reports

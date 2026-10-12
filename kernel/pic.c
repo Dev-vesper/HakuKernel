@@ -1,4 +1,4 @@
-/* MyOS 8259 PIC driver: remap, masks and EOIs (see pic.h for the model). */
+/* Haku 8259 PIC driver: remap, masks and EOIs (see pic.h for the model). */
 #include "pic.h"
 
 /* 1 bit = masked, like Linux's cached_irq_mask (starts all-masked). */

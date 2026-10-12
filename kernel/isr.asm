@@ -1,5 +1,5 @@
 ; =============================================================================
-; MyOS v0.1 — interrupt stubs (NASM -> COFF object for link.exe)
+; Haku v0.1 — interrupt stubs (NASM -> COFF object for link.exe)
 ;
 ; Each CPU exception gets a tiny stub that pushes a uniform frame:
 ;   [dummy error code unless the CPU pushed a real one] + vector number,

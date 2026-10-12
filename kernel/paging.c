@@ -1,4 +1,4 @@
-/* MyOS paging implementation: Linux head_32.S logic in C.
+/* Haku paging implementation: Linux head_32.S logic in C.
  *
  * Linux (arch/x86/kernel/head_32.S, __startup_32) builds swapper_pg_dir
  * with PG0 identity entries, loads CR3, then sets CR0.PG. We do the same,

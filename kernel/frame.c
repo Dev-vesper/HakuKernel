@@ -1,4 +1,4 @@
-/* MyOS frame allocator implementation.
+/* Haku frame allocator implementation.
  *
  * Bitmap layout: bit 0 = frame 0 (phys 0x00000000), bit 1 = frame 1, ...
  *   bit = 0 -> free, bit = 1 -> used.

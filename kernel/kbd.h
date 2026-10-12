@@ -1,4 +1,4 @@
-/* MyOS PS/2 keyboard driver (IRQ1).
+/* Haku PS/2 keyboard driver (IRQ1).
  *
  * Follows the Linux early PS/2 keyboard path (drivers/input/keyboard/atkbd.c
  * simplified): read scancode from port 0x60 on IRQ1, translate set-1 scancodes
@@ -7,8 +7,8 @@
  * kbd_getchar() blocks; kbd_poll() is non-blocking. The driver never
  * allocates — it is safe to call before the heap.
  */
-#ifndef MYOS_KBD_H
-#define MYOS_KBD_H
+#ifndef HAKU_KBD_H
+#define HAKU_KBD_H
 
 #include "cpu.h"
 

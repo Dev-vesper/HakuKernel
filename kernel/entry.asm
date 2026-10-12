@@ -1,5 +1,5 @@
 ; =============================================================================
-; MyOS v0.1 — 32-bit kernel entry stub (NASM -> COFF object for link.exe)
+; Haku v0.1 — 32-bit kernel entry stub (NASM -> COFF object for link.exe)
 ;
 ; Assembled with `nasm -f win32` and linked FIRST on the link.exe command
 ; line, so the image starts here. link.exe /ENTRY:_entry jumps to this code

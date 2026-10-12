@@ -1,4 +1,4 @@
-/* MyOS heap: kmalloc/kfree/krealloc over a fixed identity-mapped region.
+/* Haku heap: kmalloc/kfree/krealloc over a fixed identity-mapped region.
  *
  * This is a classic free-list allocator (K&R style, adapted for kernel):
  * a doubly-linked list of blocks, first-fit search, split on alloc,
@@ -8,8 +8,8 @@
  * inside the 4 MiB identity map set up by paging.c. When the heap grows
  * past what we have mapped, the #PF handler fires — by design.
  */
-#ifndef MYOS_HEAP_H
-#define MYOS_HEAP_H
+#ifndef HAKU_HEAP_H
+#define HAKU_HEAP_H
 
 #include "cpu.h"
 

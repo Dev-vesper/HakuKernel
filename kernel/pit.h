@@ -1,9 +1,9 @@
-/* MyOS PIT driver: Intel 8253/8254 channel 0 as the system timer.
+/* Haku PIT driver: Intel 8253/8254 channel 0 as the system timer.
  * Programs mode 3 (square wave) at the requested Hz and counts ticks;
  * each full second is reported on serial (headless proof) and drawn in
  * the VGA corner (visible proof). */
-#ifndef MYOS_PIT_H
-#define MYOS_PIT_H
+#ifndef HAKU_PIT_H
+#define HAKU_PIT_H
 
 #include "cpu.h"
 

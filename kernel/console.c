@@ -1,4 +1,4 @@
-/* MyOS console: VGA text mode + COM1 serial output. */
+/* Haku console: VGA text mode + COM1 serial output. */
 #include "console.h"
 
 static volatile uint16_t *const VGA = (uint16_t *)0xB8000;

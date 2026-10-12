@@ -1,4 +1,4 @@
-/* MyOS 8259 PIC driver: remap, masks and EOIs.
+/* Haku 8259 PIC driver: remap, masks and EOIs.
  *
  * Programming mirrors Linux init_8259A (arch/x86/kernel/i8259.c): mask
  * everything, ICW1..ICW4 with io_wait() delays between writes (the 8259 is,
@@ -10,8 +10,8 @@
  * ISR through OCW3 (0x0B); if our bit isn't in service the interrupt was
  * spurious. A spurious slave IRQ gets a master-only EOI.
  */
-#ifndef MYOS_PIC_H
-#define MYOS_PIC_H
+#ifndef HAKU_PIC_H
+#define HAKU_PIC_H
 
 #include "cpu.h"
 

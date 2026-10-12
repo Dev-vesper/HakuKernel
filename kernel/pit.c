@@ -1,4 +1,4 @@
-/* MyOS PIT driver: 100 Hz-class system timer on IRQ0. */
+/* Haku PIT driver: 100 Hz-class system timer on IRQ0. */
 #include "console.h"
 #include "idt.h"
 #include "pic.h"

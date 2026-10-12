@@ -1,5 +1,5 @@
 ; =============================================================================
-; MyOS stage 2 — second-stage loader (NASM, 16-bit, loaded at 0x7E00)
+; Haku stage 2 — second-stage loader (NASM, 16-bit, loaded at 0x7E00)
 ;
 ; Loaded by stage 1 (8 sectors, no size pressure here — up to 4 KiB).
 ; Steps: load kernel (track-safe CHS loop) to 0x10000 -> enable A20
@@ -317,11 +317,11 @@ enable_a20:
 
 ; ---------------------------------------------------------------- data
 boot_drive:   db 0
-msg_loading:  db 'MyOS stage2: loading kernel...', 13, 10, 0
-msg_loaded:   db 'MyOS stage2: kernel at 0x10000', 13, 10, 0
-msg_a20:      db 'MyOS stage2: A20 gate open (tested)', 13, 10, 0
-msg_disk_err: db 'MyOS stage2: DISK READ ERROR', 13, 10, 0
-msg_a20_err:  db 'MyOS stage2: A20 FAILED (tried BIOS+KBC+fast)', 13, 10, 0
+msg_loading:  db 'Haku stage2: loading kernel...', 13, 10, 0
+msg_loaded:   db 'Haku stage2: kernel at 0x10000', 13, 10, 0
+msg_a20:      db 'Haku stage2: A20 gate open (tested)', 13, 10, 0
+msg_disk_err: db 'Haku stage2: DISK READ ERROR', 13, 10, 0
+msg_a20_err:  db 'Haku stage2: A20 FAILED (tried BIOS+KBC+fast)', 13, 10, 0
 
 ; ---------------------------------------------------------------- GDT (flat 4 GiB)
 gdt_start:

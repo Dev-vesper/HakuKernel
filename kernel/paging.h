@@ -1,4 +1,4 @@
-/* MyOS paging: i386 two-level tables, no PAE (Linux-style, simplified).
+/* Haku paging: i386 two-level tables, no PAE (Linux-style, simplified).
  *
  * This mirrors Linux arch/x86 early paging (head_32.S + paging_init):
  * a single page directory + one page table identity-mapping the first
@@ -8,8 +8,8 @@
  * Flag values are copied from Linux arch/x86/include/asm/pgtable_types.h
  * (_PAGE_BIT_* -> _PAGE_* masks).
  */
-#ifndef MYOS_PAGING_H
-#define MYOS_PAGING_H
+#ifndef HAKU_PAGING_H
+#define HAKU_PAGING_H
 
 #include "cpu.h"
 

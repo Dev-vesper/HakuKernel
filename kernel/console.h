@@ -1,8 +1,8 @@
-/* MyOS console: VGA text mode + COM1 serial output. Safe to call from
+/* Haku console: VGA text mode + COM1 serial output. Safe to call from
  * interrupt handlers (no locks needed yet: single CPU, handlers don't nest
  * because IDT gates are interrupt gates). */
-#ifndef MYOS_CONSOLE_H
-#define MYOS_CONSOLE_H
+#ifndef HAKU_CONSOLE_H
+#define HAKU_CONSOLE_H
 
 #include "cpu.h"
 

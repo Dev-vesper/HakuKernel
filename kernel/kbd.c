@@ -1,4 +1,4 @@
-/* MyOS PS/2 keyboard driver: IRQ1 + set-1 scancode translation.
+/* Haku PS/2 keyboard driver: IRQ1 + set-1 scancode translation.
  *
  * Set-1 scancodes are what the BIOS leaves the controller in after POST.
  * Bit 7 is set on "break" (key-up); everything else is "make" (key-down).

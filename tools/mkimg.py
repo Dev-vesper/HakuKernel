@@ -2,7 +2,7 @@
 """mkimg.py — assemble the bootable 1.44MB floppy image.
 
 Usage:
-    mkimg.py stage1.bin stage2.bin kernel.bin myos.img stage1.asm stage2.asm
+    mkimg.py stage1.bin stage2.bin kernel.bin haku.img stage1.asm stage2.asm
 
 Layout: [stage1: 1 sector][stage2: STAGE2_SECTORS][kernel: KERNEL_SECTORS].
 Checks: stage1 is 512 bytes with 0xAA55; stage2 fits its sector budget;

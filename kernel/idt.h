@@ -1,12 +1,12 @@
-/* MyOS interrupt handling: IDT gates, CPU exceptions and hardware IRQs.
+/* Haku interrupt handling: IDT gates, CPU exceptions and hardware IRQs.
  *
  * Layout mirrors the classic tutorial model (and Linux's split between
  * arch/x86/kernel/idt.c gate setup and entry stubs): isr.asm pushes a
  * uniform frame, C code dispatches. All gates are 32-bit interrupt gates
  * (0x8E): handlers run with IF clear, so they never nest on this CPU.
  */
-#ifndef MYOS_IDT_H
-#define MYOS_IDT_H
+#ifndef HAKU_IDT_H
+#define HAKU_IDT_H
 
 #include "cpu.h"
 

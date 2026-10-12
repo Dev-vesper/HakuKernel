@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""MyOS v0.1 build — one straightforward script, no shell-quoting games.
+"""Haku v0.1 build — one straightforward script, no shell-quoting games.
 
 Usage:
-    python build.py            build myos.img only
+    python build.py            build haku.img only
     python build.py run        build + boot in a QEMU window
     python build.py headless   build + boot headless, verify via serial log
 
@@ -11,7 +11,7 @@ Pipeline:
     entry.obj + kernel.obj --link--> kernel.pe --pe2bin--> kernel.bin
     stage1.asm --nasm--> stage1.bin (512 B)
     stage2.asm --nasm (-DKERNEL_ENTRY from the PE)--> stage2.bin
-    stage1 + stage2 + kernel.bin --mkimg--> myos.img (1.44 MB floppy)
+    stage1 + stage2 + kernel.bin --mkimg--> haku.img (1.44 MB floppy)
 
 All tools are invoked with argument lists (never through cmd.exe), so paths
 with spaces just work.
@@ -128,7 +128,7 @@ def main():
     kernel_bin = os.path.join(BUILD, "kernel.bin")
     stage1_bin = os.path.join(BUILD, "stage1.bin")
     stage2_bin = os.path.join(BUILD, "stage2.bin")
-    img = os.path.join(ROOT, "myos.img")
+    img = os.path.join(ROOT, "haku.img")
 
     # 1. kernel C files -> COFF objects
     c_objs = []
@@ -180,7 +180,7 @@ def main():
     # CPU exception trace: shows every #GP/#PF/triple-fault with EIP.
     trace = ["-d", "int,cpu_reset", "-D", os.path.join(BUILD, "qemu.log")]
     if mode == "run":
-        log("Booting MyOS in QEMU (close the window to return)...")
+        log("Booting Haku in QEMU (close the window to return)...")
         subprocess.run(disk)
     elif mode == "headless":
         serial = os.path.join(BUILD, "serial.log")
@@ -218,7 +218,7 @@ def main():
         log(content)
         # Commit-by-commit boot proof: every marker below must be present.
         expected = [
-            "MYOS-BOOT-OK",  # kernel_main reached
+            "HAKU-BOOT-OK",  # kernel_main reached
             "IDT-OK",        # 48 IDT gates loaded
             "EXC-03-BP",     # INT3 self-test dispatched through the IDT
             "INT3-RESUMED",  # handler returned, execution resumed

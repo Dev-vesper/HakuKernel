@@ -1,6 +1,6 @@
 # generated build outputs
 build/
-myos.img
+haku.img
 
 # python caches
 __pycache__/

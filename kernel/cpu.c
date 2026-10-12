@@ -1,4 +1,4 @@
-/* MyOS cpu helpers: port I/O and tiny libc substitutes. */
+/* Haku cpu helpers: port I/O and tiny libc substitutes. */
 #include "cpu.h"
 
 void outb(uint16_t port, uint8_t val) {

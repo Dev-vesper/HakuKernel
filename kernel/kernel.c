@@ -1,4 +1,4 @@
-/* MyOS v0.1 — kernel entry point (32-bit protected mode, ring 0).
+/* Haku v0.1 — kernel entry point (32-bit protected mode, ring 0).
  *
  * The bootloader has loaded us at 0x10000 with flat segments and a valid
  * stack. From here: console -> IDT -> self-test -> halt (IRQs arrive in
@@ -18,11 +18,11 @@ void kernel_main(void) {
     console_init();
 
     vga_write("============================================================\n");
-    vga_write("  MyOS v0.1 - hello from the C kernel (32-bit protected mode)\n");
+    vga_write("  Haku v0.1 - hello from the C kernel (32-bit protected mode)\n");
     vga_write("============================================================\n");
 
     /* Marker for automated checks: qemu -serial file:serial.log */
-    serial_write("MYOS-BOOT-OK cpu=386+ mode=protected video=vga serial=com1\n");
+    serial_write("HAKU-BOOT-OK cpu=386+ mode=protected video=vga serial=com1\n");
 
     idt_init();
     vga_write("IDT: 48 vectors + catch-all loaded\n");

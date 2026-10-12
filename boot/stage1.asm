@@ -1,5 +1,5 @@
 ; =============================================================================
-; MyOS stage 1 — boot sector (NASM, 16-bit, must stay within 510 bytes)
+; Haku stage 1 — boot sector (NASM, 16-bit, must stay within 510 bytes)
 ;
 ; BIOS loads this at 0x7C00 (DL = boot drive). It loads the stage-2 loader
 ; (STAGE2_SECTORS sectors right after this one) to 0x7E00 and jumps there.
@@ -125,7 +125,7 @@ serial_putc:                      ; AL = char
     ret
 
 boot_drive:   db 0
-msg_boot:     db 'MyOS', 13, 10, 0
+msg_boot:     db 'Haku', 13, 10, 0
 msg_disk_err: db 'stage1 disk err', 13, 10, 0
 
 times 510 - ($ - $$) db 0
