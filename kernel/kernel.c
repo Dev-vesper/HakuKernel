@@ -8,6 +8,7 @@
 #include "console.h"
 #include "heap.h"
 #include "idt.h"
+#include "kbd.h"
 #include "paging.h"
 #include "pic.h"
 #include "pit.h"
@@ -73,11 +74,27 @@ void kernel_main(void) {
     serial_write("PIC-OK remap=20/28\n");
     pit_init(100);
     serial_write("PIT-OK 100Hz\n");
+
+    /* PS/2 keyboard on IRQ1 (US layout, shift/caps handled in irq). */
+    kbd_init();
+    serial_write("KBD-OK irq1 irq1=unmasked\n");
+    vga_write("PS/2 keyboard ready (IRQ1). Type in QEMU window.\n");
+
     pic_clear_mask(0);
     cpu_sti();
 
-    vga_write("Timer running (see the corner clock). Idling on hlt...\n");
+    vga_write("Timer + keyboard running. Idling on hlt...\n");
+    /* Echo loop: drain the ring buffer, print what the user types. */
     for (;;) {
+        int c = kbd_poll();
+        if (c >= 0 && c != 0) {
+            char ch = (char)c;
+            if (ch == '\n') vga_write("\n");
+            else if (ch >= 0x20 && ch < 0x7F) {
+                char s[2] = { ch, 0 };
+                vga_write(s);
+            }
+        }
         __asm hlt
     }
 }

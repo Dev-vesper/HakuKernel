@@ -226,6 +226,7 @@ def main():
             "HEAP-OK",       # kmalloc/kfree/krealloc self-test passed
             "PIC-OK",        # 8259 remapped to 0x20/0x28
             "PIT-OK",        # 100 Hz timer programmed
+            "KBD-OK",        # PS/2 keyboard IRQ1 handler installed
             "T+1s",          # hardware timer IRQs arriving
             "T+2s",
             "T+3s",
