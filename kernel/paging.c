@@ -7,6 +7,7 @@
  * before and after the switch).
  */
 #include "paging.h"
+#include "frame.h"
 
 #define DIR  ((uint32_t *)PAGING_DIR_PHYS)
 #define TAB  ((uint32_t *)PAGING_TABLE_PHYS)
@@ -78,4 +79,42 @@ void paging_flush_all(void) {
         mov eax, cr3
         mov cr3, eax              /* reload -> full TLB flush */
     }
+}
+
+int paging_map_user(uint32_t virtual_addr, uint32_t physical_addr) {
+    uint32_t directory_index;
+    uint32_t table_index;
+    uint32_t *table;
+    uint32_t table_phys;
+
+    if ((virtual_addr & 0xFFFu) != 0 ||
+        (physical_addr & 0xFFFu) != 0 ||
+        virtual_addr >= PAGING_USER_LIMIT ||
+        physical_addr >= PAGING_IDMAP_MB * 1024u * 1024u)
+        return 0;
+
+    directory_index = virtual_addr >> 22;
+    table_index = (virtual_addr >> 12) & 0x3FFu;
+    if (!(DIR[directory_index] & PAGE_PRESENT)) {
+        void *new_table = frame_alloc();
+        if (!new_table) return 0;
+        table_phys = (uint32_t)new_table;
+        if (table_phys >= PAGING_IDMAP_MB * 1024u * 1024u) {
+            frame_free(new_table);
+            return 0;
+        }
+        memset(new_table, 0, 4096);
+        DIR[directory_index] = (table_phys & 0xFFFFF000u) |
+                               PAGE_PRESENT | PAGE_RW | PAGE_USER;
+    } else {
+        DIR[directory_index] |= PAGE_USER;
+        table_phys = DIR[directory_index] & 0xFFFFF000u;
+    }
+
+    table = (uint32_t *)table_phys;
+    if (table[table_index] & PAGE_PRESENT) return 0;
+    table[table_index] = (physical_addr & 0xFFFFF000u) |
+                         PAGE_PRESENT | PAGE_RW | PAGE_USER;
+    paging_flush_all();
+    return 1;
 }

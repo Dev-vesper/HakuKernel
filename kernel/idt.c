@@ -8,6 +8,7 @@
 #include "idt.h"
 #include "paging.h"
 #include "pic.h"
+#include "usermode.h"
 
 static idt_entry_t idt[IDT_ENTRIES];
 static idtr_t idtr;
@@ -32,6 +33,7 @@ DECLARE_IRQ(8); DECLARE_IRQ(9); DECLARE_IRQ(10); DECLARE_IRQ(11);
 DECLARE_IRQ(12); DECLARE_IRQ(13); DECLARE_IRQ(14); DECLARE_IRQ(15);
 
 extern void isr_default(void);
+extern void syscall128(void);
 
 static void (*isr_addrs[32])(void) = {
     isr0, isr1, isr2, isr3, isr4, isr5, isr6, isr7,
@@ -74,6 +76,7 @@ void idt_init(void) {
         idt_set_gate((uint8_t)(32 + i), (uint32_t)irq_addrs[i], KERNEL_CS, GATE_INT32);
     for (uint16_t i = 48; i < 256; i++)
         idt_set_gate((uint8_t)i, (uint32_t)isr_default, KERNEL_CS, GATE_INT32);
+    idt_set_gate(128, (uint32_t)syscall128, KERNEL_CS, GATE_USER_INT32);
     /* Mask the PIC until drivers unmask what they own (pic.c remaps first). */
     pic_mask_all();
     idtr.limit = (uint16_t)(sizeof(idt) - 1);
@@ -92,7 +95,30 @@ static void halt(void) {
     }
 }
 
+static void abort_user(regs_t *r) {
+    vga_write("USER exception vector=");
+    vga_dec(r->int_no);
+    vga_write(" eip=");
+    vga_hex(r->eip);
+    vga_write("\nReturning to kernel.\n");
+    serial_write("USER-FAULT vector=");
+    serial_dec(r->int_no);
+    serial_write(" eip=");
+    serial_hex(r->eip);
+    if (r->int_no == 14) {
+        serial_write(" cr2=");
+        serial_hex(paging_get_cr2());
+    }
+    serial_write("\n");
+    r->eip = (uint32_t)user_mode_return;
+    r->cs = KERNEL_CS;
+}
+
 void isr_handler(regs_t *r) {
+    if (r->int_no < 32 && (r->cs & 3u) == 3u) {
+        abort_user(r);
+        return;
+    }
     if (r->int_no == 3) {
         /* #BP from INT3: resumable, used as the IDT self-test. */
         vga_write("INT3 ok\n");
@@ -138,6 +164,15 @@ void isr_handler(regs_t *r) {
     serial_hex(r->eip);
     serial_write("\nhalting\n");
     halt();
+}
+
+void syscall_handler(regs_t *r) {
+    if ((r->cs & 3u) != 3u) {
+        serial_write("SYSCALL-REJECT non-user caller\n");
+        r->eax = (uint32_t)-1;
+        return;
+    }
+    user_syscall(r);
 }
 
 void irq_handler(regs_t *r) {

@@ -12,11 +12,9 @@
 [bits 32]
 
 global _idt_load, _cpu_sti, _cpu_cli
-extern _isr_handler, _irq_handler
+global _syscall128
+extern _isr_handler, _irq_handler, _syscall_handler
 
-; NOTE: win32 output needs an EXPLICIT section for global labels to bind.
-; Without this, NASM emits the code but drops every definition from the
-; symbol table (verified by dumping the .obj: sect=0 on all globals).
 section .text
 
 _idt_load:                       ; void idt_load(uint32_t idtr_addr)
@@ -32,6 +30,60 @@ _cpu_cli:
     cli
     ret
 
+; The first privilege transition also needs a safe ring-0 stack.
+global _gdt_load, _tss_load, _user_enter, _user_mode_return
+_gdt_load:                       ; void gdt_load(uint32_t gdtr_addr)
+    mov eax, [esp+4]
+    lgdt [eax]
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    jmp 0x08:.reload_cs
+.reload_cs:
+    ret
+
+_tss_load:                       ; void tss_load(uint16_t selector)
+    mov ax, [esp+4]
+    ltr ax
+    ret
+
+_user_enter:                     ; void user_enter(uint32_t eip, uint32_t esp)
+    mov eax, [esp+4]
+    mov edx, [esp+8]
+    mov [user_kernel_esp], esp
+    push dword 0x23              ; ring-3 data selector
+    push edx
+    pushfd
+    pop ecx
+    or ecx, 0x200                ; enable maskable interrupts in user mode
+    and ecx, 0xFFFFCFFF          ; never grant IOPL to user code
+    push ecx
+    push dword 0x1B              ; ring-3 code selector
+    push eax
+    mov ax, 0x23
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    iret
+
+_user_mode_return:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov esp, [user_kernel_esp]
+    ret
+
+section .bss
+align 4
+user_kernel_esp: resd 1
+
+section .text
 ; ---- CPU exceptions: dummy error code except where the CPU pushes one -----
 ; Error-code vectors (Intel SDM): 8, 10, 11, 12, 13, 14, 17.
 %macro ISR_NOERR 1
@@ -108,39 +160,69 @@ _isr_default:
     push 255
     jmp isr_common
 
-; ---- common entry ------------------------------------------------------------
-isr_common:
-    pusha                         ; eax,ecx,edx,ebx,esp,ebp,esi,edi
-    mov ax, ds
-    push eax                      ; ds
-    mov ax, 0x10                  ; kernel data segment
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-    push esp                      ; regs_t* argument
-    call _isr_handler
-    add esp, 4                    ; drop argument
-    pop eax
-    mov ds, ax                    ; restore ds (es/fs/gs never changed)
-    popa
-    add esp, 8                    ; drop vector number + error code
-    iret
+global _syscall128
+_syscall128:
+    push 0
+    push 128
+    jmp syscall_common
 
-irq_common:
+; ---- common entry ------------------------------------------------------------
+%macro SAVE_SEGMENTS 0
     pusha
+    xor eax, eax
     mov ax, ds
+    push eax
+    xor eax, eax
+    mov ax, es
+    push eax
+    xor eax, eax
+    mov ax, fs
+    push eax
+    xor eax, eax
+    mov ax, gs
     push eax
     mov ax, 0x10
     mov ds, ax
     mov es, ax
     mov fs, ax
     mov gs, ax
-    push esp
-    call _irq_handler
-    add esp, 4
+%endmacro
+
+%macro RESTORE_SEGMENTS 0
+    pop eax
+    mov gs, ax
+    pop eax
+    mov fs, ax
+    pop eax
+    mov es, ax
     pop eax
     mov ds, ax
     popa
+%endmacro
+
+isr_common:
+    SAVE_SEGMENTS
+    push esp                      ; regs_t* argument
+    call _isr_handler
+    add esp, 4                    ; drop argument
+    RESTORE_SEGMENTS
+    add esp, 8                    ; drop vector number + error code
+    iret
+
+irq_common:
+    SAVE_SEGMENTS
+    push esp
+    call _irq_handler
+    add esp, 4
+    RESTORE_SEGMENTS
+    add esp, 8
+    iret
+
+syscall_common:
+    SAVE_SEGMENTS
+    push esp
+    call _syscall_handler
+    add esp, 4
+    RESTORE_SEGMENTS
     add esp, 8
     iret

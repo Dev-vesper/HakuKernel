@@ -13,6 +13,8 @@
 #include "frame.h"
 #include "pic.h"
 #include "pit.h"
+#include "gdt.h"
+#include "usermode.h"
 
 void kernel_main(void) {
     console_init();
@@ -81,6 +83,22 @@ void kernel_main(void) {
         }
     }
 
+    if (!gdt_init()) {
+        vga_write("GDT/TSS initialization failed, halting\n");
+        serial_write("GDT-FAIL\n");
+        for (;;) {
+            __asm hlt
+        }
+    }
+    serial_write("GDT-OK ring3 tss esp0 configured\n");
+
+    if (!usermode_init()) {
+        vga_write("User address space setup failed, halting\n");
+        for (;;) {
+            __asm hlt
+        }
+    }
+
     /* PS/2 keyboard on IRQ1 (US layout, shift/caps handled in irq). */
     kbd_init();
     serial_write("KBD-OK irq1 irq1=unmasked\n");
@@ -95,6 +113,12 @@ void kernel_main(void) {
 
     pic_clear_mask(0);
     cpu_sti();
+
+    vga_write("Entering ring 3 user program...\n");
+    serial_write("USERMODE-ENTER\n");
+    user_enter(USER_CODE_BASE, USER_STACK_TOP);
+    vga_write("Returned to ring 0 from user program.\n");
+    serial_write("USERMODE-RETURNED\n");
 
     vga_write("Timer + keyboard running. Idling on hlt...\n");
     /* Echo loop: drain the ring buffer, print what the user types. */

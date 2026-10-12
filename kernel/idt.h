@@ -12,7 +12,9 @@
 
 #define IDT_ENTRIES 256
 #define KERNEL_CS   0x08
+#define USER_CS     0x1B
 #define GATE_INT32  0x8E /* present, ring 0, 32-bit interrupt gate */
+#define GATE_USER_INT32 0xEE /* present, ring 3, 32-bit interrupt gate */
 
 #pragma pack(push, 1)
 typedef struct {
@@ -29,10 +31,10 @@ typedef struct {
 } idtr_t;
 #pragma pack(pop)
 
-/* Stack frame built by isr.asm: segment reg, pusha dump, vector info,
+/* Stack frame built by isr.asm: saved segments, pusha dump, vector info,
  * then what the CPU pushed (error code or dummy, eip/cs/eflags). */
 typedef struct {
-    uint32_t ds;
+    uint32_t gs, fs, es, ds;
     uint32_t edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax;
     uint32_t int_no;
     uint32_t err_code;
@@ -45,6 +47,7 @@ void idt_set_gate(uint8_t n, uint32_t handler, uint16_t sel, uint8_t flags);
 /* C dispatchers called from isr.asm. */
 void isr_handler(regs_t *r);
 void irq_handler(regs_t *r);
+void syscall_handler(regs_t *r);
 
 /* IRQ subscribers (drivers register here; vectors 32..47 map to IRQ 0..15). */
 typedef void (*irq_fn_t)(regs_t *r);
@@ -55,5 +58,7 @@ void irq_install(uint8_t irq, irq_fn_t fn);
 void idt_load(uint32_t idtr_addr);
 void cpu_sti(void);
 void cpu_cli(void);
+void user_enter(uint32_t eip, uint32_t user_esp);
+void user_mode_return(void);
 
 #endif

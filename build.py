@@ -119,11 +119,13 @@ def main():
         sys.exit("no kernel/*.c files found")
     entry_asm = os.path.join(kernel_dir, "entry.asm")
     isr_asm = os.path.join(kernel_dir, "isr.asm")
+    user_asm = os.path.join(kernel_dir, "user.asm")
     boot_dir = os.path.join(ROOT, "boot")
     stage1_asm = os.path.join(boot_dir, "stage1.asm")
     stage2_asm = os.path.join(boot_dir, "stage2.asm")
     entry_obj = os.path.join(BUILD, "entry.obj")
     isr_obj = os.path.join(BUILD, "isr.obj")
+    user_obj = os.path.join(BUILD, "user.obj")
     kernel_pe = os.path.join(BUILD, "kernel.pe")
     kernel_bin = os.path.join(BUILD, "kernel.bin")
     stage1_bin = os.path.join(BUILD, "stage1.bin")
@@ -141,7 +143,8 @@ def main():
     # 2. asm stubs -> COFF (entry linked FIRST so the image starts there)
     run([nasm, "-f", "win32", entry_asm, "-o", entry_obj])
     run([nasm, "-f", "win32", isr_asm, "-o", isr_obj])
-    log("entry.obj + isr.obj built")
+    run([nasm, "-f", "win32", user_asm, "-o", user_obj])
+    log("entry.obj + isr.obj + user.obj built")
 
     # 3. link a fixed-base PE (/ENTRY:entry — link prepends _ for x86;
     #    /ALIGN:16 packs sections; /FIXED drops .reloc — we always load
@@ -149,7 +152,7 @@ def main():
     run([link, "/NOLOGO", "/SUBSYSTEM:NATIVE", "/ENTRY:entry",
          "/BASE:0x10000", "/ALIGN:16", "/FIXED", "/NODEFAULTLIB",
          "/MAP:" + os.path.join(BUILD, "kernel.map"),
-         "/OUT:" + kernel_pe, entry_obj, isr_obj] + c_objs)
+         "/OUT:" + kernel_pe, entry_obj, isr_obj, user_obj] + c_objs)
     log("kernel.pe linked")
 
     # 4. PE -> flat binary, learn the entry address
@@ -226,6 +229,12 @@ def main():
             "HEAP-OK",       # kmalloc/kfree/krealloc self-test passed
             "E820-OK",       # stage2 INT 15h map handoff verified
             "FRAME-OK",      # frame_alloc/free self-test passed
+            "GDT-OK",        # kernel/user selectors and ring-0 TSS stack loaded
+            "USERMODE-READY",# user text + stack pages mapped user-accessible
+            "USERMODE-ENTER",# iret entered CPL 3
+            "USERMODE-OK",   # ring-3 program reached the int 0x80 write syscall
+            "USER-EXIT-OK",  # syscall returned execution to the kernel
+            "USERMODE-RETURNED",
             "PIC-OK",        # 8259 remapped to 0x20/0x28
             "PIT-OK",        # 100 Hz timer programmed
             "KBD-OK",        # PS/2 keyboard IRQ1 handler installed
