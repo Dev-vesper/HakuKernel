@@ -6,6 +6,7 @@
  */
 #include "cpu.h"
 #include "console.h"
+#include "heap.h"
 #include "idt.h"
 #include "paging.h"
 #include "pic.h"
@@ -56,6 +57,15 @@ void kernel_main(void) {
     }
     vga_write("PAGING: 4 MiB identity mapped, CR0.PG on\n");
     serial_write("PAGING-OK idmap=4MB cr3=0x20000\n");
+
+    /* Heap: free-list allocator over the identity-mapped 1–4 MiB range.
+     * Must come after paging so the whole region is walkable. */
+    heap_init();
+    if (!heap_self_test()) {
+        for (;;) {
+            __asm hlt
+        }
+    }
 
     /* Remap the 8259 (IRQs were colliding with CPU exceptions 8..15),
      * start the 100 Hz timer and open IRQ0 only. */
