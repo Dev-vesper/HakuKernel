@@ -3,6 +3,7 @@
 #define HAKU_USERMODE_H
 
 #include "idt.h"
+#include "elf.h"
 
 #define USER_CODE_BASE  0x40000000u
 #define USER_STACK_TOP  0xC0000000u
@@ -22,6 +23,7 @@
 #define HAKU_ENOSYS 38u
 
 int usermode_init(void);
+void usermode_run(void);
 void user_syscall(regs_t *r);
 
 #endif

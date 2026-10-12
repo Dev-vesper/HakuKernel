@@ -1,24 +1,72 @@
 #include "usermode.h"
 #include "console.h"
-#include "frame.h"
 #include "kbd.h"
 #include "paging.h"
 
-extern const uint8_t user_program_start[];
-extern const uint8_t user_program_end[];
+extern const uint8_t user_elf_image[];
+extern const uint32_t user_elf_image_size;
 
+static loaded_elf_t initial_program;
 static uint32_t current_pid = 1;
 
-static void *alloc_identity_frame(void) {
-    void *frame = frame_alloc();
-    if (frame && (uint32_t)frame >= PAGING_IDMAP_MB * 1024u * 1024u) {
-        frame_free(frame);
-        return 0;
-    }
-    return frame;
+static int elf_rejection_self_test(void) {
+    uint8_t invalid[116];
+    loaded_elf_t rejected;
+
+    memcpy(invalid, user_elf_image, sizeof(invalid));
+    invalid[0] = 0;
+    if (elf_load_executable(invalid, sizeof(invalid), &rejected)) return 0;
+
+    memcpy(invalid, user_elf_image, sizeof(invalid));
+    invalid[28] = 0xF0;
+    invalid[29] = 0xFF;
+    invalid[30] = 0xFF;
+    invalid[31] = 0xFF;
+    if (elf_load_executable(invalid, sizeof(invalid), &rejected)) return 0;
+
+    memcpy(invalid, user_elf_image, sizeof(invalid));
+    invalid[76] = 7; /* first PT_LOAD would be writable and executable */
+    if (elf_load_executable(invalid, sizeof(invalid), &rejected)) return 0;
+
+    serial_write("ELF-REJECT-OK malformed headers and W+X rejected\n");
+    return 1;
 }
 
-static int copy_from_user(void *destination, uint32_t source, uint32_t length) {
+int usermode_init(void) {
+    if (!elf_rejection_self_test()) {
+        serial_write("ELF-REJECT-FAIL\n");
+        return 0;
+    }
+    if (!elf_load_executable(user_elf_image, user_elf_image_size,
+                             &initial_program)) {
+        serial_write("ELF-LOAD-FAIL invalid or unsupported ELF32 image\n");
+        return 0;
+    }
+    serial_write("ELF-LOAD-OK entry=");
+    serial_hex(initial_program.entry);
+    serial_write(" cr3=");
+    serial_hex(initial_program.address_space.directory_phys);
+    serial_write("\n");
+    serial_write("USERMODE-READY stack=");
+    serial_hex(initial_program.user_stack);
+    serial_write("\n");
+    return 1;
+}
+
+void usermode_run(void) {
+    paging_activate_user_space(&initial_program.address_space);
+    serial_write("USERMODE-ENTER\n");
+    user_enter(initial_program.entry, initial_program.user_stack);
+    paging_destroy_user_space(&initial_program.address_space);
+    serial_write("USERMODE-RETURNED address-space-freed\n");
+}
+
+static uint32_t copy_from_user_error(uint32_t error) {
+    return 0u - error;
+}
+
+static int copy_from_user(void *destination, uint32_t source,
+                          uint32_t length) {
     if (!paging_user_range_valid(source, length, 0)) return 0;
     if (length) memcpy(destination, (const void *)source, length);
     return 1;
@@ -31,25 +79,23 @@ static int copy_to_user(uint32_t destination, const void *source,
     return 1;
 }
 
-static uint32_t syscall_error(uint32_t error) {
-    return 0u - error;
-}
-
 static uint32_t sys_write(uint32_t fd, uint32_t user_buffer,
                           uint32_t count) {
     char chunk[128];
     uint32_t offset = 0;
 
-    if (fd != 1u && fd != 2u) return syscall_error(HAKU_EBADF);
-    if (count > USER_IO_MAX) return syscall_error(HAKU_EINVAL);
+    if (fd != 1u && fd != 2u)
+        return copy_from_user_error(HAKU_EBADF);
+    if (count > USER_IO_MAX)
+        return copy_from_user_error(HAKU_EINVAL);
     if (!paging_user_range_valid(user_buffer, count, 0))
-        return syscall_error(HAKU_EFAULT);
+        return copy_from_user_error(HAKU_EFAULT);
 
     while (offset < count) {
         uint32_t amount = count - offset;
         if (amount > sizeof(chunk)) amount = sizeof(chunk);
         if (!copy_from_user(chunk, user_buffer + offset, amount))
-            return offset ? offset : syscall_error(HAKU_EFAULT);
+            return offset ? offset : copy_from_user_error(HAKU_EFAULT);
         for (uint32_t i = 0; i < amount; i++) {
             console_putc(chunk[i]);
             serial_putc(chunk[i]);
@@ -63,55 +109,21 @@ static uint32_t sys_read(uint32_t fd, uint32_t user_buffer,
                          uint32_t count) {
     uint32_t copied = 0;
 
-    if (fd != 0u) return syscall_error(HAKU_EBADF);
-    if (count > USER_IO_MAX) return syscall_error(HAKU_EINVAL);
+    if (fd != 0u) return copy_from_user_error(HAKU_EBADF);
+    if (count > USER_IO_MAX) return copy_from_user_error(HAKU_EINVAL);
     if (count == 0) return 0;
     if (!paging_user_range_valid(user_buffer, count, 1))
-        return syscall_error(HAKU_EFAULT);
+        return copy_from_user_error(HAKU_EFAULT);
 
     /* The PS/2 console is canonical: return after newline or count bytes. */
     while (copied < count) {
         char ch = kbd_getchar();
         if (!copy_to_user(user_buffer + copied, &ch, 1))
-            return copied ? copied : syscall_error(HAKU_EFAULT);
+            return copied ? copied : copy_from_user_error(HAKU_EFAULT);
         copied++;
         if (ch == '\n') break;
     }
     return copied;
-}
-
-int usermode_init(void) {
-    void *code = alloc_identity_frame();
-    void *stack_low = alloc_identity_frame();
-    void *stack_high = alloc_identity_frame();
-    size_t code_size = (size_t)(user_program_end - user_program_start);
-
-    if (!code || !stack_low || !stack_high ||
-        code_size == 0 || code_size > USER_PAGE_SIZE) {
-        serial_write("USERMODE-FAIL allocation or image size\n");
-        return 0;
-    }
-
-    memset(code, 0, USER_PAGE_SIZE);
-    memcpy(code, user_program_start, code_size);
-    memset(stack_low, 0, USER_PAGE_SIZE);
-    memset(stack_high, 0, USER_PAGE_SIZE);
-
-    if (!paging_map_user(USER_CODE_BASE, (uint32_t)code) ||
-        !paging_map_user(USER_STACK_TOP - 2u * USER_PAGE_SIZE,
-                         (uint32_t)stack_low) ||
-        !paging_map_user(USER_STACK_TOP - USER_PAGE_SIZE,
-                         (uint32_t)stack_high)) {
-        serial_write("USERMODE-FAIL page mapping\n");
-        return 0;
-    }
-
-    serial_write("USERMODE-READY code=");
-    serial_hex(USER_CODE_BASE);
-    serial_write(" stack=");
-    serial_hex(USER_STACK_TOP);
-    serial_write("\n");
-    return 1;
 }
 
 void user_syscall(regs_t *r) {
@@ -134,7 +146,7 @@ void user_syscall(regs_t *r) {
         r->eax = current_pid;
         return;
     default:
-        r->eax = syscall_error(HAKU_ENOSYS);
+        r->eax = copy_from_user_error(HAKU_ENOSYS);
         return;
     }
 }

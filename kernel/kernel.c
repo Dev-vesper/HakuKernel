@@ -112,11 +112,9 @@ void kernel_main(void) {
     pic_clear_mask(0);
     cpu_sti();
 
-    vga_write("Entering ring 3; press any key for the read() test...\n");
-    serial_write("USERMODE-ENTER\n");
-    user_enter(USER_CODE_BASE, USER_STACK_TOP);
+    vga_write("ELF32 loaded; press any key for user read() test...\n");
+    usermode_run();
     vga_write("Returned to ring 0 from user program.\n");
-    serial_write("USERMODE-RETURNED\n");
 
     vga_write("Timer + keyboard running. Idling on hlt...\n");
     /* Echo loop: drain the ring buffer, print what the user types. */

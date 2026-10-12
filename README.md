@@ -106,6 +106,25 @@ POSIX-inspired kernel interface, not full POSIX conformance. Run
 `python build.py headless` to test read/write/getpid/exit, bad pointers,
 descriptor errors, input copying, and continued timer operation.
 
+### ELF32 program loading
+
+`kernel/elf.c` loads static ELF32 little-endian i386 `ET_EXEC` images.
+It validates the ELF header and program-header bounds, accepts non-overlapping
+readable `PT_LOAD` segments, checks address arithmetic and file ranges, and
+rejects dynamic/interpreted images and writable-executable segments. Each
+segment is mapped according to its ELF permissions; the loader zeroes
+`p_memsz - p_filesz` for BSS and creates a two-page user stack.
+
+Each loaded image receives a fresh page directory containing supervisor-only
+kernel identity mappings plus only that image's user pages. The kernel
+activates the new CR3 for ring-3 execution, switches back to the kernel page
+directory on exit, and releases the image pages, page tables, stack, and
+directory. `kernel/user.asm` is a small ELF32 test executable; `build.py`
+assembles it and embeds its bytes into the kernel so the normal headless QEMU
+test exercises the actual ELF parser and loader. This initial loader does
+not yet support ELF dynamic linking, relocations, shared libraries, or
+loading from a filesystem.
+
 ### Why `link.exe` + `tools/pe2bin.py`?
 
 MS `link.exe` cannot emit flat binaries and raw COFF objects carry
@@ -129,6 +148,7 @@ Haku/
   kernel/entry.asm     32-bit entry stub (_entry, linked first via /ENTRY)
   kernel/isr.asm       interrupt stubs, GDT/TSS load, ring-3 transition + syscalls
   kernel/user.asm      minimal ring-3 demo payload
+  kernel/elf.h/.c      validated ELF32 PT_LOAD loader and fresh user address spaces
   kernel/cpu.h/cpu.c   types, port I/O, tiny libc (memset & friends, no CRT)
   kernel/console.h/.c  VGA text + COM1 serial drivers
   kernel/idt.h/idt.c   IDT gates, exception/IRQ dispatchers (+ #PF handler)

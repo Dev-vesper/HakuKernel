@@ -32,6 +32,7 @@ _cpu_cli:
 
 ; The first privilege transition also needs a safe ring-0 stack.
 global _gdt_load, _tss_load, _user_enter, _user_mode_return
+extern _paging_activate_kernel_space
 _gdt_load:                       ; void gdt_load(uint32_t gdtr_addr)
     mov eax, [esp+4]
     lgdt [eax]
@@ -72,6 +73,7 @@ _user_enter:                     ; void user_enter(uint32_t eip, uint32_t esp)
     iret
 
 _user_mode_return:
+    call _paging_activate_kernel_space
     mov ax, 0x10
     mov ds, ax
     mov es, ax

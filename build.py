@@ -98,6 +98,20 @@ def run(cmd):
     subprocess.run(cmd, check=True)
 
 
+def embed_binary_as_c(binary_path, source_path):
+    with open(binary_path, "rb") as f:
+        payload = f.read()
+    with open(source_path, "w", newline="\n") as f:
+        f.write("typedef unsigned int uint32_t;\n")
+        f.write("const unsigned char user_elf_image[] = {\n")
+        for offset in range(0, len(payload), 16):
+            row = payload[offset:offset + 16]
+            f.write("    " + ", ".join(f"0x{byte:02X}" for byte in row))
+            f.write(",\n" if offset + len(row) < len(payload) else "\n")
+        f.write("};\n")
+        f.write(f"const uint32_t user_elf_image_size = {len(payload)}u;\n")
+
+
 def main():
     nasm = find_tool("nasm", [
         os.path.join(os.environ.get("LOCALAPPDATA", ""), r"bin\NASM\nasm.exe"),
@@ -125,34 +139,43 @@ def main():
     stage2_asm = os.path.join(boot_dir, "stage2.asm")
     entry_obj = os.path.join(BUILD, "entry.obj")
     isr_obj = os.path.join(BUILD, "isr.obj")
-    user_obj = os.path.join(BUILD, "user.obj")
+    user_elf = os.path.join(BUILD, "user.elf")
+    user_elf_source = os.path.join(BUILD, "user_elf_blob.c")
     kernel_pe = os.path.join(BUILD, "kernel.pe")
     kernel_bin = os.path.join(BUILD, "kernel.bin")
     stage1_bin = os.path.join(BUILD, "stage1.bin")
     stage2_bin = os.path.join(BUILD, "stage2.bin")
     img = os.path.join(ROOT, "haku.img")
 
-    # 1. kernel C files -> COFF objects
+    # 1. Build the test ELF and embed it in the kernel as a C byte array.
+    run([nasm, "-f", "bin", user_asm, "-o", user_elf])
+    embed_binary_as_c(user_elf, user_elf_source)
+    log(f"embedded ELF test image ({os.path.getsize(user_elf)} bytes)")
+
+    # 2. kernel C files -> COFF objects
     c_objs = []
     for src in c_files:
         obj = os.path.join(BUILD, os.path.splitext(os.path.basename(src))[0] + ".obj")
         run([cl, "/nologo", "/c", "/GS-", "/Os", "/W3", "/Fo" + obj, src])
         c_objs.append(obj)
+    user_elf_obj = os.path.join(BUILD, "user_elf_blob.obj")
+    run([cl, "/nologo", "/c", "/GS-", "/Os", "/W3",
+         "/Fo" + user_elf_obj, user_elf_source])
+    c_objs.append(user_elf_obj)
     log(f"{len(c_objs)} C objects built")
 
-    # 2. asm stubs -> COFF (entry linked FIRST so the image starts there)
+    # 3. asm stubs -> COFF (entry linked FIRST so the image starts there)
     run([nasm, "-f", "win32", entry_asm, "-o", entry_obj])
     run([nasm, "-f", "win32", isr_asm, "-o", isr_obj])
-    run([nasm, "-f", "win32", user_asm, "-o", user_obj])
-    log("entry.obj + isr.obj + user.obj built")
+    log("entry.obj + isr.obj built")
 
-    # 3. link a fixed-base PE (/ENTRY:entry — link prepends _ for x86;
+    # 4. link a fixed-base PE (/ENTRY:entry — link prepends _ for x86;
     #    /ALIGN:16 packs sections; /FIXED drops .reloc — we always load
     #    at the linked base, so runtime relocation is meaningless)
     run([link, "/NOLOGO", "/SUBSYSTEM:NATIVE", "/ENTRY:entry",
          "/BASE:0x10000", "/ALIGN:16", "/FIXED", "/NODEFAULTLIB",
          "/MAP:" + os.path.join(BUILD, "kernel.map"),
-         "/OUT:" + kernel_pe, entry_obj, isr_obj, user_obj] + c_objs)
+         "/OUT:" + kernel_pe, entry_obj, isr_obj] + c_objs)
     log("kernel.pe linked")
 
     # 4. PE -> flat binary, learn the entry address
@@ -233,13 +256,15 @@ def main():
             "E820-OK",       # stage2 INT 15h map handoff verified
             "FRAME-OK",      # frame_alloc/free self-test passed
             "GDT-OK",        # kernel/user selectors and ring-0 TSS stack loaded
-            "USERMODE-READY",# user text + stack pages mapped user-accessible
+            "ELF-REJECT-OK", # malformed images and W+X segments were rejected
+            "ELF-LOAD-OK",   # valid ELF32 PT_LOAD segments loaded to fresh CR3
+            "USERMODE-READY",# user stack mapped in its own address space
             "USERMODE-ENTER",# iret entered CPL 3
-            "USERMODE-OK",   # POSIX-style write/getpid syscalls passed
+            "USERMODE-OK",   # ELF32 user image executed POSIX-style syscalls
             "USER-SYSCALL-CHECKS-OK", # EFAULT/EBADF/EINVAL/ENOSYS paths passed
             "USER-READ-OK",  # blocking read copied keyboard input to user memory
             "USER-EXIT-OK status=0",
-            "USERMODE-RETURNED",
+            "USERMODE-RETURNED address-space-freed",
             "PIC-OK",        # 8259 remapped to 0x20/0x28
             "PIT-OK",        # 100 Hz timer programmed
             "KBD-OK",        # PS/2 keyboard IRQ1 handler installed

@@ -39,13 +39,22 @@
 #define PAGING_ENTRIES    1024u
 #define PAGING_USER_LIMIT  0xC0000000u
 
+typedef struct {
+    uint32_t directory_phys;
+} address_space_t;
+
 void paging_init(void);        /* zero tables, install PDE0 + 1024 identity PTEs */
 void paging_enable(void);      /* load CR3, set CR0.PG (call with IRQs off) */
 int paging_is_enabled(void);   /* CR0.PG bit test */
 uint32_t paging_get_cr3(void); /* raw CR3 (== PAGING_DIR_PHYS after enable) */
 uint32_t paging_get_cr2(void); /* fault address (for the #PF handler) */
 void paging_flush_all(void);   /* reload CR3: full TLB flush (Linux flush_tlb_all) */
-int paging_map_user(uint32_t virtual_addr, uint32_t physical_addr);
+int paging_create_user_space(address_space_t *space);
+int paging_map_user_page(address_space_t *space, uint32_t virtual_addr,
+                         uint32_t physical_addr, int writable);
+void paging_activate_user_space(const address_space_t *space);
+void paging_activate_kernel_space(void);
+void paging_destroy_user_space(address_space_t *space);
 int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
                             int write_access);
 

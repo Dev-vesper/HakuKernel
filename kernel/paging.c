@@ -13,6 +13,17 @@
 #define TAB  ((uint32_t *)PAGING_TABLE_PHYS)
 #define TAB1 ((uint32_t *)PAGING_TABLE1_PHYS)
 
+static uint32_t alloc_page_table(void) {
+    void *frame = frame_alloc();
+    if (!frame) return 0;
+    if ((uint32_t)frame >= PAGING_IDMAP_MB * 1024u * 1024u) {
+        frame_free(frame);
+        return 0;
+    }
+    memset(frame, 0, 4096);
+    return (uint32_t)frame;
+}
+
 void paging_init(void) {
     /* Fresh tables: stale TLB state cannot exist yet (PG was off), but
      * zeroing is still required — a leftover non-zero word would alias
@@ -81,48 +92,104 @@ void paging_flush_all(void) {
     }
 }
 
-int paging_map_user(uint32_t virtual_addr, uint32_t physical_addr) {
+int paging_create_user_space(address_space_t *space) {
+    uint32_t *directory;
+    uint32_t directory_phys;
+    if (!space) return 0;
+    directory_phys = alloc_page_table();
+    if (!directory_phys) return 0;
+    directory = (uint32_t *)directory_phys;
+    directory[0] = DIR[0];
+    directory[1] = DIR[1];
+    space->directory_phys = directory_phys;
+    return 1;
+}
+
+int paging_map_user_page(address_space_t *space, uint32_t virtual_addr,
+                         uint32_t physical_addr, int writable) {
+    uint32_t *directory;
     uint32_t directory_index;
     uint32_t table_index;
-    uint32_t *table;
     uint32_t table_phys;
+    uint32_t flags = PAGE_PRESENT | PAGE_USER;
 
-    if ((virtual_addr & 0xFFFu) != 0 ||
+    if (!space || !space->directory_phys ||
+        (virtual_addr & 0xFFFu) != 0 ||
         (physical_addr & 0xFFFu) != 0 ||
+        virtual_addr < 0x40000000u ||
         virtual_addr >= PAGING_USER_LIMIT ||
         physical_addr >= PAGING_IDMAP_MB * 1024u * 1024u)
         return 0;
+    if (writable) flags |= PAGE_RW;
 
+    directory = (uint32_t *)space->directory_phys;
     directory_index = virtual_addr >> 22;
     table_index = (virtual_addr >> 12) & 0x3FFu;
-    if (!(DIR[directory_index] & PAGE_PRESENT)) {
-        void *new_table = frame_alloc();
-        if (!new_table) return 0;
-        table_phys = (uint32_t)new_table;
-        if (table_phys >= PAGING_IDMAP_MB * 1024u * 1024u) {
-            frame_free(new_table);
-            return 0;
-        }
-        memset(new_table, 0, 4096);
-        DIR[directory_index] = (table_phys & 0xFFFFF000u) |
-                               PAGE_PRESENT | PAGE_RW | PAGE_USER;
+    if (!(directory[directory_index] & PAGE_PRESENT)) {
+        table_phys = alloc_page_table();
+        if (!table_phys) return 0;
+        directory[directory_index] = table_phys | PAGE_PRESENT |
+                                     PAGE_RW | PAGE_USER;
     } else {
-        DIR[directory_index] |= PAGE_USER;
-        table_phys = DIR[directory_index] & 0xFFFFF000u;
+        if (!(directory[directory_index] & PAGE_USER)) return 0;
+        table_phys = directory[directory_index] & 0xFFFFF000u;
+        if (table_phys >= PAGING_IDMAP_MB * 1024u * 1024u) return 0;
     }
 
-    table = (uint32_t *)table_phys;
-    if (table[table_index] & PAGE_PRESENT) return 0;
-    table[table_index] = (physical_addr & 0xFFFFF000u) |
-                         PAGE_PRESENT | PAGE_RW | PAGE_USER;
-    paging_flush_all();
+    if (((uint32_t *)table_phys)[table_index] & PAGE_PRESENT) return 0;
+    ((uint32_t *)table_phys)[table_index] =
+        (physical_addr & 0xFFFFF000u) | flags;
     return 1;
+}
+
+void paging_activate_user_space(const address_space_t *space) {
+    if (!space || !space->directory_phys) return;
+    __asm {
+        mov eax, space
+        mov eax, [eax]
+        mov cr3, eax
+    }
+}
+
+void paging_activate_kernel_space(void) {
+    __asm {
+        mov eax, PAGING_DIR_PHYS
+        mov cr3, eax
+    }
+}
+
+void paging_destroy_user_space(address_space_t *space) {
+    uint32_t *directory;
+    if (!space || !space->directory_phys ||
+        space->directory_phys == PAGING_DIR_PHYS)
+        return;
+
+    directory = (uint32_t *)space->directory_phys;
+    for (uint32_t di = 256; di < (PAGING_USER_LIMIT >> 22); di++) {
+        uint32_t pde = directory[di];
+        if (!(pde & PAGE_PRESENT)) continue;
+        {
+            uint32_t table_phys = pde & 0xFFFFF000u;
+            uint32_t *table;
+            if (table_phys >= PAGING_IDMAP_MB * 1024u * 1024u) continue;
+            table = (uint32_t *)table_phys;
+            for (uint32_t ti = 0; ti < PAGING_ENTRIES; ti++) {
+                if (table[ti] & PAGE_PRESENT)
+                    frame_free((void *)(table[ti] & 0xFFFFF000u));
+            }
+            frame_free((void *)table_phys);
+        }
+    }
+    frame_free((void *)space->directory_phys);
+    space->directory_phys = 0;
 }
 
 int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
                             int write_access) {
     uint32_t last_addr;
     uint32_t page_addr;
+    uint32_t directory_phys = paging_get_cr3() & 0xFFFFF000u;
+    uint32_t *directory;
 
     if (length == 0) return 1;
     if (virtual_addr < 0x40000000u ||
@@ -131,10 +198,12 @@ int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
         return 0;
     last_addr = virtual_addr + length - 1u;
     if (last_addr >= PAGING_USER_LIMIT) return 0;
+    if (directory_phys >= PAGING_IDMAP_MB * 1024u * 1024u) return 0;
+    directory = (uint32_t *)directory_phys;
 
     page_addr = virtual_addr & 0xFFFFF000u;
     for (;;) {
-        uint32_t pde = DIR[page_addr >> 22];
+        uint32_t pde = directory[page_addr >> 22];
         uint32_t table_phys;
         uint32_t pte;
 
