@@ -2,6 +2,9 @@
 build/
 haku.img
 
+# Visual Studio workspace cache (regenerates on folder open)
+.vs/
+
 # python caches
 __pycache__/
 *.pyc
