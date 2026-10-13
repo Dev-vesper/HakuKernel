@@ -229,6 +229,68 @@ static uint32_t sys_open(uint32_t user_path, uint32_t flags) {
     return copy_from_user_error(HAKU_ENAMETOOLONG);
 }
 
+/* Copy a user path into a 13-byte kernel buffer. Returns 1 on success,
+ * otherwise a negative -HAKU_E* errno ready to return to the caller. */
+static int copy_user_path(uint32_t user_path, char out[13]) {
+    for (uint32_t i = 0; i < 13u; i++) {
+        if (user_path > 0xFFFFFFFFu - i ||
+            !paging_user_range_valid(user_path + i, 1, 0))
+            return -(int32_t)HAKU_EFAULT;
+        out[i] = *(const char *)(user_path + i);
+        if (!out[i]) return 1;
+    }
+    return -(int32_t)HAKU_ENAMETOOLONG;
+}
+
+/* POSIX returns 0 on success here: translate the VFS-internal 1. */
+static uint32_t sys_unlink(uint32_t user_path) {
+    char path[13];
+    int32_t result;
+    int copied = copy_user_path(user_path, path);
+    if (copied != 1) return (uint32_t)copied;
+    result = vfs_unlink(scheduler_current_pid(), path);
+    return result == 1 ? 0u : (uint32_t)result;
+}
+
+static uint32_t sys_rename(uint32_t user_old, uint32_t user_new) {
+    char oldpath[13];
+    char newpath[13];
+    int32_t result;
+    int copied_old = copy_user_path(user_old, oldpath);
+    int copied_new = copy_user_path(user_new, newpath);
+    if (copied_old != 1) return (uint32_t)copied_old;
+    if (copied_new != 1) return (uint32_t)copied_new;
+    result = vfs_rename(scheduler_current_pid(), oldpath, newpath);
+    return result == 1 ? 0u : (uint32_t)result;
+}
+
+static uint32_t sys_stat(uint32_t user_path, uint32_t user_buf) {
+    char path[13];
+    vfs_stat_t st;
+    int32_t result;
+    int copied = copy_user_path(user_path, path);
+    if (copied != 1) return (uint32_t)copied;
+    if (!paging_user_range_valid(user_buf, sizeof(st), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    result = vfs_stat(scheduler_current_pid(), path, &st);
+    if (result != 1) return (uint32_t)result;
+    if (!copy_to_user(user_buf, &st, sizeof(st)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0;
+}
+
+static uint32_t sys_fstat(uint32_t fd, uint32_t user_buf) {
+    vfs_stat_t st;
+    int32_t result;
+    if (!paging_user_range_valid(user_buf, sizeof(st), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    result = vfs_fstat(scheduler_current_pid(), fd, &st);
+    if (result != 1) return (uint32_t)result;
+    if (!copy_to_user(user_buf, &st, sizeof(st)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0;
+}
+
 regs_t *user_syscall(regs_t *r) {
     switch (r->eax) {
     case SYS_EXIT:
@@ -255,6 +317,18 @@ regs_t *user_syscall(regs_t *r) {
     case SYS_LSEEK:
         r->eax = (uint32_t)vfs_seek(scheduler_current_pid(), r->ebx,
                                     (int32_t)r->ecx, r->edx);
+        return r;
+    case SYS_UNLINK:
+        r->eax = sys_unlink(r->ebx);
+        return r;
+    case SYS_RENAME:
+        r->eax = sys_rename(r->ebx, r->ecx);
+        return r;
+    case SYS_STAT:
+        r->eax = sys_stat(r->ebx, r->ecx);
+        return r;
+    case SYS_FSTAT:
+        r->eax = sys_fstat(r->ebx, r->ecx);
         return r;
     case SYS_GETPID:
         r->eax = scheduler_current_pid();

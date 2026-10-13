@@ -316,6 +316,7 @@ def main():
             "USER-SYSCALL-CHECKS-OK", # EFAULT/EBADF/EINVAL/ENOSYS + flag/fd/whence paths passed
             "USER-READ-OK",  # blocking read copied keyboard input to user memory
             "USER-FILE-IO-OK", # FAT12 create/write/read/seek/close passed
+            "USER-FILE-OPS-OK", # unlink/rename/stat/fstat, open-file removed/renamed
             "USER-EXIT-OK status=0 pid=1",
             "USER-EXIT-OK status=0 pid=2",
             "SCHED-REAP-OK",
@@ -337,6 +338,8 @@ def main():
             missing.append("two exited processes reaped")
         if content.count("USER-FILE-IO-OK") < 2:
             missing.append("file I/O passed in both user processes")
+        if content.count("USER-FILE-OPS-OK") < 2:
+            missing.append("file ops passed in both user processes")
         unexpected = [m for m in ("USER-SYSCALL-FAIL",
                                      "FS-ERROR-FAIL",
                                      "FS-EDGE-FAIL",

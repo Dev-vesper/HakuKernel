@@ -16,8 +16,15 @@
 #define SYS_CLOSE 6u
 #define SYS_READ  3u
 #define SYS_WRITE 4u
+#define SYS_UNLINK 10u
 #define SYS_LSEEK 19u
 #define SYS_GETPID 20u
+#define SYS_RENAME 38u
+#define SYS_STAT  106u
+#define SYS_FSTAT 108u
+
+/* stat buffer layout shared with ring-3 callers: byte size, then mode. */
+#define HAKU_STAT_SIZE 8u
 
 /* Raw syscall errors are returned as -errno; a future libc sets errno. */
 #define HAKU_ENOENT 2u

@@ -36,7 +36,8 @@ static int name_equal(const char *a, const char *b) {
 
 int vfs_register_fs(const vfs_fs_ops_t *ops) {
     if (!ops || !ops->name || !ops->mount || !ops->open || !ops->close ||
-        !ops->read || !ops->write || !ops->seek)
+        !ops->read || !ops->write || !ops->seek || !ops->unlink ||
+        !ops->rename || !ops->stat || !ops->fstat)
         return 0;
     for (uint32_t i = 0; i < fs_count; i++) {
         if (fs_table[i] == ops || name_equal(fs_table[i]->name, ops->name))
@@ -174,6 +175,54 @@ int32_t vfs_seek(uint32_t pid, uint32_t fd, int32_t offset,
     if (moved != 1) return moved;
     if (position > 0x7FFFFFFFu) return -VFS_EINVAL;
     return (int32_t)position;
+}
+
+int32_t vfs_unlink(uint32_t pid, const char *path) {
+    uint32_t irq_flags;
+    int32_t removed;
+    if (!pid_valid(pid) || !path) return -VFS_EINVAL;
+    if (!root_fs) return -VFS_EIO;
+    irq_flags = cpu_irq_save();
+    removed = root_fs->unlink(path);
+    cpu_irq_restore(irq_flags);
+    return removed;
+}
+
+int32_t vfs_rename(uint32_t pid, const char *oldpath, const char *newpath) {
+    uint32_t irq_flags;
+    int32_t renamed;
+    if (!pid_valid(pid) || !oldpath || !newpath) return -VFS_EINVAL;
+    if (!root_fs) return -VFS_EIO;
+    irq_flags = cpu_irq_save();
+    renamed = root_fs->rename(oldpath, newpath);
+    cpu_irq_restore(irq_flags);
+    return renamed;
+}
+
+int32_t vfs_stat(uint32_t pid, const char *path, vfs_stat_t *out) {
+    uint32_t irq_flags;
+    int32_t stated;
+    if (!pid_valid(pid) || !path || !out) return -VFS_EINVAL;
+    if (!root_fs) return -VFS_EIO;
+    irq_flags = cpu_irq_save();
+    stated = root_fs->stat(path, out);
+    cpu_irq_restore(irq_flags);
+    return stated;
+}
+
+int32_t vfs_fstat(uint32_t pid, uint32_t fd, vfs_stat_t *out) {
+    vfs_fd_t *descriptor;
+    uint32_t irq_flags;
+    int32_t stated;
+    if (!pid_valid(pid) || fd < VFS_FIRST_FILE_FD || fd >= VFS_FD_COUNT)
+        return -VFS_EBADF;
+    descriptor = &descriptors[pid - 1u][fd];
+    if (!descriptor->used) return -VFS_EBADF;
+    if (!out) return -VFS_EINVAL;
+    irq_flags = cpu_irq_save();
+    stated = descriptor->ops->fstat(descriptor->backend, out);
+    cpu_irq_restore(irq_flags);
+    return stated;
 }
 
 void vfs_close_all(uint32_t pid) {

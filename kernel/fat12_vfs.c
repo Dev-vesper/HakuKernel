@@ -95,6 +95,44 @@ static int32_t fat12_vfs_seek(void *handle, int32_t offset, uint32_t whence,
     return fat12_map_errno(moved);
 }
 
+static int32_t fat12_vfs_unlink(const char *path) {
+    int removed;
+    if (!path) return -VFS_EINVAL;
+    removed = fat12_file_unlink(path);
+    if (removed == 1) return 1;
+    return fat12_map_errno(removed);
+}
+
+static int32_t fat12_vfs_rename(const char *oldpath, const char *newpath) {
+    int renamed;
+    if (!oldpath || !newpath) return -VFS_EINVAL;
+    renamed = fat12_file_rename(oldpath, newpath);
+    if (renamed == 1) return 1;
+    return fat12_map_errno(renamed);
+}
+
+static int32_t fat12_vfs_stat(const char *path, vfs_stat_t *out) {
+    fat12_stat_t st;
+    int stated;
+    if (!path || !out) return -VFS_EINVAL;
+    stated = fat12_file_stat(path, &st);
+    if (stated != 1) return fat12_map_errno(stated);
+    out->size = st.size;
+    out->mode = VFS_S_IFREG | 0644u;
+    return 1;
+}
+
+static int32_t fat12_vfs_fstat(void *handle, vfs_stat_t *out) {
+    fat12_stat_t st;
+    int stated;
+    if (!handle || !out) return -VFS_EINVAL;
+    stated = fat12_file_fstat((fat12_file_t *)handle, &st);
+    if (stated != 1) return fat12_map_errno(stated);
+    out->size = st.size;
+    out->mode = VFS_S_IFREG | 0644u;
+    return 1;
+}
+
 const vfs_fs_ops_t fat12_fs_ops = {
     "fat12",
     fat12_vfs_mount,
@@ -103,4 +141,8 @@ const vfs_fs_ops_t fat12_fs_ops = {
     fat12_vfs_read,
     fat12_vfs_write,
     fat12_vfs_seek,
+    fat12_vfs_unlink,
+    fat12_vfs_rename,
+    fat12_vfs_stat,
+    fat12_vfs_fstat,
 };

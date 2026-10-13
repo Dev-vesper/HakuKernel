@@ -11,8 +11,15 @@
 %define SYS_CLOSE  6
 %define SYS_READ   3
 %define SYS_WRITE  4
+%define SYS_UNLINK 10
 %define SYS_LSEEK 19
 %define SYS_GETPID 20
+%define SYS_RENAME 38
+%define SYS_STAT   106
+%define SYS_FSTAT  108
+
+%define STAT_SIZE  8
+%define STAT_MODE  0x81A4          ; S_IFREG | 0644
 
 ; ELF32 header
     db 0x7F, 'E', 'L', 'F'
@@ -442,6 +449,386 @@ _user_program_start:
     cmp eax, edx
     jne .fail
 
+    ; unlink/rename/stat/fstat, including open files that are removed or
+    ; renamed. Per-process names (patched with the pid digit) so the two
+    ; instances never collide; shared Q-names are never created.
+    mov esi, 34
+    mov eax, SYS_GETPID
+    int 0x80
+    add eax, '0'                   ; '1' or '2' (range proven above)
+    mov [USER_DATA_BASE + (unlink_path - data_start) + 1], al
+    mov [USER_DATA_BASE + (rename_src - data_start) + 1], al
+    mov [USER_DATA_BASE + (rename_dst - data_start) + 1], al
+    mov [USER_DATA_BASE + (rename_dst2 - data_start) + 1], al
+    mov [USER_DATA_BASE + (extra_path - data_start) + 1], al
+    mov ebx, USER_DATA_BASE + (unlink_path - data_start)
+    mov [USER_DATA_BASE + (ops_unlink - data_start)], ebx
+    mov ebx, USER_DATA_BASE + (rename_src - data_start)
+    mov [USER_DATA_BASE + (ops_src - data_start)], ebx
+    mov ebx, USER_DATA_BASE + (rename_dst - data_start)
+    mov [USER_DATA_BASE + (ops_dst - data_start)], ebx
+    mov ebx, USER_DATA_BASE + (rename_dst2 - data_start)
+    mov [USER_DATA_BASE + (ops_dst2 - data_start)], ebx
+    mov ebx, USER_DATA_BASE + (extra_path - data_start)
+    mov [USER_DATA_BASE + (ops_extra - data_start)], ebx
+    ; stat on a missing name -> ENOENT
+    mov eax, SYS_STAT
+    mov ebx, [USER_DATA_BASE + (ops_unlink - data_start)]
+    mov ecx, USER_DATA_BASE + (stat_buf - data_start)
+    int 0x80
+    cmp eax, -2
+    jne .fail
+    ; fstat on a bad descriptor -> EBADF, stat to nowhere -> EFAULT
+    mov esi, 35
+    mov eax, SYS_FSTAT
+    mov ebx, 99
+    mov ecx, USER_DATA_BASE + (stat_buf - data_start)
+    int 0x80
+    cmp eax, -9
+    jne .fail
+    mov eax, SYS_STAT
+    mov ebx, [USER_DATA_BASE + (ops_unlink - data_start)]
+    mov ecx, 0x1000                ; unmapped
+    int 0x80
+    cmp eax, -14
+    jne .fail
+
+    ; create, then stat size+mode and fstat the open fd
+    mov esi, 36
+    mov eax, SYS_OPEN
+    mov ebx, [USER_DATA_BASE + (ops_unlink - data_start)]
+    mov ecx, 0x242               ; O_CREAT | O_RDWR | O_TRUNC
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jb .fail
+    mov edi, eax
+    mov eax, SYS_WRITE
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (file_payload - data_start)
+    mov edx, 10
+    int 0x80
+    cmp eax, 10
+    jne .fail
+    mov eax, SYS_CLOSE
+    mov ebx, edi
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_STAT
+    mov ebx, [USER_DATA_BASE + (ops_unlink - data_start)]
+    mov ecx, USER_DATA_BASE + (stat_buf - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    cmp dword [USER_DATA_BASE + (stat_buf - data_start)], 10
+    jne .fail
+    cmp dword [USER_DATA_BASE + (stat_buf - data_start) + 4], STAT_MODE
+    jne .fail
+    mov eax, SYS_OPEN
+    mov ebx, [USER_DATA_BASE + (ops_unlink - data_start)]
+    mov ecx, 2                   ; O_RDWR
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jb .fail
+    mov edi, eax
+    mov eax, SYS_FSTAT
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (stat_buf - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    cmp dword [USER_DATA_BASE + (stat_buf - data_start)], 10
+    jne .fail
+    mov eax, SYS_CLOSE
+    mov ebx, edi
+    int 0x80
+    test eax, eax
+    jne .fail
+
+    ; unlink: the name and its stat entry die together
+    mov esi, 37
+    mov eax, SYS_UNLINK
+    mov ebx, [USER_DATA_BASE + (ops_unlink - data_start)]
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_OPEN
+    mov ebx, [USER_DATA_BASE + (ops_unlink - data_start)]
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    cmp eax, -2
+    jne .fail
+    mov eax, SYS_STAT
+    mov ebx, [USER_DATA_BASE + (ops_unlink - data_start)]
+    mov ecx, USER_DATA_BASE + (stat_buf - data_start)
+    int 0x80
+    cmp eax, -2
+    jne .fail
+
+    ; removed-but-open: the descriptor keeps working until close
+    mov esi, 38
+    mov eax, SYS_OPEN
+    mov ebx, [USER_DATA_BASE + (ops_unlink - data_start)]
+    mov ecx, 0x242
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jb .fail
+    mov edi, eax
+    mov eax, SYS_WRITE
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (file_payload - data_start)
+    mov edx, 10
+    int 0x80
+    cmp eax, 10
+    jne .fail
+    mov eax, SYS_UNLINK
+    mov ebx, [USER_DATA_BASE + (ops_unlink - data_start)]
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_LSEEK            ; rewind: overwrite, not append
+    mov ebx, edi
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_WRITE            ; overwrite 5 through the open fd
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (file_payload - data_start)
+    mov edx, 5
+    int 0x80
+    cmp eax, 5
+    jne .fail
+    mov eax, SYS_LSEEK
+    mov ebx, edi
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_READ
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (file_readback - data_start)
+    mov edx, 5
+    int 0x80
+    cmp eax, 5
+    jne .fail
+    push esi
+    push edi
+    mov esi, USER_DATA_BASE + (file_payload - data_start)
+    mov edi, USER_DATA_BASE + (file_readback - data_start)
+    mov ecx, 5
+    cld
+    repe cmpsb
+    pop edi
+    pop esi
+    jne .fail
+    mov eax, SYS_FSTAT            ; size still 10: overwrite, no extend
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (stat_buf - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    cmp dword [USER_DATA_BASE + (stat_buf - data_start)], 10
+    jne .fail
+    mov eax, SYS_CLOSE
+    mov ebx, edi
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_OPEN            ; name stayed dead after close
+    mov ebx, [USER_DATA_BASE + (ops_unlink - data_start)]
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    cmp eax, -2
+    jne .fail
+
+    ; rename: old name dies, new name serves the same bytes
+    mov esi, 39
+    mov eax, SYS_OPEN
+    mov ebx, [USER_DATA_BASE + (ops_src - data_start)]
+    mov ecx, 0x242
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jb .fail
+    mov edi, eax
+    mov eax, SYS_WRITE
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (file_payload - data_start)
+    mov edx, 8
+    int 0x80
+    cmp eax, 8
+    jne .fail
+    mov eax, SYS_CLOSE
+    mov ebx, edi
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_RENAME
+    mov ebx, [USER_DATA_BASE + (ops_src - data_start)]
+    mov ecx, [USER_DATA_BASE + (ops_dst - data_start)]
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_OPEN
+    mov ebx, [USER_DATA_BASE + (ops_src - data_start)]
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    cmp eax, -2
+    jne .fail
+    mov eax, SYS_STAT
+    mov ebx, [USER_DATA_BASE + (ops_src - data_start)]
+    mov ecx, USER_DATA_BASE + (stat_buf - data_start)
+    int 0x80
+    cmp eax, -2
+    jne .fail
+    mov eax, SYS_STAT
+    mov ebx, [USER_DATA_BASE + (ops_dst - data_start)]
+    mov ecx, USER_DATA_BASE + (stat_buf - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    cmp dword [USER_DATA_BASE + (stat_buf - data_start)], 8
+    jne .fail
+
+    ; renamed-but-open: the old descriptor follows the entry
+    mov esi, 40
+    mov eax, SYS_OPEN
+    mov ebx, [USER_DATA_BASE + (ops_dst - data_start)]
+    mov ecx, 2
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jb .fail
+    mov edi, eax
+    mov eax, SYS_RENAME
+    mov ebx, [USER_DATA_BASE + (ops_dst - data_start)]
+    mov ecx, [USER_DATA_BASE + (ops_dst2 - data_start)]
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_LSEEK
+    mov ebx, edi
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_READ
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (file_readback - data_start)
+    mov edx, 8
+    int 0x80
+    cmp eax, 8
+    jne .fail
+    push esi
+    push edi
+    mov esi, USER_DATA_BASE + (file_payload - data_start)
+    mov edi, USER_DATA_BASE + (file_readback - data_start)
+    mov ecx, 8
+    cld
+    repe cmpsb
+    pop edi
+    pop esi
+    jne .fail
+    mov eax, SYS_OPEN
+    mov ebx, [USER_DATA_BASE + (ops_dst2 - data_start)]
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jb .fail
+    mov [USER_DATA_BASE + (ops_fd - data_start)], eax
+    mov eax, SYS_READ
+    mov ebx, [USER_DATA_BASE + (ops_fd - data_start)]
+    mov ecx, USER_DATA_BASE + (file_readback - data_start)
+    mov edx, 8
+    int 0x80
+    cmp eax, 8
+    jne .fail
+    push esi
+    push edi
+    mov esi, USER_DATA_BASE + (file_payload - data_start)
+    mov edi, USER_DATA_BASE + (file_readback - data_start)
+    mov ecx, 8
+    cld
+    repe cmpsb
+    pop edi
+    pop esi
+    jne .fail
+    mov eax, SYS_CLOSE
+    mov ebx, [USER_DATA_BASE + (ops_fd - data_start)]
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_CLOSE
+    mov ebx, edi
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_OPEN            ; intermediate name stayed dead
+    mov ebx, [USER_DATA_BASE + (ops_dst - data_start)]
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    cmp eax, -2
+    jne .fail
+
+    mov esi, 41
+    mov eax, SYS_RENAME          ; missing source -> ENOENT
+    mov ebx, USER_DATA_BASE + (missing_q9 - data_start)
+    mov ecx, USER_DATA_BASE + (missing_q8 - data_start)
+    int 0x80
+    cmp eax, -2
+    jne .fail
+    mov eax, SYS_RENAME          ; same name -> no-op success
+    mov ebx, [USER_DATA_BASE + (ops_dst2 - data_start)]
+    mov ecx, [USER_DATA_BASE + (ops_dst2 - data_start)]
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_OPEN            ; fresh file for the EEXIST probe
+    mov ebx, [USER_DATA_BASE + (ops_extra - data_start)]
+    mov ecx, 0x242
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jb .fail
+    mov edi, eax
+    mov eax, SYS_CLOSE
+    mov ebx, edi
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_RENAME          ; onto an existing name -> EEXIST
+    mov ebx, [USER_DATA_BASE + (ops_extra - data_start)]
+    mov ecx, [USER_DATA_BASE + (ops_dst2 - data_start)]
+    int 0x80
+    cmp eax, -17
+    jne .fail
+    mov eax, SYS_UNLINK          ; missing name -> ENOENT
+    mov ebx, USER_DATA_BASE + (missing_q9 - data_start)
+    int 0x80
+    cmp eax, -2
+    jne .fail
+
+    mov esi, 42
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (file_ops_message - data_start)
+    mov edx, file_ops_message_end - file_ops_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
     mov eax, SYS_EXIT
     xor ebx, ebx
     int 0x80
@@ -485,6 +872,37 @@ file_path_selected:
     dd 0
 file_fd:
     dd 0
+file_ops_message:
+    db "USER-FILE-OPS-OK unlink/rename/stat/fstat", 10
+file_ops_message_end:
+unlink_path:
+    db "U0.TXT", 0
+rename_src:
+    db "R0A.TXT", 0
+rename_dst:
+    db "R0B.TXT", 0
+rename_dst2:
+    db "R0C.TXT", 0
+extra_path:
+    db "X0.TXT", 0
+missing_q9:
+    db "Q9.TXT", 0
+missing_q8:
+    db "Q8.TXT", 0
+ops_unlink:
+    dd 0
+ops_src:
+    dd 0
+ops_dst:
+    dd 0
+ops_dst2:
+    dd 0
+ops_extra:
+    dd 0
+ops_fd:
+    dd 0
+stat_buf:
+    times 8 db 0
 append_payload:
     db 'B'
 file_payload:

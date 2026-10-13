@@ -60,8 +60,12 @@ unexpectedly lost image data across restarts.
   FAT12 lives behind `fat12_vfs.c`, VFS holds no FAT12 references; boot
   registers the backend and mounts it as root; self-test guards the
   registry and proves the root survives bad mounts).
-- [ ] Add `unlink`, `rename`, `stat`, and `fstat`, including defined behavior
-  for open files that are removed or renamed.
+- [x] Add `unlink`, `rename`, `stat`, and `fstat`, including defined behavior
+  for open files that are removed or renamed (syscalls 10/38/106/108;
+  unlink defers the cluster free to the last open descriptor, rename
+  repoints live descriptors; rename-to-existing gives `EEXIST`, same-name
+  is a no-op; proven end to end from ring 3 as `USER-FILE-OPS-OK`, and
+  the post-run image check confirms zero orphaned clusters).
 - [ ] Add subdirectories and basic paths, including rules for `.` and `..`.
 - [ ] Implement and test relevant POSIX errors such as `EEXIST`, `ENOENT`,
   `ENOSPC`, `ENOTDIR`, `EISDIR`, and `EROFS`.

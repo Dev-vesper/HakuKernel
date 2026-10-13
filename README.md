@@ -120,16 +120,18 @@ user permissions.
 `kernel/user.asm` is built as an ELF32 image, loaded separately for each
 process and entered via `iret` at CPL 3. The initial syscall ABI follows the
 i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
-`read` (3), `write` (4), `open` (5), `close` (6), `lseek` (19), and `getpid`
-(20), with arguments in `ebx`, `ecx`, and `edx` and syscall number/result in
-`eax`.
+`read` (3), `write` (4), `open` (5), `close` (6), `unlink` (10), `lseek`
+(19), `getpid` (20), `rename` (38), `stat` (106), and `fstat` (108), with
+arguments in `ebx`, `ecx`, and `edx` and syscall number/result in `eax`.
 
 ### User-mode system calls
 
 `read` supports stdin from the PS/2 keyboard and regular files; `write`
 supports stdout/stderr to VGA and serial as well as writable regular files.
-`open`, `close`, `lseek`, and per-process file descriptors are backed by the
-VFS/FAT12 layer. Reads and writes are bounded to 4096 bytes, and errors return
+`open`, `close`, `lseek`, `unlink`, `rename`, `stat`, `fstat`, and per-process
+file descriptors are backed by the VFS/FAT12 layer. `stat`/`fstat` report
+byte size and mode (`S_IFREG | 0644`) through an 8-byte user buffer. Reads
+and writes are bounded to 4096 bytes, and errors return
 negative errno values (a future libc can translate these to `errno`).
 Every FAT12 failure class keeps one distinct errno end to end: missing
 files give `ENOENT`, bad flags/whence/pointers give `EINVAL`, existing
@@ -155,6 +157,15 @@ zeroes the entry best-effort so the file reads back empty instead of
 pointing at a broken chain. Anything beyond that best effort (for
 example, clusters orphaned by a dying disk) stays leaked: there is no
 fsck yet.
+
+Open files survive removal and renaming: `unlink` deletes the name at
+once while open descriptors keep reading, writing, and seeking the data
+(clusters are released at the last such close); `rename` moves the entry
+and repoints open descriptors to it, so they keep working under the new
+name. Renaming onto an existing name fails with `EEXIST`, renaming a name
+onto itself succeeds as a no-op, and every other missing name gives
+`ENOENT`. The user test program proves all of this from ring 3 in both
+processes (`USER-FILE-OPS-OK`).
 
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It
@@ -188,7 +199,7 @@ simultaneously open regular files per process and the `O_RDONLY`,
 `O_WRONLY`, `O_RDWR`, `O_CREAT`, `O_EXCL`, `O_TRUNC`, and `O_APPEND` flags.
 
 The filesystem remains intentionally small: no partition tables, subfolders,
-long filenames, unlink/rename, permissions, mount points, journaling, FAT16,
+long filenames, permissions, mount points, journaling, FAT16,
 or FAT32. This is a minimal single-volume VFS, not full POSIX filesystem
 conformance. The QEMU headless test creates separate `P1.TXT` and `P2.TXT`
 files from the two user processes and verifies multi-sector writes, reads,

@@ -34,6 +34,61 @@ typedef struct {
 static fat12_volume_t volume;
 static uint8_t sector_buffer[FAT12_SECTOR_SIZE];
 
+/* Live open handles, by pointer. unlink/rename/close consult this table
+ * to flag, repoint, or release exactly the handles of one directory slot.
+ * 32 slots can never fill via VFS (4 processes x 5 file descriptors, plus
+ * one transient boot handle), so exhaustion is unreachable in practice. */
+#define FAT12_MAX_LIVE_HANDLES 32u
+static fat12_file_t *live_handles[FAT12_MAX_LIVE_HANDLES];
+
+static int track_open(fat12_file_t *file) {
+    for (uint32_t i = 0; i < FAT12_MAX_LIVE_HANDLES; i++) {
+        if (!live_handles[i]) {
+            live_handles[i] = file;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void untrack_close(fat12_file_t *file) {
+    for (uint32_t i = 0; i < FAT12_MAX_LIVE_HANDLES; i++) {
+        if (live_handles[i] == file) {
+            live_handles[i] = 0;
+            return;
+        }
+    }
+}
+
+static int live_at(uint32_t lba, uint32_t off) {
+    int count = 0;
+    for (uint32_t i = 0; i < FAT12_MAX_LIVE_HANDLES; i++) {
+        if (live_handles[i] && live_handles[i]->dir_lba == lba &&
+            live_handles[i]->dir_off == off)
+            count++;
+    }
+    return count;
+}
+
+static void flag_unlinked_at(uint32_t lba, uint32_t off) {
+    for (uint32_t i = 0; i < FAT12_MAX_LIVE_HANDLES; i++) {
+        if (live_handles[i] && live_handles[i]->dir_lba == lba &&
+            live_handles[i]->dir_off == off)
+            live_handles[i]->unlinked = 1;
+    }
+}
+
+static void repoint_renamed(uint32_t old_lba, uint32_t old_off,
+                            uint32_t new_lba, uint32_t new_off) {
+    for (uint32_t i = 0; i < FAT12_MAX_LIVE_HANDLES; i++) {
+        if (live_handles[i] && live_handles[i]->dir_lba == old_lba &&
+            live_handles[i]->dir_off == old_off) {
+            live_handles[i]->dir_lba = new_lba;
+            live_handles[i]->dir_off = new_off;
+        }
+    }
+}
+
 static uint16_t read_u16(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
@@ -309,19 +364,24 @@ static int write_fat_entry(uint16_t cluster, uint16_t value) {
     return 0;
 }
 
+/* Persist size/first_cluster to the handle's own directory slot, after
+ * verifying the slot still belongs to this file. A removed entry (0xE5),
+ * an empty slot, or a slot reused by another name refuses the write, so a
+ * detached handle can never corrupt a stranger's metadata. */
 static int write_root_entry(const fat12_file_t *file) {
-    uint8_t entry[32];
-    uint32_t lba;
-    uint32_t offset;
-    int found = find_root_entry(file->short_name, entry, &lba, &offset);
-    if (found != 1 || !read_volume_sector(lba, sector_buffer)) return 0;
+    uint32_t offset = file->dir_off;
+    if (offset > FAT12_SECTOR_SIZE - 32u) return 0;
+    if (!read_volume_sector(file->dir_lba, sector_buffer)) return 0;
+    if (sector_buffer[offset] == 0 || sector_buffer[offset] == 0xE5u)
+        return 0;
+    if (memcmp(sector_buffer + offset, file->short_name, 11) != 0) return 0;
     sector_buffer[offset + 26u] = (uint8_t)file->first_cluster;
     sector_buffer[offset + 27u] = (uint8_t)(file->first_cluster >> 8);
     sector_buffer[offset + 28u] = (uint8_t)file->size;
     sector_buffer[offset + 29u] = (uint8_t)(file->size >> 8);
     sector_buffer[offset + 30u] = (uint8_t)(file->size >> 16);
     sector_buffer[offset + 31u] = (uint8_t)(file->size >> 24);
-    return ata_write_sectors(lba, 1, sector_buffer);
+    return ata_write_sectors(file->dir_lba, 1, sector_buffer);
 }
 
 int fat12_read_file(const char *name, void *buffer, uint32_t capacity,
@@ -367,11 +427,22 @@ static int create_root_entry(const uint8_t short_name[11]) {
     return 0;
 }
 
+/* Sync first_cluster/size from the handle's own directory slot.
+ * Returns 1 when synced, 2 when detached (entry removed or reused: the
+ * caller keeps working from the handle's cached state), or a negative
+ * -FAT12_ERR_* code on a real failure. The unlinked flag short-circuits
+ * the slot read so a same-named replacement can never alias a detached
+ * handle. */
 static int refresh_file(fat12_file_t *file) {
     uint8_t entry[32];
-    int found = find_root_entry(file->short_name, entry, 0, 0);
-    if (found < 0) return -FAT12_ERR_IO;
-    if (found != 1) return -FAT12_ERR_NOT_FOUND;
+    if (file->unlinked) return 2;
+    if (file->dir_off > FAT12_SECTOR_SIZE - 32u)
+        return -FAT12_ERR_INVALID;
+    if (!read_volume_sector(file->dir_lba, sector_buffer))
+        return -FAT12_ERR_IO;
+    memcpy(entry, sector_buffer + file->dir_off, 32);
+    if (entry[0] == 0 || entry[0] == 0xE5u) return 2;
+    if (memcmp(entry, file->short_name, 11) != 0) return 2;
     file->first_cluster = read_u16(entry + 26);
     file->size = read_u32(entry + 28);
     return 1;
@@ -452,16 +523,29 @@ static int file_cluster_at(fat12_file_t *file, uint32_t index, int create,
     return 1;
 }
 
+static int track_slot_available(void) {
+    for (uint32_t i = 0; i < FAT12_MAX_LIVE_HANDLES; i++) {
+        if (!live_handles[i]) return 1;
+    }
+    return 0;
+}
+
 int fat12_file_open(const char *name, uint8_t flags, fat12_file_t *file) {
     uint8_t short_name[11];
     uint8_t entry[32];
+    uint32_t dir_lba = 0;
+    uint32_t dir_off = 0;
     int found;
     if (!volume.mounted || !file || !make_short_name(name, short_name) ||
         !(flags & (FAT12_OPEN_READ | FAT12_OPEN_WRITE)) ||
         ((flags & FAT12_OPEN_TRUNC) && !(flags & FAT12_OPEN_WRITE)))
         return -FAT12_ERR_INVALID;
     memset(file, 0, sizeof(*file));
-    found = find_root_entry(short_name, entry, 0, 0);
+    /* Handle-slot check before any disk mutation: no caller can interleave
+     * (VFS guards backend calls with IRQs off; boot runs pre-sti), so the
+     * slot claimed here is still free at track_open below. */
+    if (!track_slot_available()) return -FAT12_ERR_NO_SPACE;
+    found = find_root_entry(short_name, entry, &dir_lba, &dir_off);
     if (found < 0) return -FAT12_ERR_IO;
     if (!found) {
         int created;
@@ -469,12 +553,14 @@ int fat12_file_open(const char *name, uint8_t flags, fat12_file_t *file) {
         created = create_root_entry(short_name);
         if (created < 0) return -FAT12_ERR_IO;
         if (!created) return -FAT12_ERR_NO_SPACE;
-        found = find_root_entry(short_name, entry, 0, 0);
+        found = find_root_entry(short_name, entry, &dir_lba, &dir_off);
         if (found != 1) return -FAT12_ERR_IO;
     } else if ((flags & FAT12_OPEN_CREATE) && (flags & FAT12_OPEN_EXCL)) {
         return -FAT12_ERR_EXISTS;
     }
     memcpy(file->short_name, short_name, sizeof(short_name));
+    file->dir_lba = dir_lba;
+    file->dir_off = dir_off;
     file->first_cluster = read_u16(entry + 26);
     file->size = read_u32(entry + 28);
     file->flags = flags;
@@ -499,11 +585,19 @@ int fat12_file_open(const char *name, uint8_t flags, fat12_file_t *file) {
         }
     }
     if (flags & FAT12_OPEN_APPEND) file->position = file->size;
+    track_open(file);
     return 1;
 }
 
 int fat12_file_close(fat12_file_t *file) {
     if (!file || !file->opened) return -FAT12_ERR_INVALID;
+    untrack_close(file);
+    if (file->unlinked && !live_at(file->dir_lba, file->dir_off)) {
+        /* Last descriptor of a removed file: the name is already gone,
+         * so release its clusters now. Best effort; the metadata is
+         * already consistent, and close still succeeds. */
+        free_cluster_chain(file->first_cluster);
+    }
     file->opened = 0;
     return 1;
 }
@@ -520,7 +614,7 @@ int fat12_file_read(fat12_file_t *file, void *buffer, uint32_t count,
         (!buffer && count))
         return -FAT12_ERR_INVALID;
     refreshed = refresh_file(file);
-    if (refreshed != 1) return refreshed;
+    if (refreshed < 0) return refreshed;
     if (file->position >= file->size || count == 0) return 1;
     if (count > file->size - file->position)
         count = file->size - file->position;
@@ -650,6 +744,7 @@ int fat12_file_write(fat12_file_t *file, const void *buffer, uint32_t count,
     uint32_t original_size;
     int status = 1;
     int refreshed;
+    int attached;
     if (!write_count) return -FAT12_ERR_INVALID;
     *write_count = 0;
     if (!file || !file->opened || !(file->flags & FAT12_OPEN_WRITE) ||
@@ -657,7 +752,8 @@ int fat12_file_write(fat12_file_t *file, const void *buffer, uint32_t count,
         return -FAT12_ERR_INVALID;
     if (count == 0) return 1;
     refreshed = refresh_file(file);
-    if (refreshed != 1) return refreshed;
+    if (refreshed < 0) return refreshed;
+    attached = (refreshed == 1);
     if (file->flags & FAT12_OPEN_APPEND) file->position = file->size;
     if (count > 0xFFFFFFFFu - file->position) return -FAT12_ERR_INVALID;
     original_position = file->position;
@@ -699,7 +795,10 @@ int fat12_file_write(fat12_file_t *file, const void *buffer, uint32_t count,
     if (original_position + written > file->size)
         file->size = original_position + written;
     file->position = original_position + written;
-    if (!persist_file(file)) {
+    /* A detached handle has no directory entry: its size lives and dies
+     * with the handle, so there is nothing to persist (and the persist
+     * failure below must not trigger a rollback of live data). */
+    if (attached && !persist_file(file)) {
         /* New bytes may be on disk but the directory cannot say so:
          * release what this call allocated and restore the pre-call
          * metadata rather than leaking unreachable orphans. */
@@ -724,7 +823,7 @@ int fat12_file_seek(fat12_file_t *file, int32_t offset, uint32_t whence,
     if (!new_position) return -FAT12_ERR_INVALID;
     if (!file || !file->opened) return -FAT12_ERR_INVALID;
     refreshed = refresh_file(file);
-    if (refreshed != 1) return refreshed;
+    if (refreshed < 0) return refreshed;
     if (whence == FAT12_SEEK_SET) base = 0;
     else if (whence == FAT12_SEEK_CUR) base = file->position;
     else if (whence == FAT12_SEEK_END) base = file->size;
@@ -741,5 +840,114 @@ int fat12_file_seek(fat12_file_t *file, int32_t offset, uint32_t whence,
     if (target > 0x7FFFFFFFu) return -FAT12_ERR_INVALID;
     file->position = target;
     *new_position = target;
+    return 1;
+}
+
+/* Locate a free root-directory slot without writing anything: 1 with
+ * lba/off filled, 0 when the directory is full, negative -FAT12_ERR_IO
+ * on a sector failure. Shared by create and rename paths. */
+static int find_free_slot(uint32_t *lba_out, uint32_t *off_out) {
+    uint32_t entries_read = 0;
+    for (uint32_t sector = 0; sector < volume.root_sectors; sector++) {
+        if (!read_volume_sector(volume.root_start + sector, sector_buffer))
+            return -FAT12_ERR_IO;
+        for (uint32_t offset = 0; offset < FAT12_SECTOR_SIZE; offset += 32u) {
+            uint8_t first = sector_buffer[offset];
+            if (entries_read++ >= volume.root_entries) return 0;
+            if (first != 0 && first != 0xE5u) continue;
+            *lba_out = volume.root_start + sector;
+            *off_out = offset;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int fat12_file_unlink(const char *name) {
+    uint8_t short_name[11];
+    uint8_t entry[32];
+    uint32_t lba = 0;
+    uint32_t off = 0;
+    uint16_t first;
+    int found;
+    if (!volume.mounted || !make_short_name(name, short_name))
+        return -FAT12_ERR_INVALID;
+    found = find_root_entry(short_name, entry, &lba, &off);
+    if (found < 0) return -FAT12_ERR_IO;
+    if (found != 1) return -FAT12_ERR_NOT_FOUND;
+    first = read_u16(entry + 26);
+    /* Remove the name first: from here on no new open can reach the file,
+     * while recorded handles keep working from their cached state. */
+    if (!read_volume_sector(lba, sector_buffer)) return -FAT12_ERR_IO;
+    sector_buffer[off] = 0xE5u;
+    if (!ata_write_sectors(lba, 1, sector_buffer)) return -FAT12_ERR_IO;
+    flag_unlinked_at(lba, off);
+    if (live_at(lba, off)) return 1; /* deferred: last close frees */
+    if (!free_cluster_chain(first)) return -FAT12_ERR_IO;
+    return 1;
+}
+
+int fat12_file_rename(const char *oldname, const char *newname) {
+    uint8_t src_name[11];
+    uint8_t dst_name[11];
+    uint8_t entry[32];
+    uint8_t probe[32];
+    uint32_t src_lba = 0;
+    uint32_t src_off = 0;
+    uint32_t dst_lba = 0;
+    uint32_t dst_off = 0;
+    int slot;
+    int found;
+    if (!volume.mounted || !make_short_name(oldname, src_name) ||
+        !make_short_name(newname, dst_name))
+        return -FAT12_ERR_INVALID;
+    found = find_root_entry(src_name, entry, &src_lba, &src_off);
+    if (found < 0) return -FAT12_ERR_IO;
+    if (found != 1) return -FAT12_ERR_NOT_FOUND;
+    if (memcmp(src_name, dst_name, 11) == 0) return 1; /* no-op */
+    found = find_root_entry(dst_name, probe, 0, 0);
+    if (found < 0) return -FAT12_ERR_IO;
+    if (found == 1) return -FAT12_ERR_EXISTS;
+    slot = find_free_slot(&dst_lba, &dst_off);
+    if (slot < 0) return -FAT12_ERR_IO;
+    if (slot != 1) return -FAT12_ERR_NO_SPACE;
+    /* Publish the new name before deleting the old one: a crash can at
+     * worst duplicate the name, never lose the file. Best effort from
+     * here on; failures are reported but the file always survives under
+     * at least one name. */
+    if (!read_volume_sector(dst_lba, sector_buffer)) return -FAT12_ERR_IO;
+    memcpy(sector_buffer + dst_off, entry, 32);
+    memcpy(sector_buffer + dst_off, dst_name, 11);
+    if (!ata_write_sectors(dst_lba, 1, sector_buffer)) return -FAT12_ERR_IO;
+    /* The new name is live from here on: repoint handles first, so every
+     * error below still leaves live descriptors usable under the new
+     * name, and only the stale-name removal can fail. */
+    repoint_renamed(src_lba, src_off, dst_lba, dst_off);
+    if (!read_volume_sector(src_lba, sector_buffer)) return -FAT12_ERR_IO;
+    sector_buffer[src_off] = 0xE5u;
+    if (!ata_write_sectors(src_lba, 1, sector_buffer)) return -FAT12_ERR_IO;
+    return 1;
+}
+
+int fat12_file_stat(const char *name, fat12_stat_t *out) {
+    uint8_t short_name[11];
+    uint8_t entry[32];
+    int found;
+    if (!volume.mounted || !out || !make_short_name(name, short_name))
+        return -FAT12_ERR_INVALID;
+    found = find_root_entry(short_name, entry, 0, 0);
+    if (found < 0) return -FAT12_ERR_IO;
+    if (found != 1) return -FAT12_ERR_NOT_FOUND;
+    out->size = read_u32(entry + 28);
+    return 1;
+}
+
+int fat12_file_fstat(fat12_file_t *file, fat12_stat_t *out) {
+    int refreshed;
+    if (!out) return -FAT12_ERR_INVALID;
+    if (!file || !file->opened) return -FAT12_ERR_INVALID;
+    refreshed = refresh_file(file);
+    if (refreshed < 0) return refreshed;
+    out->size = file->size;
     return 1;
 }

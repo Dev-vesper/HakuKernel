@@ -10,7 +10,21 @@ typedef struct {
     uint32_t position;
     uint8_t flags;
     int opened;
+    /* Directory location of this file's entry, captured at open: refresh
+     * and metadata writes verify the slot instead of re-finding by name,
+     * so rename repoints handles and unlink detaches them precisely.
+     * unlinked sticks once set: the name is gone even if the slot is
+     * later reused by another file. */
+    uint32_t dir_lba;
+    uint32_t dir_off;
+    int unlinked;
 } fat12_file_t;
+
+/* Minimal file metadata for stat/fstat (backend maps size to vfs_stat_t;
+ * every entry here is a regular file, there are no directories). */
+typedef struct {
+    uint32_t size;
+} fat12_stat_t;
 
 #define FAT12_OPEN_READ   0x01u
 #define FAT12_OPEN_WRITE  0x02u
@@ -56,5 +70,14 @@ int fat12_file_write(fat12_file_t *file, const void *buffer, uint32_t count,
                      uint32_t *write_count);
 int fat12_file_seek(fat12_file_t *file, int32_t offset, uint32_t whence,
                     uint32_t *new_position);
+/* Remove a name: the entry is marked deleted immediately; clusters are
+ * freed at once when no open handle references it, otherwise at the last
+ * such close. Renaming to an existing name fails with EXISTS; renaming
+ * a name onto itself succeeds as a no-op. Same 1 / -FAT12_ERR_*
+ * convention. */
+int fat12_file_unlink(const char *name);
+int fat12_file_rename(const char *oldname, const char *newname);
+int fat12_file_stat(const char *name, fat12_stat_t *out);
+int fat12_file_fstat(fat12_file_t *file, fat12_stat_t *out);
 
 #endif
