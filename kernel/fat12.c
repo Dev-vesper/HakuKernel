@@ -1,6 +1,7 @@
 #include "fat12.h"
 #include "ata.h"
 #include "console.h"
+#include "klog.h"
 
 #define FAT12_SECTOR_SIZE 512u
 #define FAT12_MAX_SECTORS_PER_CLUSTER 8u
@@ -96,7 +97,8 @@ int fat12_mount(void) {
     memset(&volume, 0, sizeof(volume));
     if (!ata_init()) return -FAT12_ERR_IO;
     if (!ata_read_sectors(0, 1, sector_buffer)) {
-        serial_write("FAT12-FAIL boot sector read\n");
+        klog_prefix();
+        klog_write("FAT12-FAIL: boot sector read\n");
         return -FAT12_ERR_IO;
     }
     total16 = read_u16(&sector_buffer[19]);
@@ -117,7 +119,8 @@ int fat12_mount(void) {
         !volume.total_sectors ||
         volume.total_sectors > ata_sector_count() ||
         sector_buffer[510] != 0x55u || sector_buffer[511] != 0xAAu) {
-        serial_write("FAT12-FAIL invalid BPB\n");
+        klog_prefix();
+        klog_write("FAT12-FAIL: invalid BPB\n");
         return -FAT12_ERR_INVALID;
     }
 
@@ -128,7 +131,8 @@ int fat12_mount(void) {
                         (uint32_t)volume.fat_count * volume.fat_sectors;
     volume.data_start = volume.root_start + volume.root_sectors;
     if (volume.data_start >= volume.total_sectors) {
-        serial_write("FAT12-FAIL invalid volume layout\n");
+        klog_prefix();
+        klog_write("FAT12-FAIL: invalid volume layout\n");
         return -FAT12_ERR_INVALID;
     }
 
@@ -138,16 +142,18 @@ int fat12_mount(void) {
     required_fat_bytes = ((volume.cluster_count + 2u) * 3u + 1u) / 2u;
     if (volume.cluster_count >= 4085u ||
         required_fat_bytes > fat_bytes) {
-        serial_write("FAT12-FAIL cluster table bounds\n");
+        klog_prefix();
+        klog_write("FAT12-FAIL: cluster table bounds\n");
         return -FAT12_ERR_INVALID;
     }
 
     volume.mounted = 1;
-    serial_write("FAT12-MOUNT-OK sectors=");
-    serial_dec(volume.total_sectors);
-    serial_write(" clusters=");
-    serial_dec(volume.cluster_count);
-    serial_write("\n");
+    klog_prefix();
+    klog_write("FAT12-MOUNT-OK: VFS mounted, sectors=");
+    klog_dec(volume.total_sectors);
+    klog_write(" clusters=");
+    klog_dec(volume.cluster_count);
+    klog_write("\n");
     return 1;
 }
 

@@ -3,6 +3,7 @@
 #include "console.h"
 #include "fat12.h"
 #include "heap.h"
+#include "klog.h"
 #include "scheduler.h"
 #include "vfs.h"
 
@@ -24,17 +25,18 @@ static uint8_t edge_back[2048];
 static int expect_tagged(const char *tag, const char *label, int32_t got,
                          int32_t want) {
     if (got == want) return 1;
-    serial_write(tag);
-    serial_write(" ");
-    serial_write(label);
-    serial_write(" got=");
+    klog_prefix();
+    klog_write(tag);
+    klog_write(" ");
+    klog_write(label);
+    klog_write(" got=");
     if (got < 0) {
-        serial_putc('-');
-        serial_dec((uint32_t)(-got));
+        klog_putc('-');
+        klog_dec((uint32_t)(-got));
     } else {
-        serial_dec((uint32_t)got);
+        klog_dec((uint32_t)got);
     }
-    serial_write("\n");
+    klog_write("\n");
     return 0;
 }
 
@@ -777,42 +779,51 @@ void fs_error_self_test(void) {
     }
 
     if (pass) {
-        serial_write("FS-ERRORS-OK ");
-        serial_write("enoent/einval/eexist/ebadf/eio-map distinct\n");
+        klog_prefix();
+        klog_write("FS-ERRORS-OK: enoent/einval/eexist/ebadf/eio-map distinct\n");
     } else {
-        serial_write("FS-ERRORS-FAIL\n");
+        klog_prefix();
+        klog_write("FS-ERRORS-FAIL\n");
     }
 
     /* Empty files and exact/crossing sector boundaries. */
     if (test_empty_file() & test_sector_edges()) {
-        serial_write("FS-FILE-EDGE-OK empty/exact-sector/span/partial\n");
+        klog_prefix();
+        klog_write("FS-FILE-EDGE-OK: empty/exact-sector/span/partial\n");
     } else {
-        serial_write("FS-EDGE-FAIL\n");
+        klog_prefix();
+        klog_write("FS-EDGE-FAIL\n");
     }
 
     /* Injected FAT faults (each restored): cut, bad, and reserved
      * chain values must read as EIO; cycles must terminate; a FAT with
      * no free cluster must report ENOSPC on write. */
     if (test_corrupt_chains()) {
-        serial_write("FS-CORRUPT-OK trunc/bad/reserved/cycle/datafull\n");
+        klog_prefix();
+        klog_write("FS-CORRUPT-OK: trunc/bad/reserved/cycle/datafull\n");
     } else {
-        serial_write("FS-CORRUPT-FAIL\n");
+        klog_prefix();
+        klog_write("FS-CORRUPT-FAIL\n");
     }
 
     /* ATA transfer validation. */
     if (test_ata_errors()) {
-        serial_write("FS-ATA-OK bounds/null/zero-sector\n");
+        klog_prefix();
+        klog_write("FS-ATA-OK: bounds/null/zero-sector\n");
     } else {
-        serial_write("FS-ATA-FAIL\n");
+        klog_prefix();
+        klog_write("FS-ATA-FAIL\n");
     }
 
     /* Failed-write cleanup: sizes only cover durable bytes, short
      * writes keep their prefix, and failed metadata leaves no
      * unreachable clusters behind. */
     if (test_write_rollback()) {
-        serial_write("FS-ROLLBACK-OK gap/partial/trunc cleanup\n");
+        klog_prefix();
+        klog_write("FS-ROLLBACK-OK: gap/partial/trunc cleanup\n");
     } else {
-        serial_write("FS-ROLLBACK-FAIL\n");
+        klog_prefix();
+        klog_write("FS-ROLLBACK-FAIL\n");
     }
 
     /* Full volume: create files until the root directory refuses with
@@ -832,20 +843,23 @@ void fs_error_self_test(void) {
                 break;
             }
             if (result < 3) {
-                serial_write("FS-ENOSPC-FAIL fill open got=");
-                serial_write(fat12_error_name(result));
-                serial_write("\n");
+                klog_prefix();
+                klog_write("FS-ENOSPC-FAIL: fill open got=");
+                klog_write(fat12_error_name(result));
+                klog_write("\n");
                 break;
             }
             vfs_close(FS_TEST_PID, (uint32_t)result);
             created++;
         }
         if (full) {
-            serial_write("FS-ENOSPC-OK root-full files=");
-            serial_dec(created);
-            serial_write("\n");
+            klog_prefix();
+            klog_write("FS-ENOSPC-OK: root-full files=");
+            klog_dec(created);
+            klog_write("\n");
         } else if (pass) {
-            serial_write("FS-ENOSPC-FAIL volume never reported full\n");
+            klog_prefix();
+            klog_write("FS-ENOSPC-FAIL: volume never reported full\n");
         }
     }
 }

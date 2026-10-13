@@ -9,6 +9,7 @@
 #include "heap.h"
 #include "idt.h"
 #include "kbd.h"
+#include "klog.h"
 #include "paging.h"
 #include "frame.h"
 #include "pic.h"
@@ -19,19 +20,20 @@
 void kernel_main(void) {
     console_init();
 
-    vga_write("============================================================\n");
-    vga_write("  Haku v0.1 - hello from the C kernel (32-bit protected mode)\n");
-    vga_write("============================================================\n");
-
-    /* Marker for automated checks: qemu -serial file:serial.log */
-    serial_write("HAKU-BOOT-OK cpu=386+ mode=protected video=vga serial=com1\n");
+    /* Boot banner, Linux-dmesg style. Markers stay inside the lines as
+     * subsystem tags: qemu -serial file:serial.log is grepped for them. */
+    klog_prefix();
+    klog_write("Haku version 0.1 (i386) #1 HAKU-BOOT-OK\n");
+    klog_prefix();
+    klog_write("Command line: console=ttyS0 video=vga cpu=386+ mode=protected\n");
 
     idt_init();
-    vga_write("IDT: 48 vectors + catch-all loaded\n");
-    serial_write("IDT-OK gates=48\n");
+    klog_prefix();
+    klog_write("IDT-OK: 48 gates loaded (32 exceptions + 16 IRQs)\n");
 
     __asm int 3 /* #BP self-test: the handler prints, then we resume here */
-    serial_write("INT3-RESUMED after breakpoint handler\n");
+    klog_prefix();
+    klog_write("INT3-RESUMED: resumed after breakpoint self-test\n");
 
     /* Paging (Linux-style: traps are up before the MMU, IRQs still off
      * since stage2's cli — same ordering as Linux trap_init/long-mode
@@ -40,8 +42,8 @@ void kernel_main(void) {
     paging_init();
     paging_enable();
     if (!paging_is_enabled() || paging_get_cr3() != PAGING_DIR_PHYS) {
-        vga_write("PAGING FAILED to enable, halting\n");
-        serial_write("PAGING-FAIL\n");
+        klog_prefix();
+        klog_write("PAGING-FAIL: MMU did not enable, halting\n");
         for (;;) {
             __asm hlt
         }
@@ -54,15 +56,15 @@ void kernel_main(void) {
         *p2 = 0xA5A5A5A5u;
         *p3 = 0x5A5A5A5Au;
         if (*p1 != 0x12345678u || *p2 != 0xA5A5A5A5u || *p3 != 0x5A5A5A5Au) {
-            vga_write("PAGING probe mismatch, halting\n");
-            serial_write("PAGING-FAIL probe\n");
+            klog_prefix();
+            klog_write("PAGING-FAIL: R/W probe mismatch, halting\n");
             for (;;) {
                 __asm hlt
             }
         }
     }
-    vga_write("PAGING: 8 MiB identity mapped, CR0.PG on\n");
-    serial_write("PAGING-OK idmap=8MB cr3=0x20000\n");
+    klog_prefix();
+    klog_write("PAGING-OK: 8MB identity map, cr3=0x20000, CR0.PG on\n");
 
     /* Heap: free-list allocator over the identity-mapped 1–4 MiB range. */
     heap_init();
@@ -82,16 +84,18 @@ void kernel_main(void) {
     }
 
     if (!gdt_init()) {
-        vga_write("GDT/TSS initialization failed, halting\n");
-        serial_write("GDT-FAIL\n");
+        klog_prefix();
+        klog_write("GDT-FAIL: TSS initialization failed, halting\n");
         for (;;) {
             __asm hlt
         }
     }
-    serial_write("GDT-OK ring3 tss esp0 configured\n");
+    klog_prefix();
+    klog_write("GDT-OK: ring3 code/data loaded, TSS esp0 configured\n");
 
     if (!usermode_init()) {
-        vga_write("User address space setup failed, halting\n");
+        klog_prefix();
+        klog_write("usermode setup failed, halting\n");
         for (;;) {
             __asm hlt
         }
@@ -99,21 +103,25 @@ void kernel_main(void) {
 
     /* PS/2 keyboard on IRQ1 (US layout, shift/caps handled in irq). */
     kbd_init();
-    serial_write("KBD-OK irq1 irq1=unmasked\n");
-    vga_write("PS/2 keyboard ready (IRQ1). Type in QEMU window.\n");
+    klog_prefix();
+    klog_write("KBD-OK: PS/2 keyboard on IRQ1, US layout (unmasked)\n");
 
     /* Remap the 8259 (IRQs were colliding with CPU exceptions 8..15),
      * start the 100 Hz timer and open IRQ0 only. */
     pic_remap(0x20, 0x28);
-    serial_write("PIC-OK remap=20/28\n");
+    klog_prefix();
+    klog_write("PIC-OK: 8259 remapped to 0x20/0x28\n");
     pit_init(100);
-    serial_write("PIT-OK 100Hz\n");
+    klog_prefix();
+    klog_write("PIT-OK: 100Hz timer on IRQ0\n");
 
     pic_clear_mask(0);
     cpu_sti();
 
-    vga_write("ELF32 processes loaded; press two keys for read() tests...\n");
+    klog_prefix();
+    klog_write("input: press two keys for the read() tests...\n");
     usermode_run();
-    vga_write("Scheduler returned unexpectedly; halting.\n");
+    klog_prefix();
+    klog_write("sched: returned unexpectedly, halting\n");
     for (;;) __asm hlt
 }

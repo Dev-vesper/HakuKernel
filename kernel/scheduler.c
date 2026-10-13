@@ -3,6 +3,7 @@
 #include "frame.h"
 #include "fs_test.h"
 #include "gdt.h"
+#include "klog.h"
 #include "paging.h"
 #include "vfs.h"
 
@@ -131,8 +132,11 @@ static void reap_zombies(void) {
         paging_destroy_user_space(&task->program.address_space);
         frame_free_pages((void *)task->kernel_stack,
                          TASK_KERNEL_STACK_PAGES);
+        klog_prefix();
+        klog_write("SCHED-REAP-OK: reaped pid=");
+        klog_dec(task->pid);
+        klog_write("\n");
         memset(task, 0, sizeof(*task));
-        serial_write("SCHED-REAP-OK\n");
     }
 }
 
@@ -157,9 +161,10 @@ int scheduler_init(loaded_elf_t *programs, uint32_t count) {
     idle_task.state = TASK_RUNNABLE;
     if (!initialize_stack(&idle_task, 0)) goto fail;
 
-    serial_write("SCHED-READY tasks=");
-    serial_dec(count);
-    serial_write(" kernel-stack=per-task\n");
+    klog_prefix();
+    klog_write("sched: SCHED-READY tasks=");
+    klog_dec(count);
+    klog_write(" kernel-stack=per-task\n");
     return 1;
 
 fail:
@@ -182,9 +187,10 @@ void scheduler_start(void) {
     cpu_cli();
     scheduler_started = 1;
     activate_task(first);
-    serial_write("SCHED-START pid=");
-    serial_dec(tasks[first].pid);
-    serial_write("\n");
+    klog_prefix();
+    klog_write("sched: SCHED-START pid=");
+    klog_dec(tasks[first].pid);
+    klog_write(" (first task)\n");
     scheduler_enter_frame(tasks[first].frame);
     for (;;) __asm hlt
 }
@@ -209,9 +215,10 @@ regs_t *scheduler_preempt(regs_t *frame) {
     activate_task(next);
     switch_count++;
     if (!preempt_marker_written) {
-        serial_write("SCHED-PREEMPT-OK switches=");
-        serial_dec(switch_count);
-        serial_write("\n");
+        klog_prefix();
+        klog_write("SCHED-PREEMPT-OK: timer preemption works, switches=");
+        klog_dec(switch_count);
+        klog_write("\n");
         preempt_marker_written = 1;
     }
     return next == (int)task_count ? idle_task.frame :

@@ -7,6 +7,7 @@
 #include "frame.h"
 #include "console.h"
 #include "heap.h"
+#include "klog.h"
 #include "paging.h"
 
 #define E820_MAP_PHYS 0x7000u
@@ -125,8 +126,8 @@ void frame_init(void) {
     volatile e820_entry_t *entries = (volatile e820_entry_t *)E820_MAP_PHYS;
 
     if (count == 0 || count > E820_MAX_ENTRIES) {
-        vga_write("E820 map missing or invalid, halting\n");
-        serial_write("E820-FAIL\n");
+        klog_prefix();
+        klog_write("E820-FAIL: map missing or invalid, halting\n");
         for (;;) {
             __asm hlt
         }
@@ -135,8 +136,8 @@ void frame_init(void) {
     frame_bitmap = (uint32_t *)kmalloc(FRAME_BMAP_BYTES);
     frame_usable = (uint32_t *)kmalloc(FRAME_BMAP_BYTES);
     if (!frame_bitmap || !frame_usable) {
-        vga_write("FRAME FAILED: no heap for bitmaps, halting\n");
-        serial_write("FRAME-FAIL bitmap\n");
+        klog_prefix();
+        klog_write("FRAME-FAIL: no heap for bitmaps, halting\n");
         for (;;) {
             __asm hlt
         }
@@ -163,12 +164,41 @@ void frame_init(void) {
     reserve_e820_non_ram(count);
     reserve_kernel_regions();
 
-    vga_write("E820 map: ");
-    vga_dec(count);
-    vga_write(" entries\n");
-    serial_write("E820-OK entries=");
-    serial_dec(count);
-    serial_write("\n");
+    /* Linux-style RAM map dump, then the inventory summary. */
+    klog_prefix();
+    klog_write("BIOS-provided physical RAM map:\n");
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t base_lo = entries[i].base_low;
+        uint32_t base_hi = entries[i].base_high;
+        uint32_t end_lo = base_lo + entries[i].length_low;
+        uint32_t end_hi = base_hi + entries[i].length_high +
+                         (end_lo < base_lo ? 1u : 0u);
+        const char *kind;
+        end_lo -= 1u;
+        if (end_lo == 0xFFFFFFFFu) end_hi -= 1u;
+        switch (entries[i].type) {
+        case 1u: kind = "usable"; break;
+        case 2u: kind = "reserved"; break;
+        case 3u: kind = "ACPI reclaimable"; break;
+        case 4u: kind = "ACPI NVS"; break;
+        case 5u: kind = "bad"; break;
+        default: kind = "unknown"; break;
+        }
+        klog_prefix();
+        klog_write("BIOS-e820: [mem 0x");
+        klog_hex_raw(base_hi);
+        klog_hex_raw(base_lo);
+        klog_write("-0x");
+        klog_hex_raw(end_hi);
+        klog_hex_raw(end_lo);
+        klog_write("] ");
+        klog_write(kind);
+        klog_write("\n");
+    }
+    klog_prefix();
+    klog_write("E820-OK: ");
+    klog_dec(count);
+    klog_write(" map entries\n");
 }
 
 void *frame_alloc(void) {
@@ -315,15 +345,15 @@ int frame_self_test(void) {
 
 done:
     if (pass) {
-        vga_write("FRAME: E820 self-test PASS\n");
-        serial_write("FRAME-OK free=");
-        serial_dec(frame_free_count());
-        serial_write(" usable=");
-        serial_dec(frame_usable_count());
-        serial_write(" alloc-limit=8MB\n");
+        klog_prefix();
+        klog_write("FRAME-OK: E820 self-test PASS, free=");
+        klog_dec(frame_free_count());
+        klog_write(" usable=");
+        klog_dec(frame_usable_count());
+        klog_write(" alloc-limit=8MB\n");
     } else {
-        vga_write("FRAME: self-test FAIL\n");
-        serial_write("FRAME-FAIL\n");
+        klog_prefix();
+        klog_write("FRAME-FAIL: self-test FAIL\n");
     }
     return pass;
 }

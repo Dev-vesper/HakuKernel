@@ -6,6 +6,7 @@
  */
 #include "console.h"
 #include "idt.h"
+#include "klog.h"
 #include "paging.h"
 #include "pic.h"
 #include "scheduler.h"
@@ -102,15 +103,16 @@ static regs_t *abort_user(regs_t *r) {
     vga_write(" eip=");
     vga_hex(r->eip);
     vga_write("\nTerminating process.\n");
-    serial_write("USER-FAULT vector=");
-    serial_dec(r->int_no);
-    serial_write(" eip=");
-    serial_hex(r->eip);
+    klog_prefix();
+    klog_write("USER-FAULT: vector=");
+    klog_dec(r->int_no);
+    klog_write(" eip=");
+    klog_hex(r->eip);
     if (r->int_no == 14) {
-        serial_write(" cr2=");
-        serial_hex(paging_get_cr2());
+        klog_write(" cr2=");
+        klog_hex(paging_get_cr2());
     }
-    serial_write("\n");
+    klog_write("\n");
     return scheduler_exit_current(r);
 }
 
@@ -120,8 +122,8 @@ regs_t *isr_handler(regs_t *r) {
     }
     if (r->int_no == 3) {
         /* #BP from INT3: resumable, used as the IDT self-test. */
-        vga_write("INT3 ok\n");
-        serial_write("EXC-03-BP BREAKPOINT-OK\n");
+        klog_prefix();
+        klog_write("EXC-03-BP: breakpoint trap test (BREAKPOINT-OK)\n");
         return r;
     }
     if (r->int_no == 14) {
@@ -135,17 +137,19 @@ regs_t *isr_handler(regs_t *r) {
         vga_write(" err=");
         vga_hex(r->err_code);
         vga_write("\nSystem halted.\n");
-        serial_write("PFAULT-OK addr=");
-        serial_hex(addr);
-        serial_write(" err=");
-        serial_hex(r->err_code);
-        serial_write("\nhalting\n");
+        klog_prefix();
+        klog_write("PFAULT-OK: addr=");
+        klog_hex(addr);
+        klog_write(" err=");
+        klog_hex(r->err_code);
+        klog_write(" halting\n");
         halt();
         return r;
     }
     if (r->int_no == 255) {
         vga_write("UNEXPECTED INTERRUPT, halting\n");
-        serial_write("EXC-FF-UNEXPECTED halting\n");
+        klog_prefix();
+        klog_write("EXC-FF-UNEXPECTED: halting\n");
         halt();
         return r;
     }
@@ -157,20 +161,22 @@ regs_t *isr_handler(regs_t *r) {
     vga_write(" eip=");
     vga_hex(r->eip);
     vga_write("\nSystem halted.\n");
-    serial_write("CPU-EXCEPTION ");
-    serial_write(name);
-    serial_write(" err=");
-    serial_hex(r->err_code);
-    serial_write(" eip=");
-    serial_hex(r->eip);
-    serial_write("\nhalting\n");
+    klog_prefix();
+    klog_write("CPU-EXCEPTION ");
+    klog_write(name);
+    klog_write(" err=");
+    klog_hex(r->err_code);
+    klog_write(" eip=");
+    klog_hex(r->eip);
+    klog_write(" halting\n");
     halt();
     return r;
 }
 
 regs_t *syscall_handler(regs_t *r) {
     if ((r->cs & 3u) != 3u) {
-        serial_write("SYSCALL-REJECT non-user caller\n");
+        klog_prefix();
+        klog_write("SYSCALL-REJECT: non-user caller\n");
         r->eax = (uint32_t)-1;
         return r;
     }
@@ -180,21 +186,24 @@ regs_t *syscall_handler(regs_t *r) {
 regs_t *irq_handler(regs_t *r) {
     uint8_t irq = (uint8_t)(r->int_no - 32);
     if (irq >= 16) {
-        serial_write("IRQ-BAD-VECTOR\n");
+        klog_prefix();
+        klog_write("IRQ-BAD-VECTOR\n");
         pic_send_eoi(15);
         return r;
     }
     if (irq_handlers[irq])
         irq_handlers[irq](r);
     else if (pic_is_spurious(irq)) {
-        serial_write("IRQ-SPURIOUS ");
-        serial_hex(irq);
-        serial_write("\n");
+        klog_prefix();
+        klog_write("IRQ-SPURIOUS ");
+        klog_hex(irq);
+        klog_write("\n");
     } else {
         vga_write("Unexpected IRQ\n");
-        serial_write("IRQ-UNEXPECTED ");
-        serial_hex(irq);
-        serial_write("\n");
+        klog_prefix();
+        klog_write("IRQ-UNEXPECTED ");
+        klog_hex(irq);
+        klog_write("\n");
     }
     pic_send_eoi(irq);
     if (irq == 0)

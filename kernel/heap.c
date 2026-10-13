@@ -8,6 +8,7 @@
  */
 #include "heap.h"
 #include "console.h"
+#include "klog.h"
 
 static heap_block_t *heap_head = 0;
 
@@ -184,13 +185,13 @@ int heap_self_test(void) {
 
 done:
     if (pass) {
-        vga_write("HEAP: self-test PASS\n");
-        serial_write("HEAP-OK bytes=");
-        serial_dec(heap_free_bytes());
-        serial_write("\n");
+        klog_prefix();
+        klog_write("HEAP-OK: kmalloc self-test PASS, bytes=");
+        klog_dec(heap_free_bytes());
+        klog_write("\n");
     } else {
-        vga_write("HEAP: self-test FAIL\n");
-        serial_write("HEAP-FAIL\n");
+        klog_prefix();
+        klog_write("HEAP-FAIL: self-test FAIL\n");
     }
     return pass;
 }

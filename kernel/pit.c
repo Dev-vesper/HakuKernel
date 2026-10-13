@@ -1,6 +1,7 @@
 /* Haku PIT driver: 100 Hz-class system timer on IRQ0. */
 #include "console.h"
 #include "idt.h"
+#include "klog.h"
 #include "pic.h"
 #include "pit.h"
 
@@ -17,9 +18,10 @@ static void pit_tick(regs_t *r) {
     ticks++;
     if (ticks % hz == 0) {
         seconds++;
-        serial_write("T+");
-        serial_dec(seconds);
-        serial_write("s\n");
+        klog_prefix();
+        klog_write("T+");
+        klog_dec(seconds);
+        klog_write("s: timer heartbeat\n");
         /* Heartbeat in the top-right corner (redrawn every second). */
         char buf[16];
         uint32_t v = seconds;

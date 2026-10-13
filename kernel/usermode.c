@@ -1,6 +1,7 @@
 #include "usermode.h"
 #include "console.h"
 #include "kbd.h"
+#include "klog.h"
 #include "paging.h"
 #include "scheduler.h"
 #include "fat12.h"
@@ -33,7 +34,8 @@ static int elf_rejection_self_test(const uint8_t *image,
     invalid[76] = 7; /* first PT_LOAD would be writable and executable */
     if (elf_load_executable(invalid, sizeof(invalid), &rejected)) return 0;
 
-    serial_write("ELF-REJECT-OK malformed headers and W+X rejected\n");
+    klog_prefix();
+    klog_write("ELF-REJECT-OK: malformed headers and W+X rejected\n");
     return 1;
 }
 
@@ -46,7 +48,8 @@ int usermode_init(void) {
     vfs_init();
     image = (uint8_t *)kmalloc(USER_ELF_MAX_SIZE);
     if (!image) {
-        serial_write("ELF-DISK-FAIL kernel heap exhausted\n");
+        klog_prefix();
+        klog_write("ELF-DISK-FAIL: kernel heap exhausted\n");
         return 0;
     }
     if (fat12_read_file("HAKU.ELF", image, USER_ELF_MAX_SIZE,
@@ -54,18 +57,21 @@ int usermode_init(void) {
         kfree(image);
         return 0;
     }
-    serial_write("FAT12-READ-OK name=HAKU.ELF size=");
-    serial_dec(image_size);
-    serial_write("\n");
+    klog_prefix();
+    klog_write("FAT12-READ-OK name=HAKU.ELF size=");
+    klog_dec(image_size);
+    klog_write("\n");
 
     if (!elf_rejection_self_test(image, image_size)) {
-        serial_write("ELF-REJECT-FAIL\n");
+        klog_prefix();
+        klog_write("ELF-REJECT-FAIL: bad image accepted\n");
         kfree(image);
         return 0;
     }
     for (; loaded < USER_PROGRAM_COUNT; loaded++) {
         if (!elf_load_executable(image, image_size, &programs[loaded])) {
-            serial_write("ELF-LOAD-FAIL invalid or unsupported ELF32 image\n");
+            klog_prefix();
+            klog_write("ELF-LOAD-FAIL: invalid or unsupported ELF32 image\n");
             while (loaded)
                 paging_destroy_user_space(
                     &programs[--loaded].address_space);
@@ -74,16 +80,19 @@ int usermode_init(void) {
         }
     }
     kfree(image);
-    serial_write("ELF-LOAD-OK entry=");
-    serial_hex(programs[0].entry);
-    serial_write(" cr3=");
-    serial_hex(programs[0].address_space.directory_phys);
-    serial_write("\n");
-    serial_write("USERMODE-READY stack=");
-    serial_hex(programs[0].user_stack);
-    serial_write("\n");
+    klog_prefix();
+    klog_write("ELF-LOAD-OK: entry=");
+    klog_hex(programs[0].entry);
+    klog_write(" cr3=");
+    klog_hex(programs[0].address_space.directory_phys);
+    klog_write("\n");
+    klog_prefix();
+    klog_write("USERMODE-READY: user stack=");
+    klog_hex(programs[0].user_stack);
+    klog_write("\n");
     if (!scheduler_init(programs, USER_PROGRAM_COUNT)) {
-        serial_write("SCHED-INIT-FAIL\n");
+        klog_prefix();
+        klog_write("SCHED-INIT-FAIL: no task slots\n");
         for (uint32_t i = 0; i < USER_PROGRAM_COUNT; i++)
             paging_destroy_user_space(&programs[i].address_space);
         return 0;
@@ -92,7 +101,8 @@ int usermode_init(void) {
 }
 
 void usermode_run(void) {
-    serial_write("USERMODE-ENTER\n");
+    klog_prefix();
+    klog_write("USERMODE-ENTER: iret to CPL 3\n");
     scheduler_start();
 }
 
@@ -151,6 +161,7 @@ static uint32_t sys_write(uint32_t fd, uint32_t user_buffer,
             return offset ? offset : copy_from_user_error(HAKU_EFAULT);
         for (uint32_t i = 0; i < amount; i++) {
             console_putc(chunk[i]);
+            if (chunk[i] == '\n') serial_putc('\r'); /* serial is CRLF */
             serial_putc(chunk[i]);
         }
         offset += amount;
@@ -217,11 +228,12 @@ regs_t *user_syscall(regs_t *r) {
     switch (r->eax) {
     case SYS_EXIT:
         cpu_cli();
-        serial_write("USER-EXIT-OK status=");
-        serial_dec(r->ebx);
-        serial_write(" pid=");
-        serial_dec(scheduler_current_pid());
-        serial_write("\n");
+        klog_prefix();
+        klog_write("USER-EXIT-OK status=");
+        klog_dec(r->ebx);
+        klog_write(" pid=");
+        klog_dec(scheduler_current_pid());
+        klog_write("\n");
         return scheduler_exit_current(r);
     case SYS_READ:
         r->eax = sys_read(r->ebx, r->ecx, r->edx);

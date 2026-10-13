@@ -1,5 +1,6 @@
 #include "ata.h"
 #include "console.h"
+#include "klog.h"
 
 #define ATA_DATA       0x1F0u
 #define ATA_ERROR      0x1F1u
@@ -52,7 +53,8 @@ int ata_init(void) {
     status = inb(ATA_STATUS);
     if (status == 0 || status == 0xFFu ||
         !wait_status(ATA_SR_DRQ)) {
-        serial_write("ATA-FAIL identify primary master\n");
+        klog_prefix();
+        klog_write("ATA-FAIL: identify primary master\n");
         return 0;
     }
 
@@ -60,19 +62,22 @@ int ata_init(void) {
         identify_words[i] = inw(ATA_DATA);
 
     if (!(identify_words[49] & (1u << 9))) {
-        serial_write("ATA-FAIL LBA unsupported\n");
+        klog_prefix();
+        klog_write("ATA-FAIL: LBA unsupported\n");
         return 0;
     }
     primary_master_sectors = (uint32_t)identify_words[60] |
                              ((uint32_t)identify_words[61] << 16);
     if (!primary_master_sectors) {
-        serial_write("ATA-FAIL empty LBA capacity\n");
+        klog_prefix();
+        klog_write("ATA-FAIL: empty LBA capacity\n");
         return 0;
     }
 
-    serial_write("ATA-OK primary-master LBA28 sectors=");
-    serial_dec(primary_master_sectors);
-    serial_write("\n");
+    klog_prefix();
+    klog_write("ata: ATA-OK primary-master LBA28 sectors=");
+    klog_dec(primary_master_sectors);
+    klog_write("\n");
     return 1;
 }
 
@@ -95,11 +100,12 @@ int ata_read_sectors(uint32_t lba, uint8_t count, void *buffer) {
         outb(ATA_LBA_HIGH, (uint8_t)(current_lba >> 16));
         outb(ATA_COMMAND, 0x20u); /* READ SECTORS, one sector */
         if (!wait_status(ATA_SR_DRQ)) {
-            serial_write("ATA-READ-FAIL lba=");
-            serial_dec(current_lba);
-            serial_write(" error=");
-            serial_hex(inb(ATA_ERROR));
-            serial_write("\n");
+            klog_prefix();
+            klog_write("ATA-READ-FAIL: lba=");
+            klog_dec(current_lba);
+            klog_write(" error=");
+            klog_hex(inb(ATA_ERROR));
+            klog_write("\n");
             return 0;
         }
 
@@ -110,9 +116,10 @@ int ata_read_sectors(uint32_t lba, uint8_t count, void *buffer) {
                 (uint8_t)(value >> 8);
         }
         if (!wait_status(0)) {
-            serial_write("ATA-READ-FAIL completion lba=");
-            serial_dec(current_lba);
-            serial_write("\n");
+            klog_prefix();
+            klog_write("ATA-READ-FAIL: completion lba=");
+            klog_dec(current_lba);
+            klog_write("\n");
             return 0;
         }
     }
@@ -138,11 +145,12 @@ int ata_write_sectors(uint32_t lba, uint8_t count, const void *buffer) {
         outb(ATA_LBA_HIGH, (uint8_t)(current_lba >> 16));
         outb(ATA_COMMAND, 0x30u); /* WRITE SECTORS, one sector */
         if (!wait_status(ATA_SR_DRQ)) {
-            serial_write("ATA-WRITE-FAIL lba=");
-            serial_dec(current_lba);
-            serial_write(" error=");
-            serial_hex(inb(ATA_ERROR));
-            serial_write("\n");
+            klog_prefix();
+            klog_write("ATA-WRITE-FAIL: lba=");
+            klog_dec(current_lba);
+            klog_write(" error=");
+            klog_hex(inb(ATA_ERROR));
+            klog_write("\n");
             return 0;
         }
 
@@ -153,9 +161,10 @@ int ata_write_sectors(uint32_t lba, uint8_t count, const void *buffer) {
             outw(ATA_DATA, value);
         }
         if (!wait_status(0)) {
-            serial_write("ATA-WRITE-FAIL completion lba=");
-            serial_dec(current_lba);
-            serial_write("\n");
+            klog_prefix();
+            klog_write("ATA-WRITE-FAIL: completion lba=");
+            klog_dec(current_lba);
+            klog_write("\n");
             return 0;
         }
     }
