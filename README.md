@@ -18,15 +18,34 @@ at ring 3.
 
 ```cmd
 cd D:\Source\Haku
-python build.py            :: build haku.img only
-python build.py run        :: build + boot in a QEMU window
-python build.py headless   :: build + boot headless, verify via serial log
+python build.py                 :: build haku.img only (data image preserved)
+python build.py run             :: build + boot in a QEMU window
+python build.py run --fresh     :: recreate the FAT12 data image, then boot
+python build.py headless        :: fresh data image + boot headless, verify
+python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 ```
 
 `python build.py headless` verifies ATA detection, FAT12 mounting and
 multi-cluster file reads, ring-3 process entry, timer preemption, per-process
 kernel stacks, syscall handling, process exit/reaping, and timer IRQs through
 the serial log.
+
+### Data image lifecycle
+
+`build/haku_fs.img` is the ATA data disk and is treated as user data: an
+existing image is reused untouched, so files created in a previous QEMU
+session survive the next build. It is (re)created from `kernel/user.asm`
+only when missing or with `--fresh`. If `user.asm` is newer than a reused
+image, the build warns that `HAKU.ELF` on disk is stale. `headless` always
+starts from a fresh image (its fault-injection tests mutate the disk) and,
+after the serial-log check passes, re-verifies the post-run image on the
+host side.
+
+`python build.py inspect` (default: `build/haku_fs.img`) lists the root
+directory and FAT summary without touching the image; `--chains` also prints
+cluster chains, `--cat NAME.EXT` / `--dump NAME.EXT OUT.BIN` extract a file,
+and `--check` enforces the kernel's mount invariants (BPB sanity, mirrored
+FATs, exact chains, no orphans) with a nonzero exit on any damage.
 The build is one Python script on purpose — `cmd.exe` quoting of spaced
 paths (e.g. `C:\Program Files\...`) is fragile, while `subprocess` argument
 lists just work.

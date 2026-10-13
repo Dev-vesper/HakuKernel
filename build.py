@@ -2,18 +2,26 @@
 """Haku build — one straightforward script, no shell-quoting games.
 
 Usage:
-    python build.py            build haku.img only
-    python build.py run        build + boot in a QEMU window
-    python build.py headless   build + boot headless, verify via serial log
+    python build.py                 build haku.img only (data image preserved)
+    python build.py run             build + boot in a QEMU window
+    python build.py run --fresh     recreate the FAT12 data image, then boot
+    python build.py headless        fresh data image + boot headless, verify
+    python build.py inspect ...     examine a FAT12 image (see --help there)
 
 Pipeline:
-    user.asm --nasm--> user.elf --mkfat12--> haku_fs.img
+    user.asm --nasm--> user.elf --mkfat12--> haku_fs.img (fresh only)
     kernel/*.c --cl--> kernel objects + entry/isr.asm --nasm--> entry objects
     kernel objects + entry objects --link--> kernel.pe --pe2bin--> kernel.bin
     stage1.asm --nasm--> stage1.bin (512 B)
     stage2.asm --nasm (kernel entry + size from PE)--> stage2.bin
     stage1 + stage2 + kernel.bin --mkimg--> haku.img (boot floppy)
     QEMU boots haku.img and attaches haku_fs.img as primary-master ATA disk
+
+The data image (build/haku_fs.img) is user data: an existing image is
+reused as-is so files from previous QEMU sessions survive the build, and
+it is recreated only when missing or with --fresh. headless always starts
+from a fresh image — its fault-injection tests need pristine state — and
+verifies the disk again after QEMU exits (tools/lsfat12.py --check).
 
 All tools are invoked with argument lists (never through cmd.exe), so paths
 with spaces just work.
@@ -126,6 +134,27 @@ def main():
     log(f"NASM: {nasm}")
     log(f"CL:   {cl}")
 
+    raw_args = sys.argv[1:]
+    positionals = [a for a in raw_args if not a.startswith("-")]
+    mode = positionals[0] if positionals else "build"
+
+    if mode == "inspect":
+        # Read-only forensics: needs no toolchain, never builds anything.
+        rest = [a for a in raw_args if a != "inspect"]
+        if not any(a.lower().endswith(".img") for a in rest):
+            rest = [os.path.join(BUILD, "haku_fs.img")] + rest
+        rc = subprocess.run([sys.executable,
+                             os.path.join(ROOT, "tools", "lsfat12.py"),
+                             ] + rest).returncode
+        sys.exit(rc)
+
+    for flag in raw_args:
+        if flag.startswith("-") and flag != "--fresh":
+            sys.exit(f"unknown flag: {flag} (only --fresh is supported)")
+    fresh = "--fresh" in raw_args
+    if len(positionals) > 1:
+        sys.exit(f"unexpected argument: {positionals[1]}")
+
     kernel_dir = os.path.join(ROOT, "kernel")
     c_files = sorted(glob.glob(os.path.join(kernel_dir, "*.c")))
     if not c_files:
@@ -147,10 +176,26 @@ def main():
     stage2_bin = os.path.join(BUILD, "stage2.bin")
     img = os.path.join(ROOT, "haku.img")
 
-    # 1. Build the user ELF and put it on a FAT12 ATA disk image.
+    # 1. user.elf is always rebuilt (a build artifact), but the FAT12 data
+    #    disk is user data: an existing image is reused untouched so files
+    #    from previous QEMU sessions survive, and mkfat12 runs only for an
+    #    initial image or an explicit --fresh. headless always recreates —
+    #    its fault-injection tests require pristine, deterministic state.
     run([nasm, "-f", "bin", user_asm, "-o", user_elf])
-    run([py, fat12_script, user_elf, filesystem_image])
-    log(f"FAT12 program disk ready ({os.path.getsize(filesystem_image)} bytes)")
+    if mode == "headless" or fresh or not os.path.isfile(filesystem_image):
+        if mode == "headless" and os.path.isfile(filesystem_image):
+            log("headless: recreating the data image "
+                "(fault-injection tests mutate the disk)")
+        run([py, fat12_script, user_elf, filesystem_image])
+        log(f"FAT12 program disk ready "
+            f"({os.path.getsize(filesystem_image)} bytes)")
+    else:
+        log(f"reusing data image {filesystem_image} "
+            f"({os.path.getsize(filesystem_image)} bytes, "
+            f"user files preserved; --fresh recreates it)")
+        if os.path.getmtime(user_asm) > os.path.getmtime(filesystem_image):
+            log("WARNING: kernel/user.asm is newer than the data image - "
+                "HAKU.ELF on disk is stale; rerun with --fresh")
 
     # 2. kernel C files -> COFF objects
     c_objs = []
@@ -199,7 +244,6 @@ def main():
          stage1_bin, stage2_bin, kernel_bin, str(kernel_sectors), img,
          stage1_asm, stage2_asm])
 
-    mode = sys.argv[1] if len(sys.argv) > 1 else "build"
     disk = [qemu, "-drive", f"file={img},format=raw,if=floppy,index=0",
             "-drive", f"file={filesystem_image},format=raw,if=ide,index=0,media=disk",
             "-boot", "order=a", "-no-reboot"]
@@ -302,15 +346,31 @@ def main():
                                      "FS-ENOSPC-FAIL") if m in content]
         if not missing and not unexpected:
             log("HEADLESS CHECK PASSED: " + ", ".join(expected))
+            # The guest just ran fault-injection restores and a root-fill
+            # against this image: prove on the host side that mirrors,
+            # chains, and allocation state are still consistent.
+            log("--- post-run filesystem inspection ---")
+            chk = subprocess.run(
+                [py, os.path.join(ROOT, "tools", "lsfat12.py"),
+                 "--check", filesystem_image],
+                capture_output=True, text=True)
+            print(chk.stdout, end="")
+            if chk.returncode != 0:
+                print(chk.stderr, end="")
+                sys.exit("HEADLESS CHECK FAILED: "
+                         "data image inconsistent after run")
         else:
             failures = []
             if missing:
                 failures.append("missing markers: " + ", ".join(missing))
             if unexpected:
                 failures.append("unexpected markers: " + ", ".join(unexpected))
+            log("hint: inspect the disk with "
+                "`python build.py inspect [--check] [IMAGE.img]`")
             sys.exit("HEADLESS CHECK FAILED: " + "; ".join(failures))
     elif mode != "build":
-        sys.exit(f"unknown mode: {mode} (use: build | run | headless)")
+        sys.exit(f"unknown mode: {mode} "
+                 f"(use: build | run [--fresh] | headless | inspect [...])")
 
 
 if __name__ == "__main__":

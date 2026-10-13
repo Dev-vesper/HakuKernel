@@ -39,9 +39,15 @@ compatibility is not a short-term goal.
   gap failures keep the old size, short writes keep their durable prefix,
   directory-persist failures roll the chain back, failed TRUNC zeroes the
   entry; README documents the non-atomic model and its limits).
-- [ ] Avoid overwriting user data images during every build; separate initial
-  image creation from preservation of an existing data image.
-- [ ] Provide a way to inspect filesystem images after QEMU shuts down.
+- [x] Avoid overwriting user data images during every build; separate initial
+  image creation from preservation of an existing data image (existing
+  `build/haku_fs.img` is reused as-is; only missing images or `--fresh`
+  recreate it; `user.asm`-newer staleness warns; `headless` always starts
+  fresh for deterministic fault-injection state).
+- [x] Provide a way to inspect filesystem images after QEMU shuts down
+  (`tools/lsfat12.py` + `python build.py inspect`: root listing, chains,
+  `--cat`/`--dump` extraction; `headless` runs `--check` on the post-run
+  image and fails the gate on mirrors/chains/orphan damage).
 
 **Acceptance criteria:** QEMU success and fault-injection tests demonstrate
 that failed operations do not leave leaked descriptors, corrupt FAT chains, or
