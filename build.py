@@ -24,7 +24,11 @@ from a fresh image — its fault-injection tests need pristine state — and
 verifies the disk again after QEMU exits (tools/lsfat12.py --check).
 
 All tools are invoked with argument lists (never through cmd.exe), so paths
-with spaces just work.
+with spaces just work. The C compiler and linker are the only host-specific
+piece: Windows uses VS2022's 32-bit cl.exe + link.exe, while other platforms
+use clang-cl + lld-link. Both accept the identical MSVC-style switches
+(/c, /Fo, /ENTRY, /ALIGN, /NODEFAULTLIB ...) and both emit 32-bit COFF/PE, so
+only tool discovery differs.
 """
 
 import glob
@@ -114,6 +118,61 @@ def find_msvc():
     return cands[-1]
 
 
+def _latest(paths):
+    """Pick the highest-numbered tool; distros ship clang-cl-19, lld-link-19."""
+    def version(path):
+        nums = re.findall(r"\d+", os.path.basename(path))
+        return int(nums[-1]) if nums else -1
+    return max(paths, key=version)
+
+
+def find_clang_cl():
+    """Locate a cl-driver clang: clang-cl, a versioned one, or clang in cl mode."""
+    direct = shutil.which("clang-cl")
+    if direct:
+        return [direct]
+    cands = []
+    for d in ("/usr/lib/llvm-*/bin", "/usr/bin", "/usr/local/bin"):
+        cands += glob.glob(os.path.join(d, "clang-cl-*"))
+    if cands:
+        return [_latest(cands)]
+    clang = shutil.which("clang")
+    if clang:
+        return [clang, "--driver-mode=cl"]
+    sys.exit("clang-cl not found: install Clang (e.g. apt install clang lld)")
+
+
+def find_lld_link():
+    """Locate lld-link (or a versioned lld-link-19)."""
+    direct = shutil.which("lld-link")
+    if direct:
+        return [direct]
+    cands = []
+    for d in ("/usr/lib/llvm-*/bin", "/usr/bin", "/usr/local/bin"):
+        cands += glob.glob(os.path.join(d, "lld-link-*"))
+    if not cands:
+        sys.exit("lld-link not found: install LLVM lld (e.g. apt install lld)")
+    return [_latest(cands)]
+
+
+def detect_toolchain():
+    """Return (cc, linker, label): a compiler+linker that share MSVC switches.
+
+    Windows keeps VS2022's 32-bit cl.exe + link.exe. Everywhere else MSVC is
+    unavailable, so clang-cl + lld-link drive the same /c, /Fo, /ENTRY, /ALIGN
+    command lines targeting i686 COFF, keeping NASM win32 objects, the linked
+    PE, and pe2bin's output identical to a Windows build.
+    """
+    if os.name == "nt":
+        cl = find_msvc()
+        link = os.path.join(os.path.dirname(cl), "link.exe")
+        if not os.path.isfile(link):
+            sys.exit(f"link.exe not found next to cl.exe: {cl}")
+        return [cl], [link], "MSVC cl.exe/link.exe"
+    cc = find_clang_cl() + ["--target=i686-pc-windows-msvc"]
+    return cc, find_lld_link(), "clang-cl/lld-link (i686-pc-windows-msvc)"
+
+
 def run(cmd):
     log("+ " + " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -124,15 +183,14 @@ def main():
         os.path.join(os.environ.get("LOCALAPPDATA", ""), r"bin\NASM\nasm.exe"),
         r"C:\Program Files\NASM\nasm.exe",
     ], "NASM  [winget install NASM.NASM]")
-    cl = find_msvc()
-    link = os.path.join(os.path.dirname(cl), "link.exe")
-    if not os.path.isfile(link):
-        sys.exit(f"link.exe not found next to cl.exe: {cl}")
+    cc, linker, toolchain = detect_toolchain()
     py = sys.executable
     qemu = find_tool("qemu-system-i386",
                      [r"C:\Program Files\qemu\qemu-system-i386.exe"], "QEMU")
     log(f"NASM: {nasm}")
-    log(f"CL:   {cl}")
+    log(f"CC:   {' '.join(cc)}")
+    log(f"LINK: {' '.join(linker)}")
+    log(f"toolchain: {toolchain}")
 
     raw_args = sys.argv[1:]
     positionals = [a for a in raw_args if not a.startswith("-")]
@@ -201,7 +259,7 @@ def main():
     c_objs = []
     for src in c_files:
         obj = os.path.join(BUILD, os.path.splitext(os.path.basename(src))[0] + ".obj")
-        run([cl, "/nologo", "/c", "/GS-", "/Os", "/W3", "/Fo" + obj, src])
+        run(cc + ["/nologo", "/c", "/GS-", "/Os", "/W3", "/Fo" + obj, src])
         c_objs.append(obj)
     log(f"{len(c_objs)} C objects built")
 
@@ -213,7 +271,7 @@ def main():
     # 4. link a fixed-base PE (/ENTRY:entry — link prepends _ for x86;
     #    /ALIGN:16 packs sections; /FIXED drops .reloc — we always load
     #    at the linked base, so runtime relocation is meaningless)
-    run([link, "/NOLOGO", "/SUBSYSTEM:NATIVE", "/ENTRY:entry",
+    run(linker + ["/NOLOGO", "/SUBSYSTEM:NATIVE", "/ENTRY:entry",
          "/BASE:0x10000", "/ALIGN:16", "/FIXED", "/NODEFAULTLIB",
          "/MAP:" + os.path.join(BUILD, "kernel.map"),
          "/OUT:" + kernel_pe, entry_obj, isr_obj] + c_objs)
