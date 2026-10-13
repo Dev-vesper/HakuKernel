@@ -34,8 +34,11 @@ compatibility is not a short-term goal.
   `FS-ATA-OK`: empty files, exact-sector/span/partial I/O, injected
   cut/bad/reserved/cyclic chains with restore, crafted-full data area,
   ATA bounds and NULL-transfer rejection).
-- [ ] Clean up allocated clusters and metadata as far as possible after failed
-  writes, and document that operations are not atomic.
+- [x] Clean up allocated clusters and metadata as far as possible after failed
+  writes, and document that operations are not atomic (`FS-ROLLBACK-OK`:
+  gap failures keep the old size, short writes keep their durable prefix,
+  directory-persist failures roll the chain back, failed TRUNC zeroes the
+  entry; README documents the non-atomic model and its limits).
 - [ ] Avoid overwriting user data images during every build; separate initial
   image creation from preservation of an existing data image.
 - [ ] Provide a way to inspect filesystem images after QEMU shuts down.

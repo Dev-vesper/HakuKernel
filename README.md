@@ -124,6 +124,19 @@ restored, reads must give `EIO`, loops must terminate) plus a crafted
 full data area (`FS-CORRUPT-OK`), and ATA bounds/NULL-transfer rejection
 (`FS-ATA-OK`).
 
+Writes are not atomic: there is no journal, so a failing multi-sector
+write leaves exactly its durable prefix (a short count means those bytes
+are on disk and the size covers them), while a total failure restores
+the pre-call size and releases clusters the call allocated
+(`FS-ROLLBACK-OK`). Bytes are never attempted past a gap that failed to
+zero, so no unwritten holes are ever claimed. If persisting the directory
+entry itself fails, the call rolls back to the pre-call metadata rather
+than leaking unreachable clusters; a TRUNC whose chain cannot be freed
+zeroes the entry best-effort so the file reads back empty instead of
+pointing at a broken chain. Anything beyond that best effort (for
+example, clusters orphaned by a dying disk) stays leaked: there is no
+fsck yet.
+
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It
 rejects unmapped/kernel pointers, wraparound, invalid descriptors and

@@ -254,34 +254,39 @@ static int write_fat_entry(uint16_t cluster, uint16_t value) {
     uint32_t offset = cluster + cluster / 2u;
     uint8_t low;
     uint8_t high;
+    uint8_t original_low;
+    uint8_t original_high;
+    uint32_t low_lba = volume.fat_start + offset / FAT12_SECTOR_SIZE;
+    uint32_t low_offset = offset % FAT12_SECTOR_SIZE;
+    uint32_t high_lba = volume.fat_start +
+                        (offset + 1u) / FAT12_SECTOR_SIZE;
+    uint32_t high_offset = (offset + 1u) % FAT12_SECTOR_SIZE;
+    int pass;
     value &= 0x0FFFu;
-    for (uint32_t copy = 0; copy < volume.fat_count; copy++) {
-        uint8_t original_low;
-        uint8_t original_high;
-        uint32_t low_lba = volume.fat_start +
-                           copy * volume.fat_sectors +
-                           offset / FAT12_SECTOR_SIZE;
-        uint32_t low_offset = offset % FAT12_SECTOR_SIZE;
-        uint32_t high_lba = volume.fat_start +
-                            copy * volume.fat_sectors +
-                            (offset + 1u) / FAT12_SECTOR_SIZE;
-        uint32_t high_offset = (offset + 1u) % FAT12_SECTOR_SIZE;
-        if (!read_volume_sector(low_lba, sector_buffer)) return 0;
-        original_low = sector_buffer[low_offset];
-        if (!read_volume_sector(high_lba, sector_buffer)) return 0;
-        original_high = sector_buffer[high_offset];
-        if (cluster & 1u) {
-            low = (uint8_t)((original_low & 0x0Fu) | (value << 4));
-            high = (uint8_t)(value >> 4);
-        } else {
-            low = (uint8_t)value;
-            high = (uint8_t)((original_high & 0xF0u) | (value >> 8));
-        }
-        if (!write_fat_byte(copy, offset, low) ||
-            !write_fat_byte(copy, offset + 1u, high))
-            return 0;
+    /* Nibbles come from copy 0; every copy then gets the same bytes so
+     * mirrors cannot disagree. A second full pass retries transient
+     * faults before the caller rolls back (best effort, then error). */
+    if (!read_volume_sector(low_lba, sector_buffer)) return 0;
+    original_low = sector_buffer[low_offset];
+    if (!read_volume_sector(high_lba, sector_buffer)) return 0;
+    original_high = sector_buffer[high_offset];
+    if (cluster & 1u) {
+        low = (uint8_t)((original_low & 0x0Fu) | (value << 4));
+        high = (uint8_t)(value >> 4);
+    } else {
+        low = (uint8_t)value;
+        high = (uint8_t)((original_high & 0xF0u) | (value >> 8));
     }
-    return 1;
+    for (pass = 0; pass < 2; pass++) {
+        int complete = 1;
+        for (uint32_t copy = 0; copy < volume.fat_count; copy++) {
+            if (!write_fat_byte(copy, offset, low) ||
+                !write_fat_byte(copy, offset + 1u, high))
+                complete = 0;
+        }
+        if (complete) return 1;
+    }
+    return 0;
 }
 
 static int write_root_entry(const fat12_file_t *file) {
@@ -456,6 +461,13 @@ int fat12_file_open(const char *name, uint8_t flags, fat12_file_t *file) {
     file->opened = 1;
     if (flags & FAT12_OPEN_TRUNC) {
         if (!free_cluster_chain(file->first_cluster)) {
+            /* The chain may be only half released: leave the metadata
+             * consistent-as-empty (best effort) instead of pointing at
+             * a broken chain that would read phantom data, then fail.
+             * A later create/truncate heals the file for reuse. */
+            file->first_cluster = 0;
+            file->size = 0;
+            write_root_entry(file);
             file->opened = 0;
             return -FAT12_ERR_IO;
         }
@@ -561,12 +573,61 @@ static int write_file_bytes(fat12_file_t *file, uint32_t position,
     return copied == count ? 1 : -FAT12_ERR_IO;
 }
 
+/* Persist size/first_cluster to the directory entry, with one retry
+ * for transient faults. Returns 1 on success, 0 when the metadata did
+ * not reach the disk (callers must then roll back, see below). */
+static int persist_file(fat12_file_t *file) {
+    if (write_root_entry(file)) return 1;
+    return write_root_entry(file);
+}
+
+/* Cut the in-memory chain down to the clusters covering keep_size and
+ * release the rest back to the FAT. Used to undo allocations from a
+ * failed write so clusters do not leak as unreachable orphans. Reads
+ * the whole kept prefix first, so a corrupt chain aborts before
+ * anything is modified. Returns 1 when the chain matches keep_size. */
+static int truncate_chain_to(fat12_file_t *file, uint32_t keep_size) {
+    uint32_t bytes_per_cluster =
+        (uint32_t)volume.sectors_per_cluster * FAT12_SECTOR_SIZE;
+    uint32_t needed =
+        keep_size ? (keep_size - 1u) / bytes_per_cluster + 1u : 0u;
+    uint16_t cluster = file->first_cluster;
+    uint16_t rest;
+    if (needed == 0) {
+        int freed = free_cluster_chain(cluster);
+        file->first_cluster = 0;
+        return freed;
+    }
+    for (uint32_t i = 0; i + 1u < needed; i++) {
+        uint16_t following;
+        if (cluster < 2u || cluster >= volume.cluster_count + 2u ||
+            !read_fat_entry(cluster, &following))
+            return 0;
+        if (following < 2u || following >= volume.cluster_count + 2u)
+            return 0;
+        cluster = following;
+    }
+    if (!read_fat_entry(cluster, &rest)) return 0;
+    if (rest >= FAT12_CLUSTER_EOC) return 1;
+    if (!write_fat_entry(cluster, FAT12_CLUSTER_END)) return 0;
+    return free_cluster_chain(rest);
+}
+
+/* Write model (NOT atomic, see README): the directory entry is only
+ * ever persisted with a size the disk actually holds. A fully written
+ * call extends the size; a short write keeps its durable prefix and
+ * reports a short count; a total failure restores the pre-call size
+ * and releases clusters allocated by the call. Payload bytes are
+ * never attempted past a gap that failed to zero, so no unwritten
+ * holes are ever claimed. */
 int fat12_file_write(fat12_file_t *file, const void *buffer, uint32_t count,
                      uint32_t *write_count) {
     static const uint8_t zeros[FAT12_SECTOR_SIZE];
     const uint8_t *source = (const uint8_t *)buffer;
     uint32_t written = 0;
     uint32_t original_position;
+    uint32_t original_first;
+    uint32_t original_size;
     int status = 1;
     int refreshed;
     if (!write_count) return -FAT12_ERR_INVALID;
@@ -580,6 +641,8 @@ int fat12_file_write(fat12_file_t *file, const void *buffer, uint32_t count,
     if (file->flags & FAT12_OPEN_APPEND) file->position = file->size;
     if (count > 0xFFFFFFFFu - file->position) return -FAT12_ERR_INVALID;
     original_position = file->position;
+    original_first = file->first_cluster;
+    original_size = file->size;
     if (original_position > file->size) {
         uint32_t gap = original_position - file->size;
         uint32_t zeroed = 0;
@@ -596,12 +659,18 @@ int fat12_file_write(fat12_file_t *file, const void *buffer, uint32_t count,
                 break;
             }
         }
-        if (status == 1) {
-            file->size = original_position;
-            if (!write_root_entry(file)) status = -FAT12_ERR_IO;
+        if (status != 1) {
+            /* Gap does not exist: keep only the zeroed prefix, never
+             * claim the hole, and do not touch the payload. */
+            file->size = original_size + zeroed;
+            file->position = file->size;
+            persist_file(file);
+            *write_count = 0;
+            return status;
         }
+        file->size = original_position;
     }
-    if (status == 1 && count) {
+    if (count) {
         uint32_t done = 0;
         status = write_file_bytes(file, original_position, source, count,
                                   &done);
@@ -610,7 +679,17 @@ int fat12_file_write(fat12_file_t *file, const void *buffer, uint32_t count,
     if (original_position + written > file->size)
         file->size = original_position + written;
     file->position = original_position + written;
-    if (!write_root_entry(file)) status = -FAT12_ERR_IO;
+    if (!persist_file(file)) {
+        /* New bytes may be on disk but the directory cannot say so:
+         * release what this call allocated and restore the pre-call
+         * metadata rather than leaking unreachable orphans. */
+        truncate_chain_to(file, original_size);
+        file->first_cluster = (uint16_t)original_first;
+        file->size = original_size;
+        file->position = original_size;
+        *write_count = 0;
+        return -FAT12_ERR_IO;
+    }
     *write_count = written;
     if (status != 1) return written ? 1 : status;
     return written == count ? 1 : -FAT12_ERR_IO;

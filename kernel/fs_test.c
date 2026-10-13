@@ -208,11 +208,12 @@ static int test_sector_edges(void) {
     return ok;
 }
 
-static int open_scratch_chain(fat12_file_t *file, uint16_t *first_out) {
+static int open_scratch_chain(fat12_file_t *file, const char *name,
+                              uint16_t *first_out) {
     uint32_t written = 0;
     int opened;
     fill_pattern(edge_buf, 3u * FS_SECTOR);
-    opened = fat12_file_open("CHAIN.TXT",
+    opened = fat12_file_open(name,
                              FAT12_OPEN_READ | FAT12_OPEN_WRITE |
                              FAT12_OPEN_CREATE | FAT12_OPEN_TRUNC,
                              file);
@@ -272,7 +273,7 @@ static int test_corrupt_chains(void) {
                         fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) vfs_close(FS_TEST_PID, (uint32_t)fd);
     else return 0;
-    setup_result = open_scratch_chain(&setup, &first);
+    setup_result = open_scratch_chain(&setup, "CHAIN.TXT", &first);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "corrupt-setup", setup_result, 1);
     if (setup_result != 1) return 0;
     if (!snap_take(&snap)) {
@@ -391,7 +392,10 @@ static int test_corrupt_chains(void) {
 
     /* T4: back edge (last cluster points at the middle one). Bounded
      * walks must terminate: reads succeed on the valid prefix, and
-     * freeing the loop must fail cleanly instead of spinning. */
+     * freeing the loop must fail cleanly instead of spinning. The
+     * failed TRUNC frees what it walked and zeroes the entry, so the
+     * file comes back as a clean empty file that plain writes heal —
+     * no restore needed, nothing leaks. */
     memcpy(work, snap.image, snap.sectors * FS_SECTOR);
     chain_set(work, c, b);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "cycle-patch",
@@ -401,12 +405,50 @@ static int test_corrupt_chains(void) {
                         vfs_open(FS_TEST_PID, "CHAIN.TXT",
                                  VFS_O_RDWR | VFS_O_TRUNC),
                         -VFS_EIO);
-    ok &= expect_tagged("FS-CORRUPT-FAIL", "cycle-restore",
-                        snap_write_all(&snap, snap.image), 1);
+    fd = vfs_open(FS_TEST_PID, "CHAIN.TXT", VFS_O_RDONLY);
+    ok &= expect_tagged("FS-CORRUPT-FAIL", "cycle-empty-open",
+                        fd >= 3 ? 0 : fd, 0);
+    if (fd >= 3) {
+        ok &= expect_tagged("FS-CORRUPT-FAIL", "cycle-empty-size",
+                            vfs_seek(FS_TEST_PID, (uint32_t)fd, 0,
+                                     FS_SEEK_END),
+                            0);
+        vfs_close(FS_TEST_PID, (uint32_t)fd);
+    } else {
+        ok = 0;
+    }
+    /* Heal with ordinary writes: the freed loop clusters are reusable
+     * and the entry is already a valid empty file. */
+    fd = vfs_open(FS_TEST_PID, "CHAIN.TXT",
+                  VFS_O_CREAT | VFS_O_RDWR | VFS_O_TRUNC);
+    ok &= expect_tagged("FS-CORRUPT-FAIL", "cycle-recreate",
+                        fd >= 3 ? 0 : fd, 0);
+    if (fd >= 3) {
+        fill_pattern(edge_buf, 3u * FS_SECTOR);
+        ok &= expect_tagged("FS-CORRUPT-FAIL", "cycle-rewrite",
+                            vfs_write(FS_TEST_PID, (uint32_t)fd, edge_buf,
+                                      3u * FS_SECTOR),
+                            (int32_t)(3u * FS_SECTOR));
+        vfs_close(FS_TEST_PID, (uint32_t)fd);
+    } else {
+        ok = 0;
+    }
     ok &= heal_check("cycle-heal", 0, 3u * FS_SECTOR);
 
     /* T5: every data cluster marked used. Extending any file must
-     * report a full disk instead of an I/O error. */
+     * report a full disk instead of an I/O error. Re-snapshot first:
+     * the T4 rewrite above legitimately reallocated the scratch chain,
+     * so the original image no longer describes this volume. */
+    snap_free(&snap);
+    if (ok && !snap_take(&snap)) {
+        expect_tagged("FS-CORRUPT-FAIL", "datafull-snap", 0, 1);
+        ok = 0;
+    }
+    if (!ok) {
+        kfree(work);
+        snap_free(&snap);
+        return 0;
+    }
     memcpy(work, snap.image, snap.sectors * FS_SECTOR);
     for (uint16_t cluster = 2; cluster < snap.cluster_count + 2u;
          cluster++)
@@ -441,6 +483,195 @@ static int test_corrupt_chains(void) {
     }
 
     kfree(work);
+    snap_free(&snap);
+    return ok;
+}
+
+static int craft_disk_full(fat_snap_t *snap, uint8_t *work) {
+    memcpy(work, snap->image, snap->sectors * FS_SECTOR);
+    for (uint16_t cluster = 2; cluster < snap->cluster_count + 2u;
+         cluster++)
+        chain_set(work, cluster, FS_FAT12_EOC);
+    return snap_write_all(snap, work);
+}
+
+/* Failed-write cleanup: a gap that cannot be zeroed must not grow the
+ * size, a partially written payload keeps exactly its durable prefix,
+ * and a TRUNC that cannot free its chain must leave consistent-as-empty
+ * metadata instead of a broken chain. */
+static int test_write_rollback(void) {
+    int ok = 1;
+    fat_snap_t snap;
+    uint8_t *work = 0;
+    fat12_file_t setup;
+    uint16_t first = 0;
+    uint32_t cl_b = 0;
+    uint32_t cl_c = 0;
+    int32_t fd;
+    int32_t r;
+    int setup_result;
+    if (!snap_take(&snap)) {
+        expect_tagged("FS-ROLLBACK-FAIL", "rollback-snap", 0, 1);
+        return 0;
+    }
+    work = (uint8_t *)kmalloc(snap.sectors * FS_SECTOR);
+    if (!work) {
+        expect_tagged("FS-ROLLBACK-FAIL", "rollback-work", 0, 1);
+        snap_free(&snap);
+        return 0;
+    }
+
+    /* Scratch files up front so the snapshots below cover their chains.
+     * ROLL stays empty; TRUNC owns three clusters for the cycle probe. */
+    fd = vfs_open(FS_TEST_PID, "ROLL.TXT", VFS_O_CREAT | VFS_O_RDWR);
+    ok &= expect_tagged("FS-ROLLBACK-FAIL", "rollback-roll-create",
+                        fd >= 3 ? 0 : fd, 0);
+    if (fd >= 3) vfs_close(FS_TEST_PID, (uint32_t)fd);
+    else {
+        ok = 0;
+        goto done;
+    }
+    setup_result = open_scratch_chain(&setup, "TRUNC.TXT", &first);
+    ok &= expect_tagged("FS-ROLLBACK-FAIL", "rollback-trunc-setup",
+                        setup_result, 1);
+    if (setup_result != 1) {
+        ok = 0;
+        goto done;
+    }
+    snap_free(&snap);
+    if (!snap_take(&snap)) {
+        expect_tagged("FS-ROLLBACK-FAIL", "rollback-snap2", 0, 1);
+        ok = 0;
+        goto done;
+    }
+
+    /* R1: seek past EOF on a full volume, then write. The gap cannot
+     * be zeroed, so the size must stay 0 and the error stays ENOSPC. */
+    ok &= expect_tagged("FS-ROLLBACK-FAIL", "gap-patch",
+                        craft_disk_full(&snap, work), 1);
+    fd = vfs_open(FS_TEST_PID, "ROLL.TXT", VFS_O_RDWR);
+    ok &= expect_tagged("FS-ROLLBACK-FAIL", "gap-open",
+                        fd >= 3 ? 0 : fd, 0);
+    if (fd >= 3) {
+        ok &= expect_tagged("FS-ROLLBACK-FAIL", "gap-seek",
+                            vfs_seek(FS_TEST_PID, (uint32_t)fd, 2048,
+                                     FS_SEEK_SET),
+                            2048);
+        ok &= expect_tagged("FS-ROLLBACK-FAIL", "gap-write-enospc",
+                            vfs_write(FS_TEST_PID, (uint32_t)fd, edge_buf,
+                                      10),
+                            -VFS_ENOSPC);
+        ok &= expect_tagged("FS-ROLLBACK-FAIL", "gap-size-kept",
+                            vfs_seek(FS_TEST_PID, (uint32_t)fd, 0,
+                                     FS_SEEK_END),
+                            0);
+        vfs_close(FS_TEST_PID, (uint32_t)fd);
+    } else {
+        ok = 0;
+    }
+    ok &= expect_tagged("FS-ROLLBACK-FAIL", "gap-restore",
+                        snap_write_all(&snap, snap.image), 1);
+    /* The volume heals: a plain small write works again. */
+    fd = vfs_open(FS_TEST_PID, "ROLL.TXT", VFS_O_RDWR);
+    ok &= expect_tagged("FS-ROLLBACK-FAIL", "gap-heal-open",
+                        fd >= 3 ? 0 : fd, 0);
+    if (fd >= 3) {
+        fill_pattern(edge_buf, 10);
+        ok &= expect_tagged("FS-ROLLBACK-FAIL", "gap-heal-write",
+                            vfs_write(FS_TEST_PID, (uint32_t)fd, edge_buf,
+                                      10),
+                            10);
+        vfs_close(FS_TEST_PID, (uint32_t)fd);
+    } else {
+        ok = 0;
+    }
+
+    /* R2: the first cluster exists, the second cannot be allocated.
+     * Exactly the durable 512-byte prefix must survive with ENOSPC
+     * reported via a short count, and the size must cover it. */
+    snap_free(&snap);
+    if (!snap_take(&snap)) {
+        expect_tagged("FS-ROLLBACK-FAIL", "rollback-snap3", 0, 1);
+        ok = 0;
+        goto done;
+    }
+    ok &= expect_tagged("FS-ROLLBACK-FAIL", "partial-patch",
+                        craft_disk_full(&snap, work), 1);
+    fill_pattern(edge_buf, 600);
+    fd = vfs_open(FS_TEST_PID, "ROLL.TXT", VFS_O_RDWR);
+    ok &= expect_tagged("FS-ROLLBACK-FAIL", "partial-open",
+                        fd >= 3 ? 0 : fd, 0);
+    if (fd >= 3) {
+        ok &= expect_tagged("FS-ROLLBACK-FAIL", "partial-seek",
+                            vfs_seek(FS_TEST_PID, (uint32_t)fd, 0,
+                                     FS_SEEK_SET),
+                            0);
+        ok &= expect_tagged("FS-ROLLBACK-FAIL", "partial-short",
+                            vfs_write(FS_TEST_PID, (uint32_t)fd, edge_buf,
+                                      600),
+                            512);
+        ok &= expect_tagged("FS-ROLLBACK-FAIL", "partial-size",
+                            vfs_seek(FS_TEST_PID, (uint32_t)fd, 0,
+                                     FS_SEEK_END),
+                            512);
+        ok &= expect_tagged("FS-ROLLBACK-FAIL", "partial-rewind",
+                            vfs_seek(FS_TEST_PID, (uint32_t)fd, 0,
+                                     FS_SEEK_SET),
+                            0);
+        r = vfs_read(FS_TEST_PID, (uint32_t)fd, edge_back, 512);
+        ok &= expect_tagged("FS-ROLLBACK-FAIL", "partial-reread", r, 512);
+        if (r > 0)
+            ok &= expect_tagged("FS-ROLLBACK-FAIL", "partial-content",
+                                same_bytes(edge_back, edge_buf, 512), 1);
+        vfs_close(FS_TEST_PID, (uint32_t)fd);
+    } else {
+        ok = 0;
+    }
+    ok &= expect_tagged("FS-ROLLBACK-FAIL", "partial-restore",
+                        snap_write_all(&snap, snap.image), 1);
+
+    /* R3: TRUNC over a cyclic chain cannot free it; the file must read
+     * back as a clean empty file, not phantom data or EIO. */
+    if (ok) {
+        if (first >= 2u && first < snap.cluster_count + 2u)
+            cl_b = chain_next(snap.image, first);
+        if (cl_b >= 2u && cl_b < snap.cluster_count + 2u)
+            cl_c = chain_next(snap.image, (uint16_t)cl_b);
+        ok &= expect_tagged("FS-ROLLBACK-FAIL", "trunc-chain",
+                            cl_c >= 2u &&
+                            cl_c < snap.cluster_count + 2u,
+                            1);
+    }
+    if (!ok) goto done;
+    memcpy(work, snap.image, snap.sectors * FS_SECTOR);
+    chain_set(work, (uint16_t)cl_c, (uint16_t)cl_b);
+    ok &= expect_tagged("FS-ROLLBACK-FAIL", "trunc-cycle-patch",
+                        snap_write_all(&snap, work), 1);
+    ok &= expect_tagged("FS-ROLLBACK-FAIL", "trunc-open-eio",
+                        vfs_open(FS_TEST_PID, "TRUNC.TXT",
+                                 VFS_O_RDWR | VFS_O_TRUNC),
+                        -VFS_EIO);
+    /* No restore: the failed free already released the loop and the
+     * directory entry is consistent-as-empty by construction. */
+    fd = vfs_open(FS_TEST_PID, "TRUNC.TXT", VFS_O_RDONLY);
+    ok &= expect_tagged("FS-ROLLBACK-FAIL", "trunc-reopen",
+                        fd >= 3 ? 0 : fd, 0);
+    if (fd >= 3) {
+        ok &= expect_tagged("FS-ROLLBACK-FAIL", "trunc-empty",
+                            vfs_seek(FS_TEST_PID, (uint32_t)fd, 0,
+                                     FS_SEEK_END),
+                            0);
+        ok &= expect_tagged("FS-ROLLBACK-FAIL", "trunc-eof",
+                            vfs_read(FS_TEST_PID, (uint32_t)fd, edge_back,
+                                     10),
+                            0);
+        vfs_close(FS_TEST_PID, (uint32_t)fd);
+    } else {
+        ok = 0;
+    }
+
+done:
+    if (work) kfree(work);
     snap_free(&snap);
     return ok;
 }
@@ -573,6 +804,15 @@ void fs_error_self_test(void) {
         serial_write("FS-ATA-OK bounds/null/zero-sector\n");
     } else {
         serial_write("FS-ATA-FAIL\n");
+    }
+
+    /* Failed-write cleanup: sizes only cover durable bytes, short
+     * writes keep their prefix, and failed metadata leaves no
+     * unreachable clusters behind. */
+    if (test_write_rollback()) {
+        serial_write("FS-ROLLBACK-OK gap/partial/trunc cleanup\n");
+    } else {
+        serial_write("FS-ROLLBACK-FAIL\n");
     }
 
     /* Full volume: create files until the root directory refuses with

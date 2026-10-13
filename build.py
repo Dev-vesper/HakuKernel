@@ -279,6 +279,7 @@ def main():
             "FS-FILE-EDGE-OK", # empty files, exact-sector, span, partial writes
             "FS-CORRUPT-OK", # cut/bad/reserved/cyclic chains + data-full ENOSPC
             "FS-ATA-OK",     # ATA bounds/null transfers rejected
+            "FS-ROLLBACK-OK", # failed writes roll back size/clusters
             "FS-ENOSPC-OK",  # full root directory refused with ENOSPC
             "PIC-OK",        # 8259 remapped to 0x20/0x28
             "PIT-OK",        # 100 Hz timer programmed
@@ -297,6 +298,7 @@ def main():
                                      "FS-EDGE-FAIL",
                                      "FS-CORRUPT-FAIL",
                                      "FS-ATA-FAIL",
+                                     "FS-ROLLBACK-FAIL",
                                      "FS-ENOSPC-FAIL") if m in content]
         if not missing and not unexpected:
             log("HEADLESS CHECK PASSED: " + ", ".join(expected))
