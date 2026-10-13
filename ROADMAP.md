@@ -25,8 +25,10 @@ compatibility is not a short-term goal.
 
 ### 1. Storage Reliability — Immediate Priority
 
-- [ ] Return distinct, correct errors for FAT12/VFS I/O failures, missing
-  files, full disks, and invalid input.
+- [x] Return distinct, correct errors for FAT12/VFS I/O failures, missing
+  files, full disks, and invalid input (`FS-ERRORS-OK`/`FS-ENOSPC-OK` in
+  headless: ENOENT/EINVAL/EEXIST/EBADF/ENOSPC/EIO mapping plus a
+  root-full probe; syscall checks cover bad flags, bad fd, bad whence).
 - [ ] Add FAT12 tests for corrupt or cyclic chains, full disks, empty files,
   sector boundaries, and ATA errors.
 - [ ] Clean up allocated clusters and metadata as far as possible after failed

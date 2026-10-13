@@ -143,6 +143,30 @@ _user_program_start:
     cmp eax, -22
     jne .fail
 
+    ; Invalid open flag combinations and bad descriptors fail distinctly.
+    mov esi, 30
+    mov eax, SYS_OPEN
+    mov ebx, USER_DATA_BASE + (file_path_one - data_start)
+    mov ecx, 0x80              ; O_EXCL without O_CREAT
+    xor edx, edx
+    int 0x80
+    cmp eax, -22               ; EINVAL
+    jne .fail
+    mov esi, 31
+    mov eax, SYS_OPEN
+    mov ebx, USER_DATA_BASE + (file_path_one - data_start)
+    mov ecx, 0x200             ; O_TRUNC with O_RDONLY
+    xor edx, edx
+    int 0x80
+    cmp eax, -22               ; EINVAL
+    jne .fail
+    mov esi, 32
+    mov eax, SYS_CLOSE
+    mov ebx, 99
+    int 0x80
+    cmp eax, -9                ; EBADF
+    jne .fail
+
     mov esi, 11
     mov eax, SYS_WRITE
     mov ebx, 1
@@ -215,6 +239,15 @@ _user_program_start:
     mov edx, file_payload_end - file_payload
     int 0x80
     cmp eax, file_payload_end - file_payload
+    jne .fail
+
+    mov esi, 33
+    mov eax, SYS_LSEEK
+    mov ebx, edi               ; valid descriptor, invalid whence
+    xor ecx, ecx
+    mov edx, 99
+    int 0x80
+    cmp eax, -22               ; EINVAL, position unchanged
     jne .fail
 
     mov esi, 17

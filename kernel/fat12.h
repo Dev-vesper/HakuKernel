@@ -25,6 +25,12 @@ typedef struct {
 #define FAT12_ERR_NO_SPACE  4
 #define FAT12_ERR_INVALID   5
 
+/* Return convention for every fat12_* call below: 1 on success, or a
+ * negative -FAT12_ERR_* code naming the exact failure (disk I/O error,
+ * missing entry, existing entry, full volume/directory, invalid
+ * argument). Callers must compare against 1, never use !result. */
+const char *fat12_error_name(int result);
+
 int fat12_mount(void);
 int fat12_read_file(const char *name, void *buffer, uint32_t capacity,
                     uint32_t *file_size);

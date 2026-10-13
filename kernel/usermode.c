@@ -42,15 +42,15 @@ int usermode_init(void) {
     uint32_t image_size = 0;
     uint8_t *image;
 
-    if (!fat12_mount()) return 0;
+    if (fat12_mount() != 1) return 0;
     vfs_init();
     image = (uint8_t *)kmalloc(USER_ELF_MAX_SIZE);
     if (!image) {
         serial_write("ELF-DISK-FAIL kernel heap exhausted\n");
         return 0;
     }
-    if (!fat12_read_file("HAKU.ELF", image, USER_ELF_MAX_SIZE,
-                         &image_size)) {
+    if (fat12_read_file("HAKU.ELF", image, USER_ELF_MAX_SIZE,
+                        &image_size) != 1) {
         kfree(image);
         return 0;
     }

@@ -21,6 +21,10 @@
 #define VFS_ENOSPC         28
 
 void vfs_init(void);
+/* Translate a fat12_* result (1 or negative -FAT12_ERR_*) into 0 or a
+ * negative -VFS_E* errno. Unit-checked by the fs error self-test, so
+ * every FAT12 failure class keeps one distinct errno end to end. */
+int32_t vfs_map_fat_error(int fat_result);
 int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags);
 int32_t vfs_close(uint32_t pid, uint32_t fd);
 int32_t vfs_read(uint32_t pid, uint32_t fd, void *buffer, uint32_t count);

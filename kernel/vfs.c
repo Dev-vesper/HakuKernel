@@ -24,6 +24,15 @@ void vfs_init(void) {
     memset(descriptors, 0, sizeof(descriptors));
 }
 
+int32_t vfs_map_fat_error(int fat_result) {
+    if (fat_result == 1) return 0;
+    if (fat_result == -FAT12_ERR_NOT_FOUND) return -VFS_ENOENT;
+    if (fat_result == -FAT12_ERR_EXISTS) return -VFS_EEXIST;
+    if (fat_result == -FAT12_ERR_NO_SPACE) return -VFS_ENOSPC;
+    if (fat_result == -FAT12_ERR_INVALID) return -VFS_EINVAL;
+    return -VFS_EIO;
+}
+
 int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
     uint8_t fat_flags = 0;
     uint32_t fd;
@@ -52,13 +61,7 @@ int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
     open_result = fat12_file_open(path, fat_flags,
                                   &descriptors[pid - 1u][fd].file);
     cpu_irq_restore(irq_flags);
-    if (open_result != 1) {
-        if (open_result == -FAT12_ERR_NOT_FOUND) return -VFS_ENOENT;
-        if (open_result == -FAT12_ERR_EXISTS) return -VFS_EEXIST;
-        if (open_result == -FAT12_ERR_NO_SPACE) return -VFS_ENOSPC;
-        if (open_result == -FAT12_ERR_INVALID) return -VFS_EINVAL;
-        return -VFS_EIO;
-    }
+    if (open_result != 1) return vfs_map_fat_error(open_result);
     descriptors[pid - 1u][fd].used = 1;
     return (int32_t)fd;
 }
@@ -71,7 +74,7 @@ int32_t vfs_close(uint32_t pid, uint32_t fd) {
     descriptor = &descriptors[pid - 1u][fd];
     if (!descriptor->used) return -VFS_EBADF;
     irq_flags = cpu_irq_save();
-    if (!fat12_file_close(&descriptor->file)) {
+    if (fat12_file_close(&descriptor->file) != 1) {
         cpu_irq_restore(irq_flags);
         return -VFS_EIO;
     }
@@ -84,17 +87,19 @@ int32_t vfs_read(uint32_t pid, uint32_t fd, void *buffer, uint32_t count) {
     vfs_fd_t *descriptor;
     uint32_t copied = 0;
     uint32_t irq_flags;
-    int ok;
+    int read_result;
     if (!pid_valid(pid) || fd < VFS_FIRST_FILE_FD || fd >= VFS_FD_COUNT)
         return -VFS_EBADF;
     descriptor = &descriptors[pid - 1u][fd];
     if (!descriptor->used) return -VFS_EBADF;
     if (!(descriptor->file.flags & FAT12_OPEN_READ)) return -VFS_EBADF;
+    if (!buffer && count) return -VFS_EINVAL;
     irq_flags = cpu_irq_save();
-    ok = fat12_file_read(&descriptor->file, buffer, count, &copied);
+    read_result = fat12_file_read(&descriptor->file, buffer, count, &copied);
     cpu_irq_restore(irq_flags);
     if (copied) return (int32_t)copied;
-    return ok ? 0 : -VFS_EIO;
+    if (read_result == 1) return 0;
+    return vfs_map_fat_error(read_result);
 }
 
 int32_t vfs_write(uint32_t pid, uint32_t fd, const void *buffer,
@@ -102,17 +107,20 @@ int32_t vfs_write(uint32_t pid, uint32_t fd, const void *buffer,
     vfs_fd_t *descriptor;
     uint32_t written = 0;
     uint32_t irq_flags;
-    int ok;
+    int write_result;
     if (!pid_valid(pid) || fd < VFS_FIRST_FILE_FD || fd >= VFS_FD_COUNT)
         return -VFS_EBADF;
     descriptor = &descriptors[pid - 1u][fd];
     if (!descriptor->used) return -VFS_EBADF;
     if (!(descriptor->file.flags & FAT12_OPEN_WRITE)) return -VFS_EBADF;
+    if (!buffer && count) return -VFS_EINVAL;
     irq_flags = cpu_irq_save();
-    ok = fat12_file_write(&descriptor->file, buffer, count, &written);
+    write_result = fat12_file_write(&descriptor->file, buffer, count,
+                                    &written);
     cpu_irq_restore(irq_flags);
     if (written) return (int32_t)written;
-    return ok ? 0 : -VFS_EIO;
+    if (write_result == 1) return 0;
+    return vfs_map_fat_error(write_result);
 }
 
 int32_t vfs_seek(uint32_t pid, uint32_t fd, int32_t offset,
@@ -128,7 +136,8 @@ int32_t vfs_seek(uint32_t pid, uint32_t fd, int32_t offset,
     irq_flags = cpu_irq_save();
     ok = fat12_file_seek(&descriptor->file, offset, whence, &position);
     cpu_irq_restore(irq_flags);
-    if (!ok || position > 0x7FFFFFFFu) return -VFS_EINVAL;
+    if (ok != 1) return vfs_map_fat_error(ok);
+    if (position > 0x7FFFFFFFu) return -VFS_EINVAL;
     return (int32_t)position;
 }
 

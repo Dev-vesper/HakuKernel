@@ -112,6 +112,12 @@ supports stdout/stderr to VGA and serial as well as writable regular files.
 `open`, `close`, `lseek`, and per-process file descriptors are backed by the
 VFS/FAT12 layer. Reads and writes are bounded to 4096 bytes, and errors return
 negative errno values (a future libc can translate these to `errno`).
+Every FAT12 failure class keeps one distinct errno end to end: missing
+files give `ENOENT`, bad flags/whence/pointers give `EINVAL`, existing
+files give `EEXIST`, bad descriptors give `EBADF`, a full volume gives
+`ENOSPC`, and disk I/O failures give `EIO`. After both user processes
+exit, the idle task runs an error self-test (`FS-ERRORS-OK`) including a
+root-fill probe that must fail with `ENOSPC` (`FS-ENOSPC-OK`).
 
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It

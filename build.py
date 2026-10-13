@@ -258,12 +258,14 @@ def main():
             "SCHED-START pid=1",
             "SCHED-PREEMPT-OK",
             "USERMODE-OK",   # ELF32 user image executed POSIX-style syscalls
-            "USER-SYSCALL-CHECKS-OK", # EFAULT/EBADF/EINVAL/ENOSYS paths passed
+            "USER-SYSCALL-CHECKS-OK", # EFAULT/EBADF/EINVAL/ENOSYS + flag/fd/whence paths passed
             "USER-READ-OK",  # blocking read copied keyboard input to user memory
             "USER-FILE-IO-OK", # FAT12 create/write/read/seek/close passed
             "USER-EXIT-OK status=0 pid=1",
             "USER-EXIT-OK status=0 pid=2",
             "SCHED-REAP-OK",
+            "FS-ERRORS-OK",  # missing/invalid/exists/badfd map to distinct errno
+            "FS-ENOSPC-OK",  # full root directory refused with ENOSPC
             "PIC-OK",        # 8259 remapped to 0x20/0x28
             "PIT-OK",        # 100 Hz timer programmed
             "KBD-OK",        # PS/2 keyboard IRQ1 handler installed

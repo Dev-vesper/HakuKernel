@@ -20,10 +20,14 @@
 #define SYS_GETPID 20u
 
 /* Raw syscall errors are returned as -errno; a future libc sets errno. */
+#define HAKU_ENOENT 2u
+#define HAKU_EIO    5u
 #define HAKU_EBADF  9u
 #define HAKU_EFAULT 14u
+#define HAKU_EEXIST 17u
 #define HAKU_EINVAL 22u
-#define HAKU_EIO    5u
+#define HAKU_EMFILE 24u
+#define HAKU_ENOSPC 28u
 #define HAKU_ENAMETOOLONG 36u
 #define HAKU_ENOSYS 38u
 

@@ -47,6 +47,18 @@ static int read_volume_sector(uint32_t relative_lba, void *buffer) {
     return ata_read_sectors(relative_lba, 1, buffer);
 }
 
+const char *fat12_error_name(int result) {
+    if (result == 1) return "OK";
+    switch (-result) {
+    case FAT12_ERR_IO: return "IO";
+    case FAT12_ERR_NOT_FOUND: return "NOT_FOUND";
+    case FAT12_ERR_EXISTS: return "EXISTS";
+    case FAT12_ERR_NO_SPACE: return "NO_SPACE";
+    case FAT12_ERR_INVALID: return "INVALID";
+    default: return "UNKNOWN";
+    }
+}
+
 int fat12_mount(void) {
     uint32_t root_bytes;
     uint32_t data_sectors;
@@ -55,10 +67,10 @@ int fat12_mount(void) {
     uint16_t total16;
 
     memset(&volume, 0, sizeof(volume));
-    if (!ata_init()) return 0;
+    if (!ata_init()) return -FAT12_ERR_IO;
     if (!ata_read_sectors(0, 1, sector_buffer)) {
         serial_write("FAT12-FAIL boot sector read\n");
-        return 0;
+        return -FAT12_ERR_IO;
     }
     total16 = read_u16(&sector_buffer[19]);
     volume.total_sectors = total16 ? total16 : read_u32(&sector_buffer[32]);
@@ -79,7 +91,7 @@ int fat12_mount(void) {
         volume.total_sectors > ata_sector_count() ||
         sector_buffer[510] != 0x55u || sector_buffer[511] != 0xAAu) {
         serial_write("FAT12-FAIL invalid BPB\n");
-        return 0;
+        return -FAT12_ERR_INVALID;
     }
 
     root_bytes = (uint32_t)volume.root_entries * 32u;
@@ -90,7 +102,7 @@ int fat12_mount(void) {
     volume.data_start = volume.root_start + volume.root_sectors;
     if (volume.data_start >= volume.total_sectors) {
         serial_write("FAT12-FAIL invalid volume layout\n");
-        return 0;
+        return -FAT12_ERR_INVALID;
     }
 
     data_sectors = volume.total_sectors - volume.data_start;
@@ -100,7 +112,7 @@ int fat12_mount(void) {
     if (volume.cluster_count >= 4085u ||
         required_fat_bytes > fat_bytes) {
         serial_write("FAT12-FAIL cluster table bounds\n");
-        return 0;
+        return -FAT12_ERR_INVALID;
     }
 
     volume.mounted = 1;
@@ -264,14 +276,19 @@ int fat12_read_file(const char *name, void *buffer, uint32_t capacity,
                     uint32_t *file_size) {
     fat12_file_t file;
     uint32_t count;
-    if (!buffer || !file_size ||
-        fat12_file_open(name, FAT12_OPEN_READ, &file) != 1 ||
-        file.size > capacity)
-        return 0;
-    if (!fat12_file_read(&file, buffer, file.size, &count) ||
-        count != file.size) {
+    int open_result;
+    int read_result;
+    if (!buffer || !file_size) return -FAT12_ERR_INVALID;
+    open_result = fat12_file_open(name, FAT12_OPEN_READ, &file);
+    if (open_result != 1) return open_result;
+    if (file.size > capacity) {
         fat12_file_close(&file);
-        return 0;
+        return -FAT12_ERR_INVALID;
+    }
+    read_result = fat12_file_read(&file, buffer, file.size, &count);
+    if (read_result != 1 || count != file.size) {
+        fat12_file_close(&file);
+        return read_result != 1 ? read_result : -FAT12_ERR_IO;
     }
     *file_size = count;
     return fat12_file_close(&file);
@@ -301,7 +318,8 @@ static int create_root_entry(const uint8_t short_name[11]) {
 static int refresh_file(fat12_file_t *file) {
     uint8_t entry[32];
     int found = find_root_entry(file->short_name, entry, 0, 0);
-    if (found != 1) return 0;
+    if (found < 0) return -FAT12_ERR_IO;
+    if (found != 1) return -FAT12_ERR_NOT_FOUND;
     file->first_cluster = read_u16(entry + 26);
     file->size = read_u32(entry + 28);
     return 1;
@@ -322,15 +340,16 @@ static int allocate_cluster(uint16_t *result) {
     for (uint32_t candidate = 2; candidate < volume.cluster_count + 2u;
          candidate++) {
         uint16_t value;
-        if (!read_fat_entry((uint16_t)candidate, &value)) return 0;
+        if (!read_fat_entry((uint16_t)candidate, &value))
+            return -FAT12_ERR_IO;
         if (value != FAT12_CLUSTER_FREE) continue;
         if (!zero_cluster((uint16_t)candidate) ||
             !write_fat_entry((uint16_t)candidate, FAT12_CLUSTER_END))
-            return 0;
+            return -FAT12_ERR_IO;
         *result = (uint16_t)candidate;
         return 1;
     }
-    return 0;
+    return -FAT12_ERR_NO_SPACE;
 }
 
 static int free_cluster_chain(uint16_t first) {
@@ -353,23 +372,27 @@ static int file_cluster_at(fat12_file_t *file, uint32_t index, int create,
                            uint16_t *result) {
     uint16_t cluster = file->first_cluster;
     uint32_t iterations = 0;
+    int allocated;
     if (cluster == 0) {
-        if (!create || !allocate_cluster(&cluster)) return 0;
+        if (!create) return -FAT12_ERR_IO;
+        allocated = allocate_cluster(&cluster);
+        if (allocated != 1) return allocated;
         file->first_cluster = cluster;
     }
     for (uint32_t i = 0; i < index; i++) {
         uint16_t following;
         if (cluster < 2u || cluster >= volume.cluster_count + 2u ||
-            iterations++ >= volume.cluster_count ||
-            !read_fat_entry(cluster, &following))
-            return 0;
+            iterations++ >= volume.cluster_count)
+            return -FAT12_ERR_IO;
+        if (!read_fat_entry(cluster, &following)) return -FAT12_ERR_IO;
         if (following >= FAT12_CLUSTER_EOC) {
-            if (!create || !allocate_cluster(&following) ||
-                !write_fat_entry(cluster, following))
-                return 0;
+            if (!create) return -FAT12_ERR_IO;
+            allocated = allocate_cluster(&following);
+            if (allocated != 1) return allocated;
+            if (!write_fat_entry(cluster, following)) return -FAT12_ERR_IO;
         } else if (following == FAT12_CLUSTER_BAD || following < 2u ||
                    following >= volume.cluster_count + 2u) {
-            return 0;
+            return -FAT12_ERR_IO;
         }
         cluster = following;
     }
@@ -421,7 +444,7 @@ int fat12_file_open(const char *name, uint8_t flags, fat12_file_t *file) {
 }
 
 int fat12_file_close(fat12_file_t *file) {
-    if (!file || !file->opened) return 0;
+    if (!file || !file->opened) return -FAT12_ERR_INVALID;
     file->opened = 0;
     return 1;
 }
@@ -431,11 +454,14 @@ int fat12_file_read(fat12_file_t *file, void *buffer, uint32_t count,
     uint8_t *destination = (uint8_t *)buffer;
     uint32_t copied = 0;
     uint32_t bytes_per_cluster;
-    if (!file || !file->opened || !(file->flags & FAT12_OPEN_READ) ||
-        !read_count || (!buffer && count))
-        return 0;
+    int refreshed;
+    if (!read_count) return -FAT12_ERR_INVALID;
     *read_count = 0;
-    if (!refresh_file(file)) return 0;
+    if (!file || !file->opened || !(file->flags & FAT12_OPEN_READ) ||
+        (!buffer && count))
+        return -FAT12_ERR_INVALID;
+    refreshed = refresh_file(file);
+    if (refreshed != 1) return refreshed;
     if (file->position >= file->size || count == 0) return 1;
     if (count > file->size - file->position)
         count = file->size - file->position;
@@ -451,8 +477,14 @@ int fat12_file_read(fat12_file_t *file, void *buffer, uint32_t count,
         uint32_t amount = FAT12_SECTOR_SIZE - sector_offset;
         uint16_t cluster;
         uint32_t lba;
+        int located;
         if (amount > count - copied) amount = count - copied;
-        if (!file_cluster_at(file, cluster_index, 0, &cluster)) break;
+        located = file_cluster_at(file, cluster_index, 0, &cluster);
+        if (located != 1) {
+            file->position += copied;
+            *read_count = copied;
+            return copied ? 1 : located;
+        }
         lba = volume.data_start +
               (uint32_t)(cluster - 2u) * volume.sectors_per_cluster +
               sector_index;
@@ -462,14 +494,16 @@ int fat12_file_read(fat12_file_t *file, void *buffer, uint32_t count,
     }
     file->position += copied;
     *read_count = copied;
-    return copied == count;
+    return copied == count ? 1 : -FAT12_ERR_IO;
 }
 
-static uint32_t write_file_bytes(fat12_file_t *file, uint32_t position,
-                                 const uint8_t *source, uint32_t count) {
+static int write_file_bytes(fat12_file_t *file, uint32_t position,
+                            const uint8_t *source, uint32_t count,
+                            uint32_t *written_out) {
     uint32_t copied = 0;
     uint32_t bytes_per_cluster =
         (uint32_t)volume.sectors_per_cluster * FAT12_SECTOR_SIZE;
+    *written_out = 0;
     while (copied < count) {
         uint32_t absolute = position + copied;
         uint32_t cluster_index = absolute / bytes_per_cluster;
@@ -479,8 +513,13 @@ static uint32_t write_file_bytes(fat12_file_t *file, uint32_t position,
         uint32_t amount = FAT12_SECTOR_SIZE - sector_offset;
         uint16_t cluster;
         uint32_t lba;
+        int located;
         if (amount > count - copied) amount = count - copied;
-        if (!file_cluster_at(file, cluster_index, 1, &cluster)) break;
+        located = file_cluster_at(file, cluster_index, 1, &cluster);
+        if (located != 1) {
+            *written_out = copied;
+            return located;
+        }
         lba = volume.data_start +
               (uint32_t)(cluster - 2u) * volume.sectors_per_cluster +
               sector_index;
@@ -491,7 +530,8 @@ static uint32_t write_file_bytes(fat12_file_t *file, uint32_t position,
         if (!ata_write_sectors(lba, 1, sector_buffer)) break;
         copied += amount;
     }
-    return copied;
+    *written_out = copied;
+    return copied == count ? 1 : -FAT12_ERR_IO;
 }
 
 int fat12_file_write(fat12_file_t *file, const void *buffer, uint32_t count,
@@ -500,43 +540,53 @@ int fat12_file_write(fat12_file_t *file, const void *buffer, uint32_t count,
     const uint8_t *source = (const uint8_t *)buffer;
     uint32_t written = 0;
     uint32_t original_position;
-    int success = 1;
-    if (!file || !file->opened || !(file->flags & FAT12_OPEN_WRITE) ||
-        !write_count || (!buffer && count))
-        return 0;
+    int status = 1;
+    int refreshed;
+    if (!write_count) return -FAT12_ERR_INVALID;
     *write_count = 0;
+    if (!file || !file->opened || !(file->flags & FAT12_OPEN_WRITE) ||
+        (!buffer && count))
+        return -FAT12_ERR_INVALID;
     if (count == 0) return 1;
-    if (!refresh_file(file)) return 0;
+    refreshed = refresh_file(file);
+    if (refreshed != 1) return refreshed;
     if (file->flags & FAT12_OPEN_APPEND) file->position = file->size;
-    if (count > 0xFFFFFFFFu - file->position) return 0;
+    if (count > 0xFFFFFFFFu - file->position) return -FAT12_ERR_INVALID;
     original_position = file->position;
     if (original_position > file->size) {
         uint32_t gap = original_position - file->size;
         uint32_t zeroed = 0;
         while (zeroed < gap) {
             uint32_t amount = gap - zeroed;
+            uint32_t done = 0;
+            int filled;
             if (amount > sizeof(zeros)) amount = sizeof(zeros);
-            uint32_t done = write_file_bytes(file, file->size + zeroed,
-                                             zeros, amount);
+            filled = write_file_bytes(file, file->size + zeroed,
+                                      zeros, amount, &done);
             zeroed += done;
-            if (done != amount) {
-                success = 0;
+            if (filled != 1) {
+                status = filled;
                 break;
             }
         }
-        if (success) {
+        if (status == 1) {
             file->size = original_position;
-            if (!write_root_entry(file)) success = 0;
+            if (!write_root_entry(file)) status = -FAT12_ERR_IO;
         }
     }
-    if (success && count)
-        written = write_file_bytes(file, original_position, source, count);
+    if (status == 1 && count) {
+        uint32_t done = 0;
+        status = write_file_bytes(file, original_position, source, count,
+                                  &done);
+        written = done;
+    }
     if (original_position + written > file->size)
         file->size = original_position + written;
     file->position = original_position + written;
-    if (!write_root_entry(file)) success = 0;
+    if (!write_root_entry(file)) status = -FAT12_ERR_IO;
     *write_count = written;
-    return success && written == count;
+    if (status != 1) return written ? 1 : status;
+    return written == count ? 1 : -FAT12_ERR_IO;
 }
 
 int fat12_file_seek(fat12_file_t *file, int32_t offset, uint32_t whence,
@@ -544,22 +594,25 @@ int fat12_file_seek(fat12_file_t *file, int32_t offset, uint32_t whence,
     uint32_t base;
     uint32_t amount;
     uint32_t target;
-    if (!file || !file->opened || !new_position || !refresh_file(file))
-        return 0;
+    int refreshed;
+    if (!new_position) return -FAT12_ERR_INVALID;
+    if (!file || !file->opened) return -FAT12_ERR_INVALID;
+    refreshed = refresh_file(file);
+    if (refreshed != 1) return refreshed;
     if (whence == FAT12_SEEK_SET) base = 0;
     else if (whence == FAT12_SEEK_CUR) base = file->position;
     else if (whence == FAT12_SEEK_END) base = file->size;
-    else return 0;
+    else return -FAT12_ERR_INVALID;
     if (offset < 0) {
         amount = (uint32_t)(-(offset + 1)) + 1u;
-        if (base < amount) return 0;
+        if (base < amount) return -FAT12_ERR_INVALID;
         target = base - amount;
     } else {
         amount = (uint32_t)offset;
-        if (base > 0xFFFFFFFFu - amount) return 0;
+        if (base > 0xFFFFFFFFu - amount) return -FAT12_ERR_INVALID;
         target = base + amount;
     }
-    if (target > 0x7FFFFFFFu) return 0;
+    if (target > 0x7FFFFFFFu) return -FAT12_ERR_INVALID;
     file->position = target;
     *new_position = target;
     return 1;

@@ -1,6 +1,7 @@
 #include "scheduler.h"
 #include "console.h"
 #include "frame.h"
+#include "fs_test.h"
 #include "gdt.h"
 #include "paging.h"
 #include "vfs.h"
@@ -29,8 +30,20 @@ static uint32_t switch_count;
 static int scheduler_started;
 static int preempt_marker_written;
 
+int scheduler_user_tasks_done(void) {
+    if (task_count == 0) return 0;
+    for (uint32_t i = 0; i < task_count; i++)
+        if (tasks[i].state == TASK_RUNNABLE) return 0;
+    return 1;
+}
+
 static void scheduler_idle_loop(void) {
     for (;;) {
+        /* Runs only while no user task is runnable, so this is the
+         * post-user hook: verify FS error reporting once, then idle.
+         * The volume stays usable for the test because every user
+         * file I/O check has already finished. */
+        fs_error_self_test();
         __asm {
             sti
             hlt
