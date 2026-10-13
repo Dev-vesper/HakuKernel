@@ -31,6 +31,15 @@ typedef struct {
  * argument). Callers must compare against 1, never use !result. */
 const char *fat12_error_name(int result);
 
+/* Fault-injection hooks for the filesystem self-test. Sector access is
+ * bounds-checked against the mounted volume; geometry inputs are
+ * validated before use. Same 1 / -FAT12_ERR_* convention. */
+int fat12_test_sector_info(uint32_t *fat_start, uint32_t *fat_sectors,
+                           uint32_t *fat_count, uint32_t *cluster_count,
+                           uint32_t *sectors_per_cluster);
+int fat12_test_read_sector(uint32_t lba, void *buffer);
+int fat12_test_write_sector(uint32_t lba, const void *buffer);
+
 int fat12_mount(void);
 int fat12_read_file(const char *name, void *buffer, uint32_t capacity,
                     uint32_t *file_size);

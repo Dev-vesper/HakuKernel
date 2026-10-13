@@ -59,6 +59,33 @@ const char *fat12_error_name(int result) {
     }
 }
 
+int fat12_test_sector_info(uint32_t *fat_start, uint32_t *fat_sectors,
+                           uint32_t *fat_count, uint32_t *cluster_count,
+                           uint32_t *sectors_per_cluster) {
+    if (!fat_start || !fat_sectors || !fat_count || !cluster_count ||
+        !sectors_per_cluster)
+        return -FAT12_ERR_INVALID;
+    if (!volume.mounted) return -FAT12_ERR_IO;
+    *fat_start = volume.fat_start;
+    *fat_sectors = volume.fat_sectors;
+    *fat_count = volume.fat_count;
+    *cluster_count = volume.cluster_count;
+    *sectors_per_cluster = volume.sectors_per_cluster;
+    return 1;
+}
+
+int fat12_test_read_sector(uint32_t lba, void *buffer) {
+    if (!volume.mounted || !buffer) return -FAT12_ERR_INVALID;
+    if (lba >= volume.total_sectors) return -FAT12_ERR_INVALID;
+    return ata_read_sectors(lba, 1, buffer) ? 1 : -FAT12_ERR_IO;
+}
+
+int fat12_test_write_sector(uint32_t lba, const void *buffer) {
+    if (!volume.mounted || !buffer) return -FAT12_ERR_INVALID;
+    if (lba >= volume.total_sectors) return -FAT12_ERR_INVALID;
+    return ata_write_sectors(lba, 1, buffer) ? 1 : -FAT12_ERR_IO;
+}
+
 int fat12_mount(void) {
     uint32_t root_bytes;
     uint32_t data_sectors;

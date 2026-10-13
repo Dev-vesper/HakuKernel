@@ -40,8 +40,19 @@ def monitor_cmd(port, cmds, timeout=5):
     """Run HMP commands over the TCP monitor, return the raw transcript."""
     import socket
     out = []
+    s = None
     try:
-        s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        # QEMU may need a moment to listen (Windows TCP); retry instead
+        # of dropping keystrokes that user processes block on.
+        for _ in range(12):
+            try:
+                s = socket.create_connection(("127.0.0.1", port),
+                                             timeout=timeout)
+                break
+            except OSError:
+                time.sleep(0.5)
+        if s is None:
+            raise OSError("monitor never listened")
         s.settimeout(timeout)
         try:
             out.append(s.recv(65536))
@@ -265,6 +276,9 @@ def main():
             "USER-EXIT-OK status=0 pid=2",
             "SCHED-REAP-OK",
             "FS-ERRORS-OK",  # missing/invalid/exists/badfd map to distinct errno
+            "FS-FILE-EDGE-OK", # empty files, exact-sector, span, partial writes
+            "FS-CORRUPT-OK", # cut/bad/reserved/cyclic chains + data-full ENOSPC
+            "FS-ATA-OK",     # ATA bounds/null transfers rejected
             "FS-ENOSPC-OK",  # full root directory refused with ENOSPC
             "PIC-OK",        # 8259 remapped to 0x20/0x28
             "PIT-OK",        # 100 Hz timer programmed
@@ -278,7 +292,12 @@ def main():
             missing.append("two exited processes reaped")
         if content.count("USER-FILE-IO-OK") < 2:
             missing.append("file I/O passed in both user processes")
-        unexpected = [m for m in ("USER-SYSCALL-FAIL",) if m in content]
+        unexpected = [m for m in ("USER-SYSCALL-FAIL",
+                                     "FS-ERROR-FAIL",
+                                     "FS-EDGE-FAIL",
+                                     "FS-CORRUPT-FAIL",
+                                     "FS-ATA-FAIL",
+                                     "FS-ENOSPC-FAIL") if m in content]
         if not missing and not unexpected:
             log("HEADLESS CHECK PASSED: " + ", ".join(expected))
         else:

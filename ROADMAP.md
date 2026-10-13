@@ -29,8 +29,11 @@ compatibility is not a short-term goal.
   files, full disks, and invalid input (`FS-ERRORS-OK`/`FS-ENOSPC-OK` in
   headless: ENOENT/EINVAL/EEXIST/EBADF/ENOSPC/EIO mapping plus a
   root-full probe; syscall checks cover bad flags, bad fd, bad whence).
-- [ ] Add FAT12 tests for corrupt or cyclic chains, full disks, empty files,
-  sector boundaries, and ATA errors.
+- [x] Add FAT12 tests for corrupt or cyclic chains, full disks, empty files,
+  sector boundaries, and ATA errors (`FS-FILE-EDGE-OK`, `FS-CORRUPT-OK`,
+  `FS-ATA-OK`: empty files, exact-sector/span/partial I/O, injected
+  cut/bad/reserved/cyclic chains with restore, crafted-full data area,
+  ATA bounds and NULL-transfer rejection).
 - [ ] Clean up allocated clusters and metadata as far as possible after failed
   writes, and document that operations are not atomic.
 - [ ] Avoid overwriting user data images during every build; separate initial

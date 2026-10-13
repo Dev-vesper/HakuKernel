@@ -117,7 +117,12 @@ files give `ENOENT`, bad flags/whence/pointers give `EINVAL`, existing
 files give `EEXIST`, bad descriptors give `EBADF`, a full volume gives
 `ENOSPC`, and disk I/O failures give `EIO`. After both user processes
 exit, the idle task runs an error self-test (`FS-ERRORS-OK`) including a
-root-fill probe that must fail with `ENOSPC` (`FS-ENOSPC-OK`).
+root-fill probe that must fail with `ENOSPC` (`FS-ENOSPC-OK`). The same
+pass also covers empty files, exact-sector and boundary-spanning I/O
+(`FS-FILE-EDGE-OK`), injected cut/bad/reserved/cyclic FAT chains (each
+restored, reads must give `EIO`, loops must terminate) plus a crafted
+full data area (`FS-CORRUPT-OK`), and ATA bounds/NULL-transfer rejection
+(`FS-ATA-OK`).
 
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It
