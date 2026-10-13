@@ -2,6 +2,7 @@
 #include "ata.h"
 #include "console.h"
 #include "fat12.h"
+#include "fat12_vfs.h"
 #include "heap.h"
 #include "klog.h"
 #include "scheduler.h"
@@ -210,23 +211,24 @@ static int test_sector_edges(void) {
     return ok;
 }
 
-static int open_scratch_chain(fat12_file_t *file, const char *name,
-                              uint16_t *first_out) {
-    uint32_t written = 0;
-    int opened;
+/* Build a 3-cluster scratch file through the public VFS interface, then
+ * locate its chain with the read-only debug hook for fault injection.
+ * Returns 1 or a negative -VFS_E* errno. */
+static int open_scratch_chain(const char *name, uint16_t *first_out) {
+    int32_t fd;
+    int32_t written;
+    int looked_up;
     fill_pattern(edge_buf, 3u * FS_SECTOR);
-    opened = fat12_file_open(name,
-                             FAT12_OPEN_READ | FAT12_OPEN_WRITE |
-                             FAT12_OPEN_CREATE | FAT12_OPEN_TRUNC,
-                             file);
-    if (opened != 1) return opened;
-    if (fat12_file_write(file, edge_buf, 3u * FS_SECTOR, &written) != 1 ||
-        written != 3u * FS_SECTOR) {
-        fat12_file_close(file);
-        return -FAT12_ERR_IO;
-    }
-    *first_out = file->first_cluster;
-    return fat12_file_close(file);
+    fd = vfs_open(FS_TEST_PID, name,
+                  VFS_O_CREAT | VFS_O_RDWR | VFS_O_TRUNC);
+    if (fd < 3) return fd;
+    written = vfs_write(FS_TEST_PID, (uint32_t)fd, edge_buf,
+                        3u * FS_SECTOR);
+    vfs_close(FS_TEST_PID, (uint32_t)fd);
+    if (written != (int32_t)(3u * FS_SECTOR)) return -VFS_EIO;
+    looked_up = fat12_debug_first_cluster(name, first_out);
+    if (looked_up != 1) return fat12_map_errno(looked_up);
+    return 1;
 }
 
 static int heal_check(const char *label, uint32_t position, uint32_t count) {
@@ -259,7 +261,6 @@ static int test_corrupt_chains(void) {
     int ok = 1;
     fat_snap_t snap;
     uint8_t *work = 0;
-    fat12_file_t setup;
     uint16_t first = 0;
     uint32_t cl_b = 0;
     uint32_t cl_c = 0;
@@ -275,7 +276,7 @@ static int test_corrupt_chains(void) {
                         fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) vfs_close(FS_TEST_PID, (uint32_t)fd);
     else return 0;
-    setup_result = open_scratch_chain(&setup, "CHAIN.TXT", &first);
+    setup_result = open_scratch_chain("CHAIN.TXT", &first);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "corrupt-setup", setup_result, 1);
     if (setup_result != 1) return 0;
     if (!snap_take(&snap)) {
@@ -505,7 +506,6 @@ static int test_write_rollback(void) {
     int ok = 1;
     fat_snap_t snap;
     uint8_t *work = 0;
-    fat12_file_t setup;
     uint16_t first = 0;
     uint32_t cl_b = 0;
     uint32_t cl_c = 0;
@@ -533,7 +533,7 @@ static int test_write_rollback(void) {
         ok = 0;
         goto done;
     }
-    setup_result = open_scratch_chain(&setup, "TRUNC.TXT", &first);
+    setup_result = open_scratch_chain("TRUNC.TXT", &first);
     ok &= expect_tagged("FS-ROLLBACK-FAIL", "rollback-trunc-setup",
                         setup_result, 1);
     if (setup_result != 1) {
@@ -716,17 +716,28 @@ void fs_error_self_test(void) {
 
     /* The errno mapper itself: every FAT12 failure class must land on
      * exactly one VFS errno, unknown codes fall back to EIO. */
-    pass &= expect("map-ok", vfs_map_fat_error(1), 0);
-    pass &= expect("map-io", vfs_map_fat_error(-FAT12_ERR_IO), -VFS_EIO);
+    pass &= expect("map-ok", fat12_map_errno(1), 0);
+    pass &= expect("map-io", fat12_map_errno(-FAT12_ERR_IO), -VFS_EIO);
     pass &= expect("map-enoent",
-                   vfs_map_fat_error(-FAT12_ERR_NOT_FOUND), -VFS_ENOENT);
+                   fat12_map_errno(-FAT12_ERR_NOT_FOUND), -VFS_ENOENT);
     pass &= expect("map-eexist",
-                   vfs_map_fat_error(-FAT12_ERR_EXISTS), -VFS_EEXIST);
+                   fat12_map_errno(-FAT12_ERR_EXISTS), -VFS_EEXIST);
     pass &= expect("map-enospc",
-                   vfs_map_fat_error(-FAT12_ERR_NO_SPACE), -VFS_ENOSPC);
+                   fat12_map_errno(-FAT12_ERR_NO_SPACE), -VFS_ENOSPC);
     pass &= expect("map-einval",
-                   vfs_map_fat_error(-FAT12_ERR_INVALID), -VFS_EINVAL);
-    pass &= expect("map-unknown", vfs_map_fat_error(-99), -VFS_EIO);
+                   fat12_map_errno(-FAT12_ERR_INVALID), -VFS_EINVAL);
+    pass &= expect("map-unknown", fat12_map_errno(-99), -VFS_EIO);
+
+    /* The interface itself: unknown filesystems and null vectors are
+     * rejected without disturbing the mounted root, which must keep
+     * serving descriptors afterwards. */
+    pass &= expect("if-bad-mount", vfs_mount_root("no-such-fs"),
+                   -VFS_EINVAL);
+    pass &= expect("if-null-register", vfs_register_fs(0), 0);
+    fd = vfs_open(FS_TEST_PID, "HAKU.ELF", VFS_O_RDONLY);
+    pass &= expect("if-root-alive", fd >= 3 ? 0 : fd, 0);
+    if (fd >= 3) vfs_close(FS_TEST_PID, (uint32_t)fd);
+    else pass = 0;
 
     /* Missing file. */
     pass &= expect("missing-open",

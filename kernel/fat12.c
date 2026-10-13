@@ -217,6 +217,20 @@ static int find_root_entry(const uint8_t short_name[11], uint8_t result[32],
     return 0;
 }
 
+int fat12_debug_first_cluster(const char *name, uint16_t *first_out) {
+    uint8_t short_name[11];
+    uint8_t entry[32];
+    int found;
+    if (!volume.mounted || !first_out ||
+        !make_short_name(name, short_name))
+        return -FAT12_ERR_INVALID;
+    found = find_root_entry(short_name, entry, 0, 0);
+    if (found < 0) return -FAT12_ERR_IO;
+    if (found != 1) return -FAT12_ERR_NOT_FOUND;
+    *first_out = read_u16(entry + 26);
+    return 1;
+}
+
 static int read_fat_entry(uint16_t cluster, uint16_t *value) {
     uint32_t fat_offset = cluster + cluster / 2u;
     uint32_t sector_index = fat_offset / FAT12_SECTOR_SIZE;

@@ -1,42 +1,80 @@
 #include "vfs.h"
-#include "fat12.h"
 #include "idt.h"
 #include "scheduler.h"
 
 #define VFS_MAX_PROCESSES SCHEDULER_MAX_PROCESSES
 #define VFS_FD_COUNT 8u
 #define VFS_FIRST_FILE_FD 3u
+#define VFS_MAX_FS 4u
 #define VFS_SUPPORTED_FLAGS \
     (VFS_O_ACCMODE | VFS_O_CREAT | VFS_O_EXCL | VFS_O_TRUNC | VFS_O_APPEND)
 
 typedef struct {
-    fat12_file_t file;
+    const vfs_fs_ops_t *ops;
+    uint32_t accmode;   /* VFS_O_RDONLY/WRONLY/RDWR, fixed at open */
+    void *backend;      /* backend-allocated per-open handle */
     int used;
 } vfs_fd_t;
 
 static vfs_fd_t descriptors[VFS_MAX_PROCESSES][VFS_FD_COUNT];
+static const vfs_fs_ops_t *fs_table[VFS_MAX_FS];
+static uint32_t fs_count;
+static const vfs_fs_ops_t *root_fs;
 
 static int pid_valid(uint32_t pid) {
     return pid > 0 && pid <= VFS_MAX_PROCESSES;
 }
 
-void vfs_init(void) {
-    memset(descriptors, 0, sizeof(descriptors));
+static int name_equal(const char *a, const char *b) {
+    size_t i = 0;
+    for (;;) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == 0) return 1;
+        i++;
+    }
 }
 
-int32_t vfs_map_fat_error(int fat_result) {
-    if (fat_result == 1) return 0;
-    if (fat_result == -FAT12_ERR_NOT_FOUND) return -VFS_ENOENT;
-    if (fat_result == -FAT12_ERR_EXISTS) return -VFS_EEXIST;
-    if (fat_result == -FAT12_ERR_NO_SPACE) return -VFS_ENOSPC;
-    if (fat_result == -FAT12_ERR_INVALID) return -VFS_EINVAL;
-    return -VFS_EIO;
+int vfs_register_fs(const vfs_fs_ops_t *ops) {
+    if (!ops || !ops->name || !ops->mount || !ops->open || !ops->close ||
+        !ops->read || !ops->write || !ops->seek)
+        return 0;
+    for (uint32_t i = 0; i < fs_count; i++) {
+        if (fs_table[i] == ops || name_equal(fs_table[i]->name, ops->name))
+            return 0;
+    }
+    if (fs_count >= VFS_MAX_FS) return 0;
+    fs_table[fs_count++] = ops;
+    return 1;
+}
+
+int32_t vfs_mount_root(const char *name) {
+    const vfs_fs_ops_t *ops = 0;
+    int32_t mounted;
+    if (!name) return -VFS_EINVAL;
+    for (uint32_t i = 0; i < fs_count; i++) {
+        if (name_equal(fs_table[i]->name, name)) {
+            ops = fs_table[i];
+            break;
+        }
+    }
+    if (!ops) return -VFS_EINVAL;
+    mounted = ops->mount();
+    if (mounted != 1) return mounted;
+    root_fs = ops;
+    return 1;
+}
+
+void vfs_init(void) {
+    memset(descriptors, 0, sizeof(descriptors));
+    fs_count = 0;
+    root_fs = 0;
 }
 
 int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
-    uint8_t fat_flags = 0;
+    vfs_fd_t *slot;
     uint32_t fd;
-    int open_result;
+    void *handle = 0;
+    int32_t opened;
     uint32_t irq_flags;
     if (!pid_valid(pid) || !path || (flags & ~VFS_SUPPORTED_FLAGS) ||
         (flags & VFS_O_ACCMODE) == VFS_O_ACCMODE ||
@@ -44,62 +82,58 @@ int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
         ((flags & VFS_O_TRUNC) &&
          (flags & VFS_O_ACCMODE) == VFS_O_RDONLY))
         return -VFS_EINVAL;
-    if ((flags & VFS_O_ACCMODE) != VFS_O_WRONLY)
-        fat_flags |= FAT12_OPEN_READ;
-    if ((flags & VFS_O_ACCMODE) != VFS_O_RDONLY)
-        fat_flags |= FAT12_OPEN_WRITE;
-    if (flags & VFS_O_CREAT) fat_flags |= FAT12_OPEN_CREATE;
-    if (flags & VFS_O_EXCL) fat_flags |= FAT12_OPEN_EXCL;
-    if (flags & VFS_O_TRUNC) fat_flags |= FAT12_OPEN_TRUNC;
-    if (flags & VFS_O_APPEND) fat_flags |= FAT12_OPEN_APPEND;
-
+    if (!root_fs) return -VFS_EIO;
     for (fd = VFS_FIRST_FILE_FD; fd < VFS_FD_COUNT; fd++)
         if (!descriptors[pid - 1u][fd].used) break;
     if (fd == VFS_FD_COUNT) return -VFS_EMFILE;
 
     irq_flags = cpu_irq_save();
-    open_result = fat12_file_open(path, fat_flags,
-                                  &descriptors[pid - 1u][fd].file);
+    opened = root_fs->open(path, flags, &handle);
     cpu_irq_restore(irq_flags);
-    if (open_result != 1) return vfs_map_fat_error(open_result);
-    descriptors[pid - 1u][fd].used = 1;
+    if (opened != 1) return opened;
+    slot = &descriptors[pid - 1u][fd];
+    slot->ops = root_fs;
+    slot->accmode = flags & VFS_O_ACCMODE;
+    slot->backend = handle;
+    slot->used = 1;
     return (int32_t)fd;
 }
 
 int32_t vfs_close(uint32_t pid, uint32_t fd) {
     vfs_fd_t *descriptor;
     uint32_t irq_flags;
+    int32_t closed;
     if (!pid_valid(pid) || fd < VFS_FIRST_FILE_FD || fd >= VFS_FD_COUNT)
         return -VFS_EBADF;
     descriptor = &descriptors[pid - 1u][fd];
     if (!descriptor->used) return -VFS_EBADF;
     irq_flags = cpu_irq_save();
-    if (fat12_file_close(&descriptor->file) != 1) {
-        cpu_irq_restore(irq_flags);
-        return -VFS_EIO;
-    }
+    closed = descriptor->ops->close(descriptor->backend);
     cpu_irq_restore(irq_flags);
+    /* Linux detach-on-close: the descriptor is gone even when the
+     * backend reports an error; the errno still reaches the caller. */
     memset(descriptor, 0, sizeof(*descriptor));
-    return 0;
+    return closed == 1 ? 0 : closed;
 }
 
 int32_t vfs_read(uint32_t pid, uint32_t fd, void *buffer, uint32_t count) {
     vfs_fd_t *descriptor;
     uint32_t copied = 0;
     uint32_t irq_flags;
-    int read_result;
+    int32_t read_result;
     if (!pid_valid(pid) || fd < VFS_FIRST_FILE_FD || fd >= VFS_FD_COUNT)
         return -VFS_EBADF;
     descriptor = &descriptors[pid - 1u][fd];
     if (!descriptor->used) return -VFS_EBADF;
-    if (!(descriptor->file.flags & FAT12_OPEN_READ)) return -VFS_EBADF;
+    if (descriptor->accmode == VFS_O_WRONLY) return -VFS_EBADF;
     if (!buffer && count) return -VFS_EINVAL;
     irq_flags = cpu_irq_save();
-    read_result = fat12_file_read(&descriptor->file, buffer, count, &copied);
+    read_result = descriptor->ops->read(descriptor->backend, buffer, count,
+                                        &copied);
     cpu_irq_restore(irq_flags);
     if (copied) return (int32_t)copied;
     if (read_result == 1) return 0;
-    return vfs_map_fat_error(read_result);
+    return read_result;
 }
 
 int32_t vfs_write(uint32_t pid, uint32_t fd, const void *buffer,
@@ -107,36 +141,37 @@ int32_t vfs_write(uint32_t pid, uint32_t fd, const void *buffer,
     vfs_fd_t *descriptor;
     uint32_t written = 0;
     uint32_t irq_flags;
-    int write_result;
+    int32_t write_result;
     if (!pid_valid(pid) || fd < VFS_FIRST_FILE_FD || fd >= VFS_FD_COUNT)
         return -VFS_EBADF;
     descriptor = &descriptors[pid - 1u][fd];
     if (!descriptor->used) return -VFS_EBADF;
-    if (!(descriptor->file.flags & FAT12_OPEN_WRITE)) return -VFS_EBADF;
+    if (descriptor->accmode == VFS_O_RDONLY) return -VFS_EBADF;
     if (!buffer && count) return -VFS_EINVAL;
     irq_flags = cpu_irq_save();
-    write_result = fat12_file_write(&descriptor->file, buffer, count,
-                                    &written);
+    write_result = descriptor->ops->write(descriptor->backend, buffer, count,
+                                          &written);
     cpu_irq_restore(irq_flags);
     if (written) return (int32_t)written;
     if (write_result == 1) return 0;
-    return vfs_map_fat_error(write_result);
+    return write_result;
 }
 
 int32_t vfs_seek(uint32_t pid, uint32_t fd, int32_t offset,
                  uint32_t whence) {
     vfs_fd_t *descriptor;
-    uint32_t position;
+    uint32_t position = 0;
     uint32_t irq_flags;
-    int ok;
+    int32_t moved;
     if (!pid_valid(pid) || fd < VFS_FIRST_FILE_FD || fd >= VFS_FD_COUNT)
         return -VFS_EBADF;
     descriptor = &descriptors[pid - 1u][fd];
     if (!descriptor->used) return -VFS_EBADF;
     irq_flags = cpu_irq_save();
-    ok = fat12_file_seek(&descriptor->file, offset, whence, &position);
+    moved = descriptor->ops->seek(descriptor->backend, offset, whence,
+                                  &position);
     cpu_irq_restore(irq_flags);
-    if (ok != 1) return vfs_map_fat_error(ok);
+    if (moved != 1) return moved;
     if (position > 0x7FFFFFFFu) return -VFS_EINVAL;
     return (int32_t)position;
 }
@@ -146,7 +181,7 @@ void vfs_close_all(uint32_t pid) {
     for (uint32_t fd = VFS_FIRST_FILE_FD; fd < VFS_FD_COUNT; fd++) {
         vfs_fd_t *descriptor = &descriptors[pid - 1u][fd];
         if (!descriptor->used) continue;
-        fat12_file_close(&descriptor->file);
+        descriptor->ops->close(descriptor->backend);
         memset(descriptor, 0, sizeof(*descriptor));
     }
 }

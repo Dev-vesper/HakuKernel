@@ -39,6 +39,11 @@ int fat12_test_sector_info(uint32_t *fat_start, uint32_t *fat_sectors,
                            uint32_t *sectors_per_cluster);
 int fat12_test_read_sector(uint32_t lba, void *buffer);
 int fat12_test_write_sector(uint32_t lba, const void *buffer);
+/* Read-only introspection for the fault-injection self-test: report the
+ * first data cluster of a root-directory file without opening it, so the
+ * test can build file content through the public VFS interface and still
+ * locate the chain to corrupt. Same 1 / -FAT12_ERR_* convention. */
+int fat12_debug_first_cluster(const char *name, uint16_t *first_out);
 
 int fat12_mount(void);
 int fat12_read_file(const char *name, void *buffer, uint32_t capacity,

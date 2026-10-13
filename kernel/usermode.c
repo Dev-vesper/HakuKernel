@@ -1,5 +1,6 @@
 #include "usermode.h"
 #include "console.h"
+#include "fat12_vfs.h"
 #include "kbd.h"
 #include "klog.h"
 #include "paging.h"
@@ -44,8 +45,12 @@ int usermode_init(void) {
     uint32_t image_size = 0;
     uint8_t *image;
 
-    if (fat12_mount() != 1) return 0;
+    /* Assemble the storage stack: VFS tables, then the FAT12 backend as
+     * the root filesystem. Everything below (syscalls, self-tests) only
+     * speaks the vfs_* interface from here on. */
     vfs_init();
+    if (!vfs_register_fs(&fat12_fs_ops)) return 0;
+    if (vfs_mount_root("fat12") != 1) return 0;
     image = (uint8_t *)kmalloc(USER_ELF_MAX_SIZE);
     if (!image) {
         klog_prefix();

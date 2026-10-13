@@ -55,8 +55,11 @@ unexpectedly lost image data across restarts.
 
 ### 2. VFS and Filesystem Completion
 
-- [ ] Define a filesystem-independent VFS interface and route descriptor
-  operations through it.
+- [x] Define a filesystem-independent VFS interface and route descriptor
+  operations through it (`vfs_fs_ops` mount/open/close/read/write/seek;
+  FAT12 lives behind `fat12_vfs.c`, VFS holds no FAT12 references; boot
+  registers the backend and mounts it as root; self-test guards the
+  registry and proves the root survives bad mounts).
 - [ ] Add `unlink`, `rename`, `stat`, and `fstat`, including defined behavior
   for open files that are removed or renamed.
 - [ ] Add subdirectories and basic paths, including rules for `.` and `..`.

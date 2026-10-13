@@ -176,11 +176,16 @@ FAT12 superfloppy and supports creating, reading, writing, truncating and
 seeking 8.3-named files in its root directory, with cluster allocation,
 release, mirrored FAT updates and volume/chain bounds checks.
 `kernel/vfs.c` supplies per-process descriptors and the user `open`, `close`,
-`read`, `write`, and `lseek` interface. Disk I/O is serialized against the
-preemptive scheduler; file contents and directory/FAT metadata are written
-through to the ATA disk. The current VFS supports up to five simultaneously
-open regular files per process and the `O_RDONLY`, `O_WRONLY`, `O_RDWR`,
-`O_CREAT`, `O_EXCL`, `O_TRUNC`, and `O_APPEND` flags.
+`read`, `write`, and `lseek` interface through a filesystem-independent
+operations vector (`vfs_fs_ops`: mount/open/close/read/write/seek, each
+returning 1 or a `-VFS_E*` errno). VFS never names a concrete filesystem;
+`kernel/fat12_vfs.c` implements the vector for FAT12 (flag translation,
+per-open handle allocation, errno mapping) and registers it at boot, after
+which one backend is mounted as the root filesystem. Disk I/O is serialized
+against the preemptive scheduler; file contents and directory/FAT metadata
+are written through to the ATA disk. The current VFS supports up to five
+simultaneously open regular files per process and the `O_RDONLY`,
+`O_WRONLY`, `O_RDWR`, `O_CREAT`, `O_EXCL`, `O_TRUNC`, and `O_APPEND` flags.
 
 The filesystem remains intentionally small: no partition tables, subfolders,
 long filenames, unlink/rename, permissions, mount points, journaling, FAT16,
@@ -240,7 +245,8 @@ Haku/
   kernel/user.asm      minimal ELF32 ring-3 test program
   kernel/ata.h/.c      primary-master ATA LBA28 polling PIO driver
   kernel/fat12.h/.c    writable FAT12 root-directory file operations
-  kernel/vfs.h/.c      per-process descriptors and file syscalls
+  kernel/fat12_vfs.h/.c FAT12 backend: vfs_fs_ops vector + errno translation
+  kernel/vfs.h/.c      fs-independent descriptors, registry, root mount
   kernel/elf.h/.c      validated ELF32 PT_LOAD loader and fresh user address spaces
   kernel/cpu.h/cpu.c   types, port I/O, tiny libc (memset & friends, no CRT)
   kernel/console.h/.c  VGA text + COM1 serial drivers
