@@ -15,6 +15,8 @@
 %define SYS_LSEEK 19
 %define SYS_GETPID 20
 %define SYS_RENAME 38
+%define SYS_DUP    41
+%define SYS_DUP2   63
 %define SYS_STAT   106
 %define SYS_FSTAT  108
 
@@ -829,6 +831,138 @@ _user_program_start:
     cmp eax, edx
     jne .fail
 
+    ; dup/dup2: descriptors may share one open file description (offset,
+    ; access mode, and a refcount that keeps the file alive until the last
+    ; of them closes). Per-process D-names avoid collisions between the two
+    ; instances.
+    mov esi, 50
+    mov eax, SYS_GETPID
+    int 0x80
+    add eax, '0'
+    mov [USER_DATA_BASE + (dup_path - data_start) + 1], al
+    mov eax, SYS_OPEN
+    mov ebx, USER_DATA_BASE + (dup_path - data_start)
+    mov ecx, 0x242             ; O_CREAT | O_RDWR | O_TRUNC
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jb .fail
+    mov edi, eax               ; fd_a
+    mov eax, SYS_WRITE
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (file_payload - data_start)
+    mov edx, 4
+    int 0x80
+    cmp eax, 4
+    jne .fail
+
+    ; dup -> lowest free fd, distinct from the original
+    mov esi, 51
+    mov eax, SYS_DUP
+    mov ebx, edi
+    int 0x80
+    cmp eax, 3
+    jb .fail
+    cmp eax, edi
+    je .fail
+    mov [USER_DATA_BASE + (dup_fd_b - data_start)], eax
+
+    ; shared offset: rewind through fd_a, fd_b reads from the same position
+    mov esi, 52
+    mov eax, SYS_LSEEK
+    mov ebx, edi
+    xor ecx, ecx
+    xor edx, edx               ; SEEK_SET
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_READ
+    mov ebx, [USER_DATA_BASE + (dup_fd_b - data_start)]
+    mov ecx, USER_DATA_BASE + (dup_buf - data_start)
+    mov edx, 4
+    int 0x80
+    cmp eax, 4
+    jne .fail
+    cmp byte [USER_DATA_BASE + (dup_buf - data_start)], 'A'
+    jne .fail
+
+    ; dup2 onto a chosen free fd returns that fd
+    mov esi, 53
+    mov eax, SYS_DUP2
+    mov ebx, edi
+    mov ecx, 5
+    int 0x80
+    cmp eax, 5
+    jne .fail
+
+    ; dup2(fd, fd) is a no-op that returns fd
+    mov esi, 54
+    mov eax, SYS_DUP2
+    mov ebx, edi
+    mov ecx, edi
+    int 0x80
+    cmp eax, edi
+    jne .fail
+
+    ; dup and dup2 with an invalid source -> EBADF (target left intact)
+    mov esi, 55
+    mov eax, SYS_DUP
+    mov ebx, 99
+    int 0x80
+    cmp eax, -9
+    jne .fail
+    mov esi, 56
+    mov eax, SYS_DUP2
+    mov ebx, 99
+    mov ecx, 5
+    int 0x80
+    cmp eax, -9
+    jne .fail
+
+    ; closing the original keeps the duplicates usable (refcount)
+    mov esi, 57
+    mov eax, SYS_CLOSE
+    mov ebx, edi
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_LSEEK
+    mov ebx, 5
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 58
+    mov eax, SYS_READ
+    mov ebx, [USER_DATA_BASE + (dup_fd_b - data_start)]
+    mov ecx, USER_DATA_BASE + (dup_buf - data_start)
+    mov edx, 4
+    int 0x80
+    cmp eax, 4
+    jne .fail
+    cmp byte [USER_DATA_BASE + (dup_buf - data_start)], 'A'
+    jne .fail
+    mov eax, SYS_CLOSE
+    mov ebx, 5
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_CLOSE
+    mov ebx, [USER_DATA_BASE + (dup_fd_b - data_start)]
+    int 0x80
+    test eax, eax
+    jne .fail
+
+    mov esi, 59
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (dup_message - data_start)
+    mov edx, dup_message_end - dup_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
     mov eax, SYS_EXIT
     xor ebx, ebx
     int 0x80
@@ -901,6 +1035,15 @@ ops_extra:
     dd 0
 ops_fd:
     dd 0
+dup_message:
+    db "USER-DUP-OK dup/dup2 shared file offset", 10
+dup_message_end:
+dup_path:
+    db "D0.TXT", 0
+dup_fd_b:
+    dd 0
+dup_buf:
+    times 4 db 0
 stat_buf:
     times 8 db 0
 append_payload:

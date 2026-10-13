@@ -121,8 +121,9 @@ user permissions.
 process and entered via `iret` at CPL 3. The initial syscall ABI follows the
 i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `read` (3), `write` (4), `open` (5), `close` (6), `unlink` (10), `lseek`
-(19), `getpid` (20), `rename` (38), `stat` (106), and `fstat` (108), with
-arguments in `ebx`, `ecx`, and `edx` and syscall number/result in `eax`.
+(19), `getpid` (20), `rename` (38), `dup` (41), `dup2` (63), `stat` (106),
+and `fstat` (108), with arguments in `ebx`, `ecx`, and `edx` and syscall
+number/result in `eax`.
 
 ### User-mode system calls
 
@@ -166,6 +167,16 @@ name. Renaming onto an existing name fails with `EEXIST`, renaming a name
 onto itself succeeds as a no-op, and every other missing name gives
 `ENOENT`. The user test program proves all of this from ring 3 in both
 processes (`USER-FILE-OPS-OK`).
+
+`dup` and `dup2` point a second descriptor at the same open file
+description: the copy shares the byte offset and access mode, and the file
+stays open until the last descriptor closes, so closing the original leaves
+the duplicate usable (and an open-on-a-removed-file survives to its final
+close). `dup` returns the lowest free descriptor, `dup2` closes and reuses a
+free or already-open target and is a no-op when both descriptors match, and
+both report `EBADF` for an invalid source without disturbing the target. The
+user program proves the shared offset, the surviving duplicate, and the
+error cases in both processes (`USER-DUP-OK`).
 
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It

@@ -20,6 +20,8 @@
 #define SYS_LSEEK 19u
 #define SYS_GETPID 20u
 #define SYS_RENAME 38u
+#define SYS_DUP   41u
+#define SYS_DUP2  63u
 #define SYS_STAT  106u
 #define SYS_FSTAT 108u
 

@@ -324,6 +324,12 @@ regs_t *user_syscall(regs_t *r) {
     case SYS_RENAME:
         r->eax = sys_rename(r->ebx, r->ecx);
         return r;
+    case SYS_DUP:
+        r->eax = (uint32_t)vfs_dup(scheduler_current_pid(), r->ebx);
+        return r;
+    case SYS_DUP2:
+        r->eax = (uint32_t)vfs_dup2(scheduler_current_pid(), r->ebx, r->ecx);
+        return r;
     case SYS_STAT:
         r->eax = sys_stat(r->ebx, r->ecx);
         return r;

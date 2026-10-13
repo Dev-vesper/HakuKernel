@@ -375,6 +375,7 @@ def main():
             "USER-READ-OK",  # blocking read copied keyboard input to user memory
             "USER-FILE-IO-OK", # FAT12 create/write/read/seek/close passed
             "USER-FILE-OPS-OK", # unlink/rename/stat/fstat, open-file removed/renamed
+            "USER-DUP-OK",   # dup/dup2 share one open file description
             "USER-EXIT-OK status=0 pid=1",
             "USER-EXIT-OK status=0 pid=2",
             "SCHED-REAP-OK",
@@ -398,6 +399,8 @@ def main():
             missing.append("file I/O passed in both user processes")
         if content.count("USER-FILE-OPS-OK") < 2:
             missing.append("file ops passed in both user processes")
+        if content.count("USER-DUP-OK") < 2:
+            missing.append("dup/dup2 passed in both user processes")
         unexpected = [m for m in ("USER-SYSCALL-FAIL",
                                      "FS-ERROR-FAIL",
                                      "FS-EDGE-FAIL",

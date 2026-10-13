@@ -68,6 +68,13 @@ int32_t vfs_read(uint32_t pid, uint32_t fd, void *buffer, uint32_t count);
 int32_t vfs_write(uint32_t pid, uint32_t fd, const void *buffer,
                   uint32_t count);
 int32_t vfs_seek(uint32_t pid, uint32_t fd, int32_t offset, uint32_t whence);
+/* dup/dup2 share the open file description behind a descriptor: the copy
+ * sees the same offset/access mode and keeps the file alive until the last
+ * of them closes. dup returns the lowest free fd, dup2 returns newfd (or
+ * closes and reuses it if already open); both return 1 or -VFS_E*. fd
+ * numbers stay within the file range VFS_FIRST_FILE_FD..VFS_FD_COUNT-1. */
+int32_t vfs_dup(uint32_t pid, uint32_t fd);
+int32_t vfs_dup2(uint32_t pid, uint32_t oldfd, uint32_t newfd);
 /* Namespace and metadata operations. Unlink removes the name at once;
  * descriptors open on the file keep working until closed (clusters are
  * released at the last such close). Rename repoints open descriptors to

@@ -87,8 +87,10 @@ tested, and common FAT tools can still read the disk image.
 - [ ] Define a user-stack convention for arguments and environment variables.
 - [ ] Add standard descriptors 0/1/2, descriptor inheritance or transfer, and
   automatic close-on-exit behavior.
-- [ ] Add `dup`/`dup2`, limited `brk`/`mmap`, and time syscalls such as
-  `gettimeofday`/`nanosleep`.
+- [x] Add `dup`/`dup2` with a shared, refcounted open-file-description
+  (`USER-DUP-OK`: shared offset, surviving duplicate, EBADF cases).
+- [ ] Add limited `brk`/`mmap`.
+- [ ] Add time syscalls such as `gettimeofday`/`nanosleep`.
 - [ ] Define a shared user/kernel ABI and headers; test invalid arguments,
   permissions, and device errors for every syscall.
 
