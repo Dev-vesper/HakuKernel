@@ -1,3 +1,6 @@
+<p align="center">
+<img width="242" height="97" alt="preview" src="https://github.com/user-attachments/assets/a44592e3-bda2-4017-a5d2-82b3f5bcbd9b" />
+</p>
 # Haku v0.1 — a tiny x86 operating system in C
 
 Bootloader (NASM) loads a C kernel and switches the CPU to 32-bit protected
