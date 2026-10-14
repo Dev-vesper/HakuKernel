@@ -27,17 +27,17 @@ python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 
 `python build.py headless` verifies ATA detection, FAT12 mounting and
 multi-cluster file reads, ring-3 process entry, per-process kernel stacks,
-syscall handling, `execve` image replacement, process exit/reaping, and timer
-IRQs through the serial log.
+syscall handling, `spawn`/`waitpid` and exit-status reporting, `execve` image
+replacement, process exit/reaping, and timer IRQs through the serial log.
 
 ### Data image lifecycle
 
 `build/haku_fs.img` is the ATA data disk and is treated as user data: an
 existing image is reused untouched, so files created in a previous QEMU
-session survive the next build. It is (re)created from `kernel/user.asm` and
-`kernel/exec_target.asm` only when missing or with `--fresh`. If either
-assembly source is newer than a reused image, the build warns that its test
-ELFs on disk may be stale. `headless` always
+session survive the next build. It is (re)created from `kernel/user.asm`,
+`kernel/exec_target.asm`, and `kernel/child.asm` only when missing or with
+`--fresh`. If any test-program assembly source is newer than a reused image,
+the build warns that its test ELFs on disk may be stale. `headless` always
 starts from a fresh image (its fault-injection tests mutate the disk) and,
 after the serial-log check passes, re-verifies the post-run image on the
 host side.
@@ -70,7 +70,7 @@ Memory map:
 | `0x7C00` | boot sector (512 B) |
 | `0x10000–0x80000` | kernel load window (up to 448 KiB, linked `/BASE:0x10000 /ALIGN:16`) |
 | `0x7000–0x7240` | E820 map from stage2 (INT 15h, count at `0x6FFC`) |
-| `0x20000–0x23000` | page directory + initial tables (8 MiB supervisor identity map) |
+| `0x9000–0xC000` | page directory + initial tables (8 MiB supervisor identity map) |
 | `0x100000–0x400000` | kernel heap (kmalloc/kfree, 16 B aligned) |
 | `0x90000` | bootstrap kernel stack top (grows down) |
 | below `0x800000` | allocated per-process 8 KiB kernel stacks |
@@ -104,8 +104,15 @@ allocation state so reserved pages cannot accidentally be released.
 ### Processes and preemptive scheduling
 
 `kernel/scheduler.c` starts the initial process from `HAKU.ELF`; a successful
-`execve` replaces that process image with another ELF loaded from the root
-filesystem. Each process has its own address space and an 8 KiB ring-0 stack;
+`spawn` creates a child process from a root-filesystem ELF and `waitpid`
+suspends the parent until the requested child exits. Exit status is returned
+in the traditional high-byte wait status format; a successful wait reaps the
+child record. The current spawn interface accepts a pathname only and starts
+the child with empty argument and environment vectors; child file descriptors
+are not inherited. `waitpid` accepts a specific child PID or `-1` (any child)
+and currently supports only options `0`. `execve` replaces a process image
+from the root filesystem.
+Each process has its own address space and an 8 KiB ring-0 stack;
 `gdt_set_kernel_stack` updates `TSS.esp0` at every task switch so the next
 ring-3 interrupt or syscall enters on the correct stack. The 100 Hz PIT
 scheduler saves and restores complete interrupt frames through `iret`.
@@ -120,7 +127,8 @@ identity mappings and maps its user program and two-page user stack with
 user permissions.
 
 `kernel/user.asm` is built as an ELF32 image and entered via `iret` at CPL 3.
-It tests `execve` (11), which loads another ELF32 image, builds an aligned
+It tests `spawn` (`0x1000`, Haku-specific) and `waitpid` (7), as well as
+`execve` (11), which loads another ELF32 image, builds an aligned
 initial user stack containing `argc`, `argv`, `envp`, and a terminating
 `AT_NULL` auxiliary-vector entry, and replaces the calling process without
 changing its PID or open file descriptors. Each vector is limited to 64
@@ -128,10 +136,11 @@ strings; their strings are limited to 4096 combined bytes including NUL
 terminators and must fit the two-page initial stack. Larger inputs return
 `E2BIG`, and invalid user pointers return `EFAULT`. The syscall ABI follows
 the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
-`read` (3), `write` (4), `open` (5), `close` (6), `unlink` (10), `execve`
-(11), `lseek` (19), `getpid` (20), `rename` (38), `dup` (41), `dup2` (63),
-`stat` (106), and `fstat` (108), with arguments in `ebx`, `ecx`, and `edx`
-and syscall number/result in `eax`.
+`read` (3), `write` (4), `open` (5), `close` (6), `waitpid` (7),
+`unlink` (10), `execve` (11), `lseek` (19), `getpid` (20), `rename` (38),
+`dup` (41), `dup2` (63), `stat` (106), and `fstat` (108), with arguments in
+`ebx`, `ecx`, and `edx` and syscall number/result in `eax`.
+The custom `spawn` syscall uses `0x1000`.
 
 ### User-mode system calls
 
@@ -223,9 +232,10 @@ or FAT32. This is a minimal single-volume VFS, not full POSIX filesystem
 conformance. The QEMU headless test creates `P1.TXT` and verifies
 multi-sector writes, reads, seeks, close, and reopen.
 
-`tools/mkfat12.py` puts `HAKU.ELF` and the exec target `NEXT.ELF` on a
-generated 1.44 MB FAT12 image. QEMU attaches this image as the primary-master
-IDE disk while the existing boot floppy still starts the kernel. The kernel
+`tools/mkfat12.py` puts `HAKU.ELF`, the exec target `NEXT.ELF`, and the
+spawn/wait child `CHILD.ELF` on a generated 1.44 MB FAT12 image. QEMU
+attaches this image as the primary-master IDE disk while the existing boot
+floppy still starts the kernel. The kernel
 loads the initial ELF at startup; `execve` uses VFS to load subsequent ELF
 files from the disk into a fresh address space before replacing the current
 image.
@@ -274,6 +284,7 @@ Haku/
   kernel/isr.asm       interrupt stubs, GDT/TSS load, ring-3 transition + syscalls
   kernel/user.asm      ELF32 initial process and syscall integration test
   kernel/exec_target.asm second ELF32 image for execve tests
+  kernel/child.asm     ELF32 child for spawn/waitpid tests
   kernel/ata.h/.c      primary-master ATA LBA28 polling PIO driver
   kernel/fat12.h/.c    writable FAT12 root-directory file operations
   kernel/fat12_vfs.h/.c FAT12 backend: vfs_fs_ops vector + errno translation

@@ -11,7 +11,9 @@
 %define SYS_CLOSE  6
 %define SYS_READ   3
 %define SYS_WRITE  4
+%define SYS_WAITPID 7
 %define SYS_EXECVE 11
+%define SYS_SPAWN 0x1000
 %define SYS_UNLINK 10
 %define SYS_LSEEK 19
 %define SYS_GETPID 20
@@ -964,8 +966,63 @@ _user_program_start:
     cmp eax, edx
     jne .fail
 
-    ; Failed exec attempts must leave this process image intact.
+    ; waitpid validates options and user status pointers before blocking.
+    mov esi, 59
+    mov eax, SYS_WAITPID
+    mov ebx, -1
+    mov ecx, USER_DATA_BASE + (child_status - data_start)
+    xor edx, edx
+    int 0x80
+    cmp eax, -10              ; ECHILD
+    jne .fail
+    mov eax, SYS_WAITPID
+    mov ebx, -1
+    mov ecx, 0x1000
+    xor edx, edx
+    int 0x80
+    cmp eax, -14              ; EFAULT
+    jne .fail
+    mov eax, SYS_WAITPID
+    mov ebx, -1
+    mov ecx, USER_DATA_BASE + (child_status - data_start)
+    mov edx, 1
+    int 0x80
+    cmp eax, -22              ; EINVAL
+    jne .fail
+
+    mov eax, SYS_SPAWN
+    mov ebx, USER_DATA_BASE + (child_path - data_start)
+    int 0x80
+    cmp eax, 2
+    jne .fail
+    mov [USER_DATA_BASE + (child_pid - data_start)], eax
     mov esi, 60
+    mov eax, SYS_WAITPID
+    mov ebx, [USER_DATA_BASE + (child_pid - data_start)]
+    mov ecx, USER_DATA_BASE + (child_status - data_start)
+    xor edx, edx
+    int 0x80
+    cmp eax, [USER_DATA_BASE + (child_pid - data_start)]
+    jne .fail
+    cmp dword [USER_DATA_BASE + (child_status - data_start)], 0x2A00
+    jne .fail
+    mov eax, SYS_WAITPID
+    mov ebx, [USER_DATA_BASE + (child_pid - data_start)]
+    mov ecx, USER_DATA_BASE + (child_status - data_start)
+    xor edx, edx
+    int 0x80
+    cmp eax, -10              ; a successful wait reaps the child
+    jne .fail
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (waitpid_message - data_start)
+    mov edx, waitpid_message_end - waitpid_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
+    ; Failed exec attempts must leave this process image intact.
+    mov esi, 61
     mov eax, SYS_EXECVE
     mov ebx, 0x1000             ; unmapped pathname
     xor ecx, ecx
@@ -1030,7 +1087,7 @@ _user_program_start:
     mov edx, USER_DATA_BASE + (exec_envp - data_start)
     int 0x80
     ; A successful execve never resumes this instruction.
-    mov esi, 61
+    mov esi, 62
     jmp .fail
 .hang:
     jmp .hang
@@ -1104,6 +1161,15 @@ ops_fd:
 dup_message:
     db "USER-DUP-OK dup/dup2 shared file offset", 10
 dup_message_end:
+waitpid_message:
+    db "USER-WAITPID-OK child status=42 reaped", 10
+waitpid_message_end:
+child_path:
+    db "CHILD.ELF", 0
+child_pid:
+    dd 0
+child_status:
+    dd 0
 dup_path:
     db "D0.TXT", 0
 dup_fd_b:

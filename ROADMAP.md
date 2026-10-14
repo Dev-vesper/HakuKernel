@@ -19,8 +19,8 @@ compatibility is not a short-term goal.
 - [x] Writable FAT12 for 8.3 files in the root directory: create, read, write,
   truncate, and append, with a VFS and per-process file descriptors.
 - [x] QEMU headless integration tests covering multi-sector I/O, seeking,
-  append, descriptor access checks, exec argument/environment stacks, and
-  persisted disk data.
+  append, descriptor access checks, spawn/waitpid exit status, exec
+  argument/environment stacks, and persisted disk data.
 
 ## Proposed Milestones
 
@@ -85,8 +85,9 @@ tested, and common FAT tools can still read the disk image.
   the current process image from an ELF file on disk (`NEXT.ELF` headless
   test; PID and open descriptors survive replacement; argc/argv/envp are
   built and validated on the new user stack).
-- [ ] Add `wait`/`waitpid`, `fork` or a simpler process-creation model, and
-  process exit status management.
+- [x] Add `waitpid`, a simpler ELF-based `spawn` process-creation model, and
+  process exit status management (blocking parent wait, reaped child records,
+  and encoded status validated in QEMU).
 - [x] Define the initial user-stack convention for `argc`, `argv`, `envp`,
   and the terminating `AT_NULL` auxiliary-vector entry.
 - [ ] Add standard descriptors 0/1/2, descriptor inheritance or transfer, and

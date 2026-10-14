@@ -360,17 +360,63 @@ static int copy_user_path(uint32_t user_path, char out[13]) {
     return -(int32_t)HAKU_ENAMETOOLONG;
 }
 
+static int32_t load_elf_file(uint32_t pid, const char *path,
+                             loaded_elf_t *program) {
+    vfs_stat_t stat;
+    uint8_t *image;
+    uint32_t offset = 0;
+    int32_t result;
+    int32_t fd;
+
+    fd = vfs_open(pid, path, VFS_O_RDONLY);
+    if (fd < 0) return fd;
+    result = vfs_fstat(pid, (uint32_t)fd, &stat);
+    if (result != 1) {
+        vfs_close(pid, (uint32_t)fd);
+        return result;
+    }
+    if (stat.size == 0 || stat.size > USER_ELF_MAX_SIZE) {
+        vfs_close(pid, (uint32_t)fd);
+        return -(int32_t)(stat.size ? HAKU_E2BIG : HAKU_ENOEXEC);
+    }
+
+    image = (uint8_t *)kmalloc(stat.size);
+    if (!image) {
+        vfs_close(pid, (uint32_t)fd);
+        return -(int32_t)HAKU_ENOMEM;
+    }
+    while (offset < stat.size) {
+        uint32_t amount = stat.size - offset;
+        if (amount > USER_IO_MAX) amount = USER_IO_MAX;
+        result = vfs_read(pid, (uint32_t)fd, image + offset, amount);
+        if (result <= 0 || (uint32_t)result > amount) {
+            vfs_close(pid, (uint32_t)fd);
+            kfree(image);
+            return result < 0 ? result : -(int32_t)HAKU_EIO;
+        }
+        offset += (uint32_t)result;
+    }
+    result = vfs_close(pid, (uint32_t)fd);
+    if (result < 0) {
+        kfree(image);
+        return result;
+    }
+
+    memset(program, 0, sizeof(*program));
+    if (!elf_load_executable(image, stat.size, program)) {
+        kfree(image);
+        return -(int32_t)HAKU_ENOEXEC;
+    }
+    kfree(image);
+    return 0;
+}
+
 static uint32_t sys_execve(uint32_t user_path, uint32_t user_argv,
                            uint32_t user_envp, regs_t *frame) {
     char path[13];
     loaded_elf_t replacement;
     exec_arguments_t arguments;
-    vfs_stat_t stat;
-    uint8_t *image;
-    uint32_t offset = 0;
-    uint32_t pid = scheduler_current_pid();
     int32_t result;
-    int32_t fd;
 
     result = copy_user_path(user_path, path);
     if (result != 1) return (uint32_t)result;
@@ -388,57 +434,11 @@ static uint32_t sys_execve(uint32_t user_path, uint32_t user_argv,
         return (uint32_t)result;
     }
 
-    fd = vfs_open(pid, path, VFS_O_RDONLY);
-    if (fd < 0) {
-        kfree(arguments.strings);
-        return (uint32_t)fd;
-    }
-    result = vfs_fstat(pid, (uint32_t)fd, &stat);
-    if (result != 1) {
-        vfs_close(pid, (uint32_t)fd);
+    result = load_elf_file(scheduler_current_pid(), path, &replacement);
+    if (result) {
         kfree(arguments.strings);
         return (uint32_t)result;
     }
-    if (stat.size == 0 || stat.size > USER_ELF_MAX_SIZE) {
-        vfs_close(pid, (uint32_t)fd);
-        kfree(arguments.strings);
-        return copy_from_user_error(stat.size ? HAKU_E2BIG :
-                                               HAKU_ENOEXEC);
-    }
-
-    image = (uint8_t *)kmalloc(stat.size);
-    if (!image) {
-        vfs_close(pid, (uint32_t)fd);
-        kfree(arguments.strings);
-        return copy_from_user_error(HAKU_ENOMEM);
-    }
-    while (offset < stat.size) {
-        uint32_t amount = stat.size - offset;
-        if (amount > USER_IO_MAX) amount = USER_IO_MAX;
-        result = vfs_read(pid, (uint32_t)fd, image + offset, amount);
-        if (result <= 0 || (uint32_t)result > amount) {
-            vfs_close(pid, (uint32_t)fd);
-            kfree(image);
-            kfree(arguments.strings);
-            return copy_from_user_error(result < 0 ? (uint32_t)-result :
-                                                    HAKU_EIO);
-        }
-        offset += (uint32_t)result;
-    }
-    result = vfs_close(pid, (uint32_t)fd);
-    if (result < 0) {
-        kfree(image);
-        kfree(arguments.strings);
-        return (uint32_t)result;
-    }
-
-    memset(&replacement, 0, sizeof(replacement));
-    if (!elf_load_executable(image, stat.size, &replacement)) {
-        kfree(image);
-        kfree(arguments.strings);
-        return copy_from_user_error(HAKU_ENOEXEC);
-    }
-    kfree(image);
     result = (int32_t)build_exec_stack(&replacement, &arguments);
     if (result != 0) {
         paging_destroy_user_space(&replacement.address_space);
@@ -451,6 +451,44 @@ static uint32_t sys_execve(uint32_t user_path, uint32_t user_argv,
         return copy_from_user_error(HAKU_EIO);
     }
     return 0;
+}
+
+static uint32_t sys_spawn(uint32_t user_path) {
+    char path[13];
+    loaded_elf_t program;
+    exec_arguments_t arguments;
+    int32_t result;
+    int copied = copy_user_path(user_path, path);
+    if (copied != 1) return (uint32_t)copied;
+
+    memset(&arguments, 0, sizeof(arguments));
+    result = load_elf_file(scheduler_current_pid(), path, &program);
+    if (result) return (uint32_t)result;
+    result = (int32_t)build_exec_stack(&program, &arguments);
+    if (result) {
+        paging_destroy_user_space(&program.address_space);
+        return (uint32_t)(0u - (uint32_t)result);
+    }
+    result = scheduler_spawn(&program);
+    if (result < 0) {
+        paging_destroy_user_space(&program.address_space);
+        return (uint32_t)result;
+    }
+    return (uint32_t)result;
+}
+
+static regs_t *sys_waitpid(regs_t *frame, uint32_t pid, uint32_t user_status,
+                           uint32_t options) {
+    if (options != 0) {
+        frame->eax = copy_from_user_error(HAKU_EINVAL);
+        return frame;
+    }
+    if (user_status &&
+        !paging_user_range_valid(user_status, sizeof(uint32_t), 1)) {
+        frame->eax = copy_from_user_error(HAKU_EFAULT);
+        return frame;
+    }
+    return scheduler_waitpid(pid, user_status, options, frame);
 }
 
 /* POSIX returns 0 on success here: translate the VFS-internal 1. */
@@ -522,6 +560,11 @@ regs_t *user_syscall(regs_t *r) {
     case SYS_EXECVE:
         r->eax = sys_execve(r->ebx, r->ecx, r->edx, r);
         return r;
+    case SYS_SPAWN:
+        r->eax = sys_spawn(r->ebx);
+        return r;
+    case SYS_WAITPID:
+        return sys_waitpid(r, r->ebx, r->ecx, r->edx);
     case SYS_OPEN:
         r->eax = sys_open(r->ebx, r->ecx);
         return r;

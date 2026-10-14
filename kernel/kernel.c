@@ -64,7 +64,9 @@ void kernel_main(void) {
         }
     }
     klog_prefix();
-    klog_write("PAGING-OK: 8MB identity map, cr3=0x20000, CR0.PG on\n");
+    klog_write("PAGING-OK: 8MB identity map, cr3=");
+    klog_hex(paging_get_cr3());
+    klog_write(", CR0.PG on\n");
 
     /* Heap: free-list allocator over the identity-mapped 1–4 MiB range. */
     heap_init();
@@ -119,7 +121,7 @@ void kernel_main(void) {
     cpu_sti();
 
     klog_prefix();
-    klog_write("input: press two keys for the read() tests...\n");
+    klog_write("input: press one key for the read() test...\n");
     usermode_run();
     klog_prefix();
     klog_write("sched: returned unexpectedly, halting\n");

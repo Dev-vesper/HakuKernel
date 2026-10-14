@@ -2,7 +2,7 @@
  *
  * Linux (arch/x86/kernel/head_32.S, __startup_32) builds swapper_pg_dir
  * with PG0 identity entries, loads CR3, then sets CR0.PG. We do the same,
- * except our tables live at fixed physical 0x20000/0x21000/0x22000
+ * except our tables live at fixed physical 0x9000/0xA000/0xB000
  * (identity mapped, so virtual == physical and plain C pointers work
  * before and after the switch).
  */

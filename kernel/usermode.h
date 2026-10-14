@@ -16,7 +16,9 @@
 #define SYS_CLOSE 6u
 #define SYS_READ  3u
 #define SYS_WRITE 4u
+#define SYS_WAITPID 7u
 #define SYS_EXECVE 11u
+#define SYS_SPAWN 0x1000u
 #define SYS_UNLINK 10u
 #define SYS_LSEEK 19u
 #define SYS_GETPID 20u
@@ -34,6 +36,8 @@
 #define HAKU_EIO    5u
 #define HAKU_ENOEXEC 8u
 #define HAKU_EBADF  9u
+#define HAKU_ECHILD 10u
+#define HAKU_EAGAIN 11u
 #define HAKU_EFAULT 14u
 #define HAKU_ENOMEM 12u
 #define HAKU_EEXIST 17u

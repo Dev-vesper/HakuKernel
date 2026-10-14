@@ -116,7 +116,7 @@ static void reserve_e820_non_ram(uint32_t count) {
 static void reserve_kernel_regions(void) {
     reserve_range(0, ISA_HOLE_END); /* low firmware, loader data and ISA hole */
     reserve_range(KERNEL_LOAD_START, KERNEL_LOAD_END);
-    reserve_range(0x00020000u, 0x00023000u); /* page directory and page tables */
+    reserve_range(PAGING_DIR_PHYS, PAGING_TABLE1_PHYS + 0x1000u);
     reserve_range(BOOT_STACK_START, BOOT_STACK_END);
     reserve_range(KERNEL_HEAP_START, KERNEL_HEAP_END);
 }

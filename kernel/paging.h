@@ -28,13 +28,11 @@
 /* CR0 / CR3 bits (Linux arch/x86/include/asm/cpufeatures + control regs). */
 #define CR0_PG_BIT 0x80000000u /* X86_CR0_PG: paging enable */
 
-/* Physical homes for the tables: free conventional RAM (above the
- * kernel at 0x10000, below the 0x90000 stack), 4 KiB-aligned by
- * construction. Two tables = first 8 MiB identity mapped, so frames
- * handed out by the frame allocator (which start at 4 MiB) are usable. */
-#define PAGING_DIR_PHYS    0x20000u
-#define PAGING_TABLE_PHYS  0x21000u
-#define PAGING_TABLE1_PHYS 0x22000u
+/* Keep the boot tables below the kernel load address: the kernel may grow
+ * across 0x20000, so placing them there would overwrite its .data section. */
+#define PAGING_DIR_PHYS    0x9000u
+#define PAGING_TABLE_PHYS  0xA000u
+#define PAGING_TABLE1_PHYS 0xB000u
 #define PAGING_IDMAP_MB    8u
 #define PAGING_ENTRIES    1024u
 #define PAGING_USER_LIMIT  0xC0000000u

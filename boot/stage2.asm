@@ -77,6 +77,21 @@ stage2:
     jae .kernel_chunk_ready
     mov bx, ax                   ; final request may be shorter than a track
 .kernel_chunk_ready:
+    ; BIOS CHS reads may not cross a 64 KiB DMA boundary. Limit the
+    ; track-sized request using the destination's low 16-bit address.
+    mov ax, [kernel_dest_segment]
+    shl ax, 4
+    neg ax
+    jnz .dma_boundary_distance
+    mov ax, 128                  ; already aligned: one full 64 KiB window
+    jmp .kernel_dma_limit_ready
+.dma_boundary_distance:
+    shr ax, 9                    ; sectors remaining before the boundary
+.kernel_dma_limit_ready:
+    cmp bx, ax
+    jbe .kernel_dma_chunk_ready
+    mov bx, ax
+.kernel_dma_chunk_ready:
     mov [kernel_chunk], bl
     mov ax, [kernel_dest_segment]
     mov es, ax
