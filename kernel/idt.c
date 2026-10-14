@@ -78,7 +78,8 @@ void idt_init(void) {
         idt_set_gate((uint8_t)(32 + i), (uint32_t)irq_addrs[i], KERNEL_CS, GATE_INT32);
     for (uint16_t i = 48; i < 256; i++)
         idt_set_gate((uint8_t)i, (uint32_t)isr_default, KERNEL_CS, GATE_INT32);
-    idt_set_gate(128, (uint32_t)syscall128, KERNEL_CS, GATE_USER_INT32);
+    idt_set_gate(HAKU_SYSCALL_VECTOR, (uint32_t)syscall128, KERNEL_CS,
+                 GATE_USER_INT32);
     /* Mask the PIC until drivers unmask what they own (pic.c remaps first). */
     pic_mask_all();
     idtr.limit = (uint16_t)(sizeof(idt) - 1);

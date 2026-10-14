@@ -30,11 +30,6 @@ typedef struct {
 } task_t;
 
 #define SCHEDULER_IDLE_INDEX ((int)SCHEDULER_MAX_PROCESSES)
-#define SCHEDULER_ECHILD 10u
-#define SCHEDULER_EAGAIN 11u
-#define SCHEDULER_ENOMEM 12u
-#define SCHEDULER_EINVAL 22u
-
 static task_t tasks[SCHEDULER_MAX_PROCESSES];
 static task_t idle_task;
 static int current_task = -1;
@@ -358,7 +353,7 @@ int32_t scheduler_spawn(loaded_elf_t *program) {
         !program->address_space.directory_phys ||
         !program->entry || !program->user_stack ||
         current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
-        return -(int32_t)SCHEDULER_ENOMEM;
+        return -(int32_t)HAKU_ENOMEM;
 
     irq_flags = cpu_irq_save();
     parent_pid = tasks[current_task].pid;
@@ -370,7 +365,7 @@ int32_t scheduler_spawn(loaded_elf_t *program) {
     }
     if (!child) {
         cpu_irq_restore(irq_flags);
-        return -(int32_t)SCHEDULER_EAGAIN;
+        return -(int32_t)HAKU_EAGAIN;
     }
 
     memset(child, 0, sizeof(*child));
@@ -407,17 +402,17 @@ regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
         return frame;
     irq_flags = cpu_irq_save();
     if (options != 0 || pid == 0) {
-        frame->eax = 0u - SCHEDULER_EINVAL;
+        frame->eax = 0u - HAKU_EINVAL;
         cpu_irq_restore(irq_flags);
         return frame;
     }
     if (pid != 0xFFFFFFFFu && pid > 0x7FFFFFFFu) {
-        frame->eax = 0u - SCHEDULER_EINVAL;
+        frame->eax = 0u - HAKU_EINVAL;
         cpu_irq_restore(irq_flags);
         return frame;
     }
     if (pid != 0xFFFFFFFFu && pid > SCHEDULER_MAX_PROCESSES) {
-        frame->eax = 0u - SCHEDULER_ECHILD;
+        frame->eax = 0u - HAKU_ECHILD;
         cpu_irq_restore(irq_flags);
         return frame;
     }
@@ -437,7 +432,7 @@ regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
         }
     }
     if (!has_child) {
-        frame->eax = 0u - SCHEDULER_ECHILD;
+        frame->eax = 0u - HAKU_ECHILD;
         cpu_irq_restore(irq_flags);
         return frame;
     }

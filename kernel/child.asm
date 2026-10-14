@@ -5,8 +5,7 @@
 %define USER_CODE_BASE 0x40000000
 %define USER_DATA_BASE 0x40001000
 
-%define SYS_EXIT  1
-%define SYS_WRITE 4
+%include "haku/abi.inc"
 
     db 0x7F, 'E', 'L', 'F'
     db 1, 1, 1, 0

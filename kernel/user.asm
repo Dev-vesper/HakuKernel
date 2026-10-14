@@ -6,25 +6,7 @@
 %define USER_DATA_BASE 0x40001000
 %define USER_STACK_TOP 0xC0000000
 
-%define SYS_EXIT   1
-%define SYS_OPEN   5
-%define SYS_CLOSE  6
-%define SYS_READ   3
-%define SYS_WRITE  4
-%define SYS_WAITPID 7
-%define SYS_EXECVE 11
-%define SYS_SPAWN 0x1000
-%define SYS_UNLINK 10
-%define SYS_LSEEK 19
-%define SYS_GETPID 20
-%define SYS_RENAME 38
-%define SYS_DUP    41
-%define SYS_DUP2   63
-%define SYS_STAT   106
-%define SYS_FSTAT  108
-
-%define STAT_SIZE  8
-%define STAT_MODE  0x81A4          ; S_IFREG | 0644
+%include "haku/abi.inc"
 
 ; ELF32 header
     db 0x7F, 'E', 'L', 'F'

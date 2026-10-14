@@ -5,11 +5,7 @@
 %define USER_CODE_BASE 0x40000000
 %define USER_DATA_BASE 0x40001000
 
-%define SYS_EXIT   1
-%define SYS_READ   3
-%define SYS_WRITE  4
-%define SYS_CLOSE  6
-%define SYS_GETPID 20
+%include "haku/abi.inc"
 %define EXPECTED_ARGC 3
 
     db 0x7F, 'E', 'L', 'F'

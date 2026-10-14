@@ -144,6 +144,12 @@ the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `dup` (41), `dup2` (63), `stat` (106), and `fstat` (108), with arguments in
 `ebx`, `ecx`, and `edx` and syscall number/result in `eax`.
 The custom `spawn` syscall uses `0x1000`.
+The public ABI definitions are in `include/haku/abi.h` for C and
+`include/haku/abi.inc` for NASM; the build checks that their numeric
+constants stay synchronized. They define syscall numbers, errno values, open
+flags, and the `stat` buffer layout. `haku_stat_t` contains 32-bit `size` and
+`mode` fields; `stat` and `fstat` currently report regular files with mode
+`0644`.
 
 ### User-mode system calls
 

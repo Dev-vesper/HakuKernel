@@ -2,33 +2,31 @@
 #define HAKU_VFS_H
 
 #include "cpu.h"
+#include "haku/abi.h"
 
-#define VFS_O_RDONLY 0x0000u
-#define VFS_O_WRONLY 0x0001u
-#define VFS_O_RDWR   0x0002u
-#define VFS_O_ACCMODE 0x0003u
-#define VFS_O_CREAT  0x0040u
-#define VFS_O_EXCL   0x0080u
-#define VFS_O_TRUNC  0x0200u
-#define VFS_O_APPEND 0x0400u
+#define VFS_O_RDONLY  HAKU_O_RDONLY
+#define VFS_O_WRONLY  HAKU_O_WRONLY
+#define VFS_O_RDWR    HAKU_O_RDWR
+#define VFS_O_ACCMODE HAKU_O_ACCMODE
+#define VFS_O_CREAT   HAKU_O_CREAT
+#define VFS_O_EXCL    HAKU_O_EXCL
+#define VFS_O_TRUNC   HAKU_O_TRUNC
+#define VFS_O_APPEND  HAKU_O_APPEND
 
-#define VFS_EIO            5
-#define VFS_ENOENT         2
-#define VFS_EBADF          9
-#define VFS_EEXIST         17
-#define VFS_EINVAL         22
-#define VFS_EMFILE         24
-#define VFS_ENOSPC         28
+#define VFS_EIO    HAKU_EIO
+#define VFS_ENOENT HAKU_ENOENT
+#define VFS_EBADF  HAKU_EBADF
+#define VFS_EEXIST HAKU_EEXIST
+#define VFS_EINVAL HAKU_EINVAL
+#define VFS_EMFILE HAKU_EMFILE
+#define VFS_ENOSPC HAKU_ENOSPC
 
 /* File types for vfs_stat_t.mode (only regular files exist so far). */
-#define VFS_S_IFREG 0x8000u
+#define VFS_S_IFREG HAKU_S_IFREG
 
 /* Minimal metadata: byte size plus mode. Backends fill size; VFS callers
  * must treat every other attribute as unsupported. */
-typedef struct {
-    uint32_t size;
-    uint32_t mode;
-} vfs_stat_t;
+typedef haku_stat_t vfs_stat_t;
 
 /* Filesystem-independent backend interface (Linux file_operations style,
  * scaled to this kernel). VFS owns the per-process descriptor tables and

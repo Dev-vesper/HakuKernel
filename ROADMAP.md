@@ -96,8 +96,9 @@ tested, and common FAT tools can still read the disk image.
   (`USER-DUP-OK`: shared offset, surviving duplicate, EBADF cases).
 - [ ] Add limited `brk`/`mmap`.
 - [ ] Add time syscalls such as `gettimeofday`/`nanosleep`.
-- [ ] Define a shared user/kernel ABI and headers; test invalid arguments,
-  permissions, and device errors for every syscall.
+- [x] Define a public user/kernel C ABI header for syscall numbers, errno
+  values, open flags, and the `stat` structure.
+- [ ] Test invalid arguments, permissions, and device errors for every syscall.
 
 **Acceptance criteria:** A basic shell can launch programs from disk, collect
 their output and exit status, and run multiple programs without unintended

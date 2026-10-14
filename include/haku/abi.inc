@@ -1,0 +1,71 @@
+%define HAKU_SYSCALL_VECTOR 0x80
+
+%define HAKU_SYS_EXIT    1
+%define HAKU_SYS_READ    3
+%define HAKU_SYS_WRITE   4
+%define HAKU_SYS_OPEN    5
+%define HAKU_SYS_CLOSE   6
+%define HAKU_SYS_WAITPID 7
+%define HAKU_SYS_UNLINK  10
+%define HAKU_SYS_EXECVE  11
+%define HAKU_SYS_LSEEK   19
+%define HAKU_SYS_GETPID  20
+%define HAKU_SYS_RENAME  38
+%define HAKU_SYS_DUP     41
+%define HAKU_SYS_DUP2    63
+%define HAKU_SYS_STAT    106
+%define HAKU_SYS_FSTAT   108
+%define HAKU_SYS_SPAWN   0x1000
+
+%define HAKU_E2BIG         7
+%define HAKU_ENOENT        2
+%define HAKU_EIO           5
+%define HAKU_ENOEXEC       8
+%define HAKU_EBADF          9
+%define HAKU_ECHILD        10
+%define HAKU_EAGAIN        11
+%define HAKU_ENOMEM        12
+%define HAKU_EFAULT        14
+%define HAKU_EEXIST        17
+%define HAKU_EINVAL        22
+%define HAKU_EMFILE        24
+%define HAKU_ENOSPC        28
+%define HAKU_ENAMETOOLONG  36
+%define HAKU_ENOSYS        38
+
+%define HAKU_O_RDONLY  0x0000
+%define HAKU_O_WRONLY  0x0001
+%define HAKU_O_RDWR    0x0002
+%define HAKU_O_ACCMODE 0x0003
+%define HAKU_O_CREAT   0x0040
+%define HAKU_O_EXCL    0x0080
+%define HAKU_O_TRUNC   0x0200
+%define HAKU_O_APPEND  0x0400
+
+%define HAKU_STDIN_FILENO  0
+%define HAKU_STDOUT_FILENO 1
+%define HAKU_STDERR_FILENO 2
+
+%define HAKU_S_IFREG       0x8000
+%define HAKU_STAT_SIZE     8
+%define HAKU_STAT_MODE_REG 0x81A4
+
+; Names kept for the existing assembly integration programs.
+%define SYS_EXIT    HAKU_SYS_EXIT
+%define SYS_READ    HAKU_SYS_READ
+%define SYS_WRITE   HAKU_SYS_WRITE
+%define SYS_OPEN    HAKU_SYS_OPEN
+%define SYS_CLOSE   HAKU_SYS_CLOSE
+%define SYS_WAITPID HAKU_SYS_WAITPID
+%define SYS_UNLINK  HAKU_SYS_UNLINK
+%define SYS_EXECVE  HAKU_SYS_EXECVE
+%define SYS_LSEEK   HAKU_SYS_LSEEK
+%define SYS_GETPID  HAKU_SYS_GETPID
+%define SYS_RENAME  HAKU_SYS_RENAME
+%define SYS_DUP     HAKU_SYS_DUP
+%define SYS_DUP2    HAKU_SYS_DUP2
+%define SYS_STAT    HAKU_SYS_STAT
+%define SYS_FSTAT   HAKU_SYS_FSTAT
+%define SYS_SPAWN   HAKU_SYS_SPAWN
+%define STAT_SIZE   HAKU_STAT_SIZE
+%define STAT_MODE   HAKU_STAT_MODE_REG

@@ -118,7 +118,7 @@ static int32_t fat12_vfs_stat(const char *path, vfs_stat_t *out) {
     stated = fat12_file_stat(path, &st);
     if (stated != 1) return fat12_map_errno(stated);
     out->size = st.size;
-    out->mode = VFS_S_IFREG | 0644u;
+    out->mode = HAKU_STAT_MODE_REG;
     return 1;
 }
 
@@ -129,7 +129,7 @@ static int32_t fat12_vfs_fstat(void *handle, vfs_stat_t *out) {
     stated = fat12_file_fstat((fat12_file_t *)handle, &st);
     if (stated != 1) return fat12_map_errno(stated);
     out->size = st.size;
-    out->mode = VFS_S_IFREG | 0644u;
+    out->mode = HAKU_STAT_MODE_REG;
     return 1;
 }
 

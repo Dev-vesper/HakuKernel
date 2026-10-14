@@ -110,6 +110,29 @@ def find_tool(name, fallbacks, label):
     sys.exit(f"Tool not found: {label}")
 
 
+def verify_abi_headers(include_dir):
+    header = os.path.join(include_dir, "haku", "abi.h")
+    nasm_include = os.path.join(include_dir, "haku", "abi.inc")
+    c_pattern = re.compile(
+        r"^\s*#define\s+(HAKU_\w+)\s+(0x[0-9A-Fa-f]+|\d+)u?\s*$")
+    nasm_pattern = re.compile(
+        r"^\s*%define\s+(HAKU_\w+)\s+(0x[0-9A-Fa-f]+|\d+)\s*$")
+
+    def read_definitions(path, pattern):
+        values = {}
+        with open(path, encoding="ascii") as source:
+            for line in source:
+                match = pattern.match(line)
+                if match:
+                    values[match.group(1)] = int(match.group(2), 0)
+        return values
+
+    c_values = read_definitions(header, c_pattern)
+    nasm_values = read_definitions(nasm_include, nasm_pattern)
+    if not c_values or c_values != nasm_values:
+        sys.exit("C and NASM ABI headers are missing or out of sync")
+
+
 def find_msvc():
     pattern = (r"C:\Program Files\Microsoft Visual Studio\2022"
                r"\*\VC\Tools\MSVC\*\bin\Hostx64\x86\cl.exe")
@@ -215,6 +238,8 @@ def main():
         sys.exit(f"unexpected argument: {positionals[1]}")
 
     kernel_dir = os.path.join(ROOT, "kernel")
+    include_dir = os.path.join(ROOT, "include")
+    verify_abi_headers(include_dir)
     c_files = sorted(glob.glob(os.path.join(kernel_dir, "*.c")))
     if not c_files:
         sys.exit("no kernel/*.c files found")
@@ -244,9 +269,11 @@ def main():
     #    from previous QEMU sessions survive, and mkfat12 runs only for an
     #    initial image or an explicit --fresh. headless always recreates —
     #    its fault-injection tests require pristine, deterministic state.
-    run([nasm, "-f", "bin", user_asm, "-o", user_elf])
-    run([nasm, "-f", "bin", exec_target_asm, "-o", exec_target_elf])
-    run([nasm, "-f", "bin", child_asm, "-o", child_elf])
+    nasm_include = include_dir + os.sep
+    run([nasm, "-I" + nasm_include, "-f", "bin", user_asm, "-o", user_elf])
+    run([nasm, "-I" + nasm_include, "-f", "bin", exec_target_asm,
+         "-o", exec_target_elf])
+    run([nasm, "-I" + nasm_include, "-f", "bin", child_asm, "-o", child_elf])
     if mode == "headless" or fresh or not os.path.isfile(filesystem_image):
         if mode == "headless" and os.path.isfile(filesystem_image):
             log("headless: recreating the data image "
@@ -270,7 +297,8 @@ def main():
     c_objs = []
     for src in c_files:
         obj = os.path.join(BUILD, os.path.splitext(os.path.basename(src))[0] + ".obj")
-        run(cc + ["/nologo", "/c", "/GS-", "/Os", "/W3", "/Fo" + obj, src])
+        run(cc + ["/nologo", "/c", "/GS-", "/Os", "/W3",
+                  "/I" + include_dir, "/Fo" + obj, src])
         c_objs.append(obj)
     log(f"{len(c_objs)} C objects built")
 

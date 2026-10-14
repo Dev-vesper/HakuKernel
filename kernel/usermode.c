@@ -256,7 +256,7 @@ static uint32_t sys_write(uint32_t fd, uint32_t user_buffer,
         return copy_from_user_error(HAKU_EINVAL);
     if (!paging_user_range_valid(user_buffer, count, 0))
         return copy_from_user_error(HAKU_EFAULT);
-    if (fd > 2u) {
+    if (fd > HAKU_STDERR_FILENO) {
         int32_t result;
         if (count == 0)
             return (uint32_t)vfs_write(scheduler_current_pid(), fd, 0, 0);
@@ -273,8 +273,8 @@ static uint32_t sys_write(uint32_t fd, uint32_t user_buffer,
         }
         return offset;
     }
-    if (fd == 0u) return copy_from_user_error(HAKU_EBADF);
-    if (fd != 1u && fd != 2u)
+    if (fd == HAKU_STDIN_FILENO) return copy_from_user_error(HAKU_EBADF);
+    if (fd != HAKU_STDOUT_FILENO && fd != HAKU_STDERR_FILENO)
         return copy_from_user_error(HAKU_EBADF);
 
     while (offset < count) {
@@ -299,7 +299,7 @@ static uint32_t sys_read(uint32_t fd, uint32_t user_buffer,
 
     if (count > USER_IO_MAX) return copy_from_user_error(HAKU_EINVAL);
     if (count == 0)
-        return fd == 0u ? 0u :
+        return fd == HAKU_STDIN_FILENO ? 0u :
                (uint32_t)vfs_read(scheduler_current_pid(), fd, 0, 0);
     if (!paging_user_range_valid(user_buffer, count, 1))
         return copy_from_user_error(HAKU_EFAULT);
@@ -542,7 +542,7 @@ static uint32_t sys_fstat(uint32_t fd, uint32_t user_buf) {
 
 regs_t *user_syscall(regs_t *r) {
     switch (r->eax) {
-    case SYS_EXIT:
+    case HAKU_SYS_EXIT:
         cpu_cli();
         klog_prefix();
         klog_write("USER-EXIT-OK status=");
@@ -551,49 +551,49 @@ regs_t *user_syscall(regs_t *r) {
         klog_dec(scheduler_current_pid());
         klog_write("\n");
         return scheduler_exit_current(r);
-    case SYS_READ:
+    case HAKU_SYS_READ:
         r->eax = sys_read(r->ebx, r->ecx, r->edx);
         return r;
-    case SYS_WRITE:
+    case HAKU_SYS_WRITE:
         r->eax = sys_write(r->ebx, r->ecx, r->edx);
         return r;
-    case SYS_EXECVE:
+    case HAKU_SYS_EXECVE:
         r->eax = sys_execve(r->ebx, r->ecx, r->edx, r);
         return r;
-    case SYS_SPAWN:
+    case HAKU_SYS_SPAWN:
         r->eax = sys_spawn(r->ebx);
         return r;
-    case SYS_WAITPID:
+    case HAKU_SYS_WAITPID:
         return sys_waitpid(r, r->ebx, r->ecx, r->edx);
-    case SYS_OPEN:
+    case HAKU_SYS_OPEN:
         r->eax = sys_open(r->ebx, r->ecx);
         return r;
-    case SYS_CLOSE:
+    case HAKU_SYS_CLOSE:
         r->eax = (uint32_t)vfs_close(scheduler_current_pid(), r->ebx);
         return r;
-    case SYS_LSEEK:
+    case HAKU_SYS_LSEEK:
         r->eax = (uint32_t)vfs_seek(scheduler_current_pid(), r->ebx,
                                     (int32_t)r->ecx, r->edx);
         return r;
-    case SYS_UNLINK:
+    case HAKU_SYS_UNLINK:
         r->eax = sys_unlink(r->ebx);
         return r;
-    case SYS_RENAME:
+    case HAKU_SYS_RENAME:
         r->eax = sys_rename(r->ebx, r->ecx);
         return r;
-    case SYS_DUP:
+    case HAKU_SYS_DUP:
         r->eax = (uint32_t)vfs_dup(scheduler_current_pid(), r->ebx);
         return r;
-    case SYS_DUP2:
+    case HAKU_SYS_DUP2:
         r->eax = (uint32_t)vfs_dup2(scheduler_current_pid(), r->ebx, r->ecx);
         return r;
-    case SYS_STAT:
+    case HAKU_SYS_STAT:
         r->eax = sys_stat(r->ebx, r->ecx);
         return r;
-    case SYS_FSTAT:
+    case HAKU_SYS_FSTAT:
         r->eax = sys_fstat(r->ebx, r->ecx);
         return r;
-    case SYS_GETPID:
+    case HAKU_SYS_GETPID:
         r->eax = scheduler_current_pid();
         return r;
     default:

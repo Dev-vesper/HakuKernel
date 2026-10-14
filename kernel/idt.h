@@ -9,6 +9,7 @@
 #define HAKU_IDT_H
 
 #include "cpu.h"
+#include "haku/abi.h"
 
 #define IDT_ENTRIES 256
 #define KERNEL_CS   0x08
