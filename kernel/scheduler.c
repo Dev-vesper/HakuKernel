@@ -27,9 +27,8 @@ static task_t tasks[SCHEDULER_MAX_PROCESSES];
 static task_t idle_task;
 static uint32_t task_count;
 static int current_task = -1;
-static uint32_t switch_count;
 static int scheduler_started;
-static int preempt_marker_written;
+static int timer_marker_written;
 
 int scheduler_user_tasks_done(void) {
     if (task_count == 0) return 0;
@@ -140,40 +139,36 @@ static void reap_zombies(void) {
     }
 }
 
-int scheduler_init(loaded_elf_t *programs, uint32_t count) {
-    if (!programs || count == 0 || count > SCHEDULER_MAX_PROCESSES)
+int scheduler_init(loaded_elf_t *initial_program) {
+    if (!initial_program || !initial_program->address_space.directory_phys ||
+        !initial_program->entry || !initial_program->user_stack)
         return 0;
 
     memset(tasks, 0, sizeof(tasks));
     memset(&idle_task, 0, sizeof(idle_task));
-    task_count = count;
+    task_count = 1;
     current_task = -1;
-    switch_count = 0;
     scheduler_started = 0;
-    preempt_marker_written = 0;
+    timer_marker_written = 0;
 
-    for (uint32_t i = 0; i < count; i++) {
-        tasks[i].pid = i + 1u;
-        tasks[i].state = TASK_RUNNABLE;
-        tasks[i].program = programs[i];
-        if (!initialize_stack(&tasks[i], 1)) goto fail;
-    }
+    tasks[0].pid = 1;
+    tasks[0].state = TASK_RUNNABLE;
+    tasks[0].program = *initial_program;
+    if (!initialize_stack(&tasks[0], 1)) goto fail;
     idle_task.state = TASK_RUNNABLE;
     if (!initialize_stack(&idle_task, 0)) goto fail;
+    initial_program->address_space.directory_phys = 0;
 
     klog_prefix();
-    klog_write("sched: SCHED-READY tasks=");
-    klog_dec(count);
+    klog_write("sched: SCHED-READY tasks=1");
     klog_write(" kernel-stack=per-task\n");
     return 1;
 
 fail:
-    for (uint32_t i = 0; i < count; i++) {
-        if (tasks[i].kernel_stack)
-            frame_free_pages((void *)tasks[i].kernel_stack,
-                             TASK_KERNEL_STACK_PAGES);
-        memset(&tasks[i], 0, sizeof(tasks[i]));
-    }
+    if (tasks[0].kernel_stack)
+        frame_free_pages((void *)tasks[0].kernel_stack,
+                         TASK_KERNEL_STACK_PAGES);
+    memset(&tasks[0], 0, sizeof(tasks[0]));
     if (idle_task.kernel_stack)
         frame_free_pages((void *)idle_task.kernel_stack,
                          TASK_KERNEL_STACK_PAGES);
@@ -200,6 +195,11 @@ regs_t *scheduler_preempt(regs_t *frame) {
 
     if (!scheduler_started || !frame)
         return frame;
+    if (!timer_marker_written) {
+        klog_prefix();
+        klog_write("sched: SCHED-TIMER-OK: timer interrupts reach scheduler\n");
+        timer_marker_written = 1;
+    }
 
     reap_zombies();
     if (current_task == (int)task_count) {
@@ -213,14 +213,6 @@ regs_t *scheduler_preempt(regs_t *frame) {
         return frame;
 
     activate_task(next);
-    switch_count++;
-    if (!preempt_marker_written) {
-        klog_prefix();
-        klog_write("SCHED-PREEMPT-OK: timer preemption works, switches=");
-        klog_dec(switch_count);
-        klog_write("\n");
-        preempt_marker_written = 1;
-    }
     return next == (int)task_count ? idle_task.frame :
                                           tasks[next].frame;
 }
@@ -238,6 +230,53 @@ regs_t *scheduler_exit_current(regs_t *frame) {
     activate_task(next);
     return next == (int)task_count ? idle_task.frame :
                                           tasks[next].frame;
+}
+
+int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
+    task_t *task;
+    loaded_elf_t previous;
+    uint32_t irq_flags;
+    if (!scheduler_started || !replacement || !frame ||
+        !replacement->address_space.directory_phys ||
+        !replacement->entry || !replacement->user_stack ||
+        current_task < 0 || current_task >= (int)task_count ||
+        (frame->cs & 3u) != 3u)
+        return 0;
+
+    irq_flags = cpu_irq_save();
+    task = &tasks[current_task];
+    previous = task->program;
+    task->program = *replacement;
+    replacement->address_space.directory_phys = 0;
+
+    frame->gs = USER_DS;
+    frame->fs = USER_DS;
+    frame->es = USER_DS;
+    frame->ds = USER_DS;
+    frame->edi = 0;
+    frame->esi = 0;
+    frame->ebp = 0;
+    frame->esp_dummy = 0;
+    frame->ebx = 0;
+    frame->edx = 0;
+    frame->ecx = 0;
+    frame->eax = 0;
+    frame->eip = task->program.entry;
+    frame->cs = USER_CS;
+    frame->eflags = 0x202u;
+    frame->user_esp = task->program.user_stack;
+    frame->user_ss = USER_DS;
+    task->frame = frame;
+
+    paging_activate_user_space(&task->program.address_space);
+    paging_destroy_user_space(&previous.address_space);
+    cpu_irq_restore(irq_flags);
+
+    klog_prefix();
+    klog_write("exec: EXECVE-OK pid=");
+    klog_dec(task->pid);
+    klog_write(" replaced image, descriptors preserved\n");
+    return 1;
 }
 
 uint32_t scheduler_current_pid(void) {

@@ -10,9 +10,20 @@
 #include "vfs.h"
 
 #define USER_ELF_MAX_SIZE (256u * 1024u)
+#define USER_EXEC_MAX_ARGUMENTS 64u
+#define USER_EXEC_MAX_BYTES 4096u
+#define USER_STACK_BOTTOM (USER_STACK_TOP - 2u * USER_PAGE_SIZE)
 
-static loaded_elf_t programs[2];
-#define USER_PROGRAM_COUNT (sizeof(programs) / sizeof(programs[0]))
+static loaded_elf_t initial_program;
+
+typedef struct {
+    uint8_t *strings;
+    uint32_t bytes_used;
+    uint32_t argc;
+    uint32_t envc;
+    uint32_t argv_offsets[USER_EXEC_MAX_ARGUMENTS];
+    uint32_t envp_offsets[USER_EXEC_MAX_ARGUMENTS];
+} exec_arguments_t;
 
 static int elf_rejection_self_test(const uint8_t *image,
                                    uint32_t image_size) {
@@ -44,6 +55,7 @@ int usermode_init(void) {
     uint32_t loaded = 0;
     uint32_t image_size = 0;
     uint8_t *image;
+    int read_result;
 
     /* Assemble the storage stack: VFS tables, then the FAT12 backend as
      * the root filesystem. Everything below (syscalls, self-tests) only
@@ -57,8 +69,13 @@ int usermode_init(void) {
         klog_write("ELF-DISK-FAIL: kernel heap exhausted\n");
         return 0;
     }
-    if (fat12_read_file("HAKU.ELF", image, USER_ELF_MAX_SIZE,
-                        &image_size) != 1) {
+    read_result = fat12_read_file("HAKU.ELF", image, USER_ELF_MAX_SIZE,
+                                  &image_size);
+    if (read_result != 1) {
+        klog_prefix();
+        klog_write("ELF-DISK-FAIL: HAKU.ELF read error=");
+        klog_dec((uint32_t)-read_result);
+        klog_write("\n");
         kfree(image);
         return 0;
     }
@@ -73,33 +90,27 @@ int usermode_init(void) {
         kfree(image);
         return 0;
     }
-    for (; loaded < USER_PROGRAM_COUNT; loaded++) {
-        if (!elf_load_executable(image, image_size, &programs[loaded])) {
-            klog_prefix();
-            klog_write("ELF-LOAD-FAIL: invalid or unsupported ELF32 image\n");
-            while (loaded)
-                paging_destroy_user_space(
-                    &programs[--loaded].address_space);
-            kfree(image);
-            return 0;
-        }
+    if (!elf_load_executable(image, image_size, &initial_program)) {
+        klog_prefix();
+        klog_write("ELF-LOAD-FAIL: invalid or unsupported ELF32 image\n");
+        kfree(image);
+        return 0;
     }
     kfree(image);
     klog_prefix();
     klog_write("ELF-LOAD-OK: entry=");
-    klog_hex(programs[0].entry);
+    klog_hex(initial_program.entry);
     klog_write(" cr3=");
-    klog_hex(programs[0].address_space.directory_phys);
+    klog_hex(initial_program.address_space.directory_phys);
     klog_write("\n");
     klog_prefix();
     klog_write("USERMODE-READY: user stack=");
-    klog_hex(programs[0].user_stack);
+    klog_hex(initial_program.user_stack);
     klog_write("\n");
-    if (!scheduler_init(programs, USER_PROGRAM_COUNT)) {
+    if (!scheduler_init(&initial_program)) {
         klog_prefix();
-        klog_write("SCHED-INIT-FAIL: no task slots\n");
-        for (uint32_t i = 0; i < USER_PROGRAM_COUNT; i++)
-            paging_destroy_user_space(&programs[i].address_space);
+        klog_write("SCHED-INIT-FAIL: could not start initial process\n");
+        paging_destroy_user_space(&initial_program.address_space);
         return 0;
     }
     return 1;
@@ -120,6 +131,113 @@ static int copy_from_user(void *destination, uint32_t source,
     if (!paging_user_range_valid(source, length, 0)) return 0;
     if (length) memcpy(destination, (const void *)source, length);
     return 1;
+}
+
+static int capture_exec_vector(uint32_t user_vector, uint32_t *offsets,
+                               uint32_t *count, exec_arguments_t *arguments) {
+    *count = 0;
+    if (!user_vector) return 1;
+
+    for (uint32_t i = 0; i <= USER_EXEC_MAX_ARGUMENTS; i++) {
+        uint32_t slot;
+        uint32_t user_string;
+        uint32_t string_offset = 0;
+        if (i > (0xFFFFFFFFu - user_vector) / sizeof(uint32_t))
+            return -(int32_t)HAKU_EFAULT;
+        slot = user_vector + i * sizeof(uint32_t);
+        if (!copy_from_user(&user_string, slot, sizeof(user_string)))
+            return -(int32_t)HAKU_EFAULT;
+        if (!user_string) return 1;
+        if (i == USER_EXEC_MAX_ARGUMENTS)
+            return -(int32_t)HAKU_E2BIG;
+
+        offsets[i] = arguments->bytes_used;
+        for (;;) {
+            uint8_t character;
+            uint32_t position = arguments->bytes_used;
+            if (position >= USER_EXEC_MAX_BYTES)
+                return -(int32_t)HAKU_E2BIG;
+            if (string_offset > 0xFFFFFFFFu - user_string ||
+                !copy_from_user(&character, user_string + string_offset, 1))
+                return -(int32_t)HAKU_EFAULT;
+            arguments->strings[position] = character;
+            arguments->bytes_used++;
+            if (!character) break;
+            string_offset++;
+        }
+        *count = i + 1u;
+    }
+    return -(int32_t)HAKU_E2BIG;
+}
+
+static uint32_t place_exec_strings(loaded_elf_t *program,
+                                   const exec_arguments_t *arguments,
+                                   const uint32_t *offsets, uint32_t count,
+                                   uint32_t *addresses,
+                                   uint32_t *stack_pointer) {
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t offset = offsets[i];
+        uint32_t length = 0;
+        uint32_t address;
+        while (offset + length < arguments->bytes_used &&
+               arguments->strings[offset + length])
+            length++;
+        if (offset + length >= arguments->bytes_used)
+            return HAKU_EIO;
+        length++;
+        if (*stack_pointer < USER_STACK_BOTTOM ||
+            length > *stack_pointer - USER_STACK_BOTTOM)
+            return HAKU_E2BIG;
+        *stack_pointer -= length;
+        address = *stack_pointer;
+        if (!paging_copy_to_user_space(&program->address_space, address,
+                                       arguments->strings + offset, length))
+            return HAKU_EIO;
+        addresses[i] = address;
+    }
+    return 0;
+}
+
+static uint32_t build_exec_stack(loaded_elf_t *program,
+                                 const exec_arguments_t *arguments) {
+    uint32_t argv_addresses[USER_EXEC_MAX_ARGUMENTS];
+    uint32_t envp_addresses[USER_EXEC_MAX_ARGUMENTS];
+    uint32_t words[USER_EXEC_MAX_ARGUMENTS * 2u + 5u];
+    uint32_t word_count = 0;
+    uint32_t stack_pointer = program->user_stack;
+    uint32_t error;
+
+    error = place_exec_strings(program, arguments, arguments->argv_offsets,
+                               arguments->argc, argv_addresses,
+                               &stack_pointer);
+    if (error) return error;
+    error = place_exec_strings(program, arguments, arguments->envp_offsets,
+                               arguments->envc, envp_addresses,
+                               &stack_pointer);
+    if (error) return error;
+
+    words[word_count++] = arguments->argc;
+    for (uint32_t i = 0; i < arguments->argc; i++)
+        words[word_count++] = argv_addresses[i];
+    words[word_count++] = 0;
+    for (uint32_t i = 0; i < arguments->envc; i++)
+        words[word_count++] = envp_addresses[i];
+    words[word_count++] = 0;
+    words[word_count++] = 0; /* AT_NULL */
+    words[word_count++] = 0;
+
+    if (stack_pointer < USER_STACK_BOTTOM ||
+        word_count * sizeof(uint32_t) >
+            stack_pointer - USER_STACK_BOTTOM)
+        return HAKU_E2BIG;
+    stack_pointer = (stack_pointer - word_count * sizeof(uint32_t)) &
+                    ~15u;
+    if (stack_pointer < USER_STACK_BOTTOM ||
+        !paging_copy_to_user_space(&program->address_space, stack_pointer,
+                                   words, word_count * sizeof(uint32_t)))
+        return HAKU_EIO;
+    program->user_stack = stack_pointer;
+    return 0;
 }
 
 static int copy_to_user(uint32_t destination, const void *source,
@@ -242,6 +360,99 @@ static int copy_user_path(uint32_t user_path, char out[13]) {
     return -(int32_t)HAKU_ENAMETOOLONG;
 }
 
+static uint32_t sys_execve(uint32_t user_path, uint32_t user_argv,
+                           uint32_t user_envp, regs_t *frame) {
+    char path[13];
+    loaded_elf_t replacement;
+    exec_arguments_t arguments;
+    vfs_stat_t stat;
+    uint8_t *image;
+    uint32_t offset = 0;
+    uint32_t pid = scheduler_current_pid();
+    int32_t result;
+    int32_t fd;
+
+    result = copy_user_path(user_path, path);
+    if (result != 1) return (uint32_t)result;
+    memset(&arguments, 0, sizeof(arguments));
+    arguments.strings = (uint8_t *)kmalloc(USER_EXEC_MAX_BYTES);
+    if (!arguments.strings)
+        return copy_from_user_error(HAKU_ENOMEM);
+    result = capture_exec_vector(user_argv, arguments.argv_offsets,
+                                &arguments.argc, &arguments);
+    if (result == 1)
+        result = capture_exec_vector(user_envp, arguments.envp_offsets,
+                                     &arguments.envc, &arguments);
+    if (result != 1) {
+        kfree(arguments.strings);
+        return (uint32_t)result;
+    }
+
+    fd = vfs_open(pid, path, VFS_O_RDONLY);
+    if (fd < 0) {
+        kfree(arguments.strings);
+        return (uint32_t)fd;
+    }
+    result = vfs_fstat(pid, (uint32_t)fd, &stat);
+    if (result != 1) {
+        vfs_close(pid, (uint32_t)fd);
+        kfree(arguments.strings);
+        return (uint32_t)result;
+    }
+    if (stat.size == 0 || stat.size > USER_ELF_MAX_SIZE) {
+        vfs_close(pid, (uint32_t)fd);
+        kfree(arguments.strings);
+        return copy_from_user_error(stat.size ? HAKU_E2BIG :
+                                               HAKU_ENOEXEC);
+    }
+
+    image = (uint8_t *)kmalloc(stat.size);
+    if (!image) {
+        vfs_close(pid, (uint32_t)fd);
+        kfree(arguments.strings);
+        return copy_from_user_error(HAKU_ENOMEM);
+    }
+    while (offset < stat.size) {
+        uint32_t amount = stat.size - offset;
+        if (amount > USER_IO_MAX) amount = USER_IO_MAX;
+        result = vfs_read(pid, (uint32_t)fd, image + offset, amount);
+        if (result <= 0 || (uint32_t)result > amount) {
+            vfs_close(pid, (uint32_t)fd);
+            kfree(image);
+            kfree(arguments.strings);
+            return copy_from_user_error(result < 0 ? (uint32_t)-result :
+                                                    HAKU_EIO);
+        }
+        offset += (uint32_t)result;
+    }
+    result = vfs_close(pid, (uint32_t)fd);
+    if (result < 0) {
+        kfree(image);
+        kfree(arguments.strings);
+        return (uint32_t)result;
+    }
+
+    memset(&replacement, 0, sizeof(replacement));
+    if (!elf_load_executable(image, stat.size, &replacement)) {
+        kfree(image);
+        kfree(arguments.strings);
+        return copy_from_user_error(HAKU_ENOEXEC);
+    }
+    kfree(image);
+    result = (int32_t)build_exec_stack(&replacement, &arguments);
+    if (result != 0) {
+        paging_destroy_user_space(&replacement.address_space);
+        kfree(arguments.strings);
+        return copy_from_user_error((uint32_t)result);
+    }
+    kfree(arguments.strings);
+    if (!scheduler_exec_current(&replacement, frame)) {
+        paging_destroy_user_space(&replacement.address_space);
+        return copy_from_user_error(HAKU_EIO);
+    }
+    return 0;
+}
+
 /* POSIX returns 0 on success here: translate the VFS-internal 1. */
 static uint32_t sys_unlink(uint32_t user_path) {
     char path[13];
@@ -307,6 +518,9 @@ regs_t *user_syscall(regs_t *r) {
         return r;
     case SYS_WRITE:
         r->eax = sys_write(r->ebx, r->ecx, r->edx);
+        return r;
+    case SYS_EXECVE:
+        r->eax = sys_execve(r->ebx, r->ecx, r->edx, r);
         return r;
     case SYS_OPEN:
         r->eax = sys_open(r->ebx, r->ecx);

@@ -57,5 +57,8 @@ void paging_activate_kernel_space(void);
 void paging_destroy_user_space(address_space_t *space);
 int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
                             int write_access);
+int paging_copy_to_user_space(const address_space_t *space,
+                              uint32_t virtual_addr, const void *source,
+                              uint32_t length);
 
 #endif

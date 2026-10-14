@@ -9,7 +9,8 @@ Usage:
     python build.py inspect ...     examine a FAT12 image (see --help there)
 
 Pipeline:
-    user.asm --nasm--> user.elf --mkfat12--> haku_fs.img (fresh only)
+    user.asm + exec_target.asm --nasm--> ELF files --mkfat12--> haku_fs.img
+    (fresh only)
     kernel/*.c --cl--> kernel objects + entry/isr.asm --nasm--> entry objects
     kernel objects + entry objects --link--> kernel.pe --pe2bin--> kernel.bin
     stage1.asm --nasm--> stage1.bin (512 B)
@@ -220,6 +221,7 @@ def main():
     entry_asm = os.path.join(kernel_dir, "entry.asm")
     isr_asm = os.path.join(kernel_dir, "isr.asm")
     user_asm = os.path.join(kernel_dir, "user.asm")
+    exec_target_asm = os.path.join(kernel_dir, "exec_target.asm")
     boot_dir = os.path.join(ROOT, "boot")
     stage1_asm = os.path.join(boot_dir, "stage1.asm")
     stage2_asm = os.path.join(boot_dir, "stage2.asm")
@@ -227,6 +229,7 @@ def main():
     entry_obj = os.path.join(BUILD, "entry.obj")
     isr_obj = os.path.join(BUILD, "isr.obj")
     user_elf = os.path.join(BUILD, "user.elf")
+    exec_target_elf = os.path.join(BUILD, "exec_target.elf")
     filesystem_image = os.path.join(BUILD, "haku_fs.img")
     kernel_pe = os.path.join(BUILD, "kernel.pe")
     kernel_bin = os.path.join(BUILD, "kernel.bin")
@@ -240,20 +243,24 @@ def main():
     #    initial image or an explicit --fresh. headless always recreates —
     #    its fault-injection tests require pristine, deterministic state.
     run([nasm, "-f", "bin", user_asm, "-o", user_elf])
+    run([nasm, "-f", "bin", exec_target_asm, "-o", exec_target_elf])
     if mode == "headless" or fresh or not os.path.isfile(filesystem_image):
         if mode == "headless" and os.path.isfile(filesystem_image):
             log("headless: recreating the data image "
                 "(fault-injection tests mutate the disk)")
-        run([py, fat12_script, user_elf, filesystem_image])
+        run([py, fat12_script, user_elf, filesystem_image,
+             f"NEXT.ELF={exec_target_elf}"])
         log(f"FAT12 program disk ready "
             f"({os.path.getsize(filesystem_image)} bytes)")
     else:
         log(f"reusing data image {filesystem_image} "
             f"({os.path.getsize(filesystem_image)} bytes, "
             f"user files preserved; --fresh recreates it)")
-        if os.path.getmtime(user_asm) > os.path.getmtime(filesystem_image):
+        source_mtime = max(os.path.getmtime(user_asm),
+                           os.path.getmtime(exec_target_asm))
+        if source_mtime > os.path.getmtime(filesystem_image):
             log("WARNING: kernel/user.asm is newer than the data image - "
-                "HAKU.ELF on disk is stale; rerun with --fresh")
+                "test ELFs on disk may be stale; rerun with --fresh")
 
     # 2. kernel C files -> COFF objects
     c_objs = []
@@ -321,11 +328,9 @@ def main():
                                                  "-serial", f"file:{serial}",
                                         "-monitor", f"tcp:127.0.0.1:{MON_PORT},server=on,wait=off"])
         try:
-            # Two instances block in read(0, ..., 1); each needs a key.
+            # The initial test process blocks once in read(0, ..., 1).
             time.sleep(1.0)
             monitor_cmd(MON_PORT, ["sendkey x"])
-            time.sleep(0.25)
-            monitor_cmd(MON_PORT, ["sendkey y"])
             proc.wait(timeout=12)
         except subprocess.TimeoutExpired:
             # Still alive: interrogate the CPU state, grab a screenshot, stop it.
@@ -367,17 +372,18 @@ def main():
             "FAT12-MOUNT-OK",
             "FAT12-READ-OK name=HAKU.ELF",
             "USERMODE-ENTER",# iret entered CPL 3
-            "SCHED-READY tasks=2 kernel-stack=per-task",
+            "SCHED-READY tasks=1 kernel-stack=per-task",
             "SCHED-START pid=1",
-            "SCHED-PREEMPT-OK",
+            "SCHED-TIMER-OK",
             "USERMODE-OK",   # ELF32 user image executed POSIX-style syscalls
             "USER-SYSCALL-CHECKS-OK", # EFAULT/EBADF/EINVAL/ENOSYS + flag/fd/whence paths passed
             "USER-READ-OK",  # blocking read copied keyboard input to user memory
             "USER-FILE-IO-OK", # FAT12 create/write/read/seek/close passed
             "USER-FILE-OPS-OK", # unlink/rename/stat/fstat, open-file removed/renamed
             "USER-DUP-OK",   # dup/dup2 share one open file description
+            "EXECVE-OK pid=1", # exec replaced the image and preserved descriptors
+            "USER-EXEC-TARGET-OK", # argv/envp stack and image replacement passed
             "USER-EXIT-OK status=0 pid=1",
-            "USER-EXIT-OK status=0 pid=2",
             "SCHED-REAP-OK",
             "FS-ERRORS-OK",  # missing/invalid/exists/badfd map to distinct errno
             "FS-FILE-EDGE-OK", # empty files, exact-sector, span, partial writes
@@ -393,14 +399,8 @@ def main():
             "T+3s",
         ]
         missing = [m for m in expected if m not in content]
-        if content.count("SCHED-REAP-OK") < 2:
-            missing.append("two exited processes reaped")
-        if content.count("USER-FILE-IO-OK") < 2:
-            missing.append("file I/O passed in both user processes")
-        if content.count("USER-FILE-OPS-OK") < 2:
-            missing.append("file ops passed in both user processes")
-        if content.count("USER-DUP-OK") < 2:
-            missing.append("dup/dup2 passed in both user processes")
+        if "EXECVE-FAIL" in content:
+            missing.append("successful execve did not return an error")
         unexpected = [m for m in ("USER-SYSCALL-FAIL",
                                      "FS-ERROR-FAIL",
                                      "FS-EDGE-FAIL",

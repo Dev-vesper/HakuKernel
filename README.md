@@ -26,17 +26,18 @@ python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 ```
 
 `python build.py headless` verifies ATA detection, FAT12 mounting and
-multi-cluster file reads, ring-3 process entry, timer preemption, per-process
-kernel stacks, syscall handling, process exit/reaping, and timer IRQs through
-the serial log.
+multi-cluster file reads, ring-3 process entry, per-process kernel stacks,
+syscall handling, `execve` image replacement, process exit/reaping, and timer
+IRQs through the serial log.
 
 ### Data image lifecycle
 
 `build/haku_fs.img` is the ATA data disk and is treated as user data: an
 existing image is reused untouched, so files created in a previous QEMU
-session survive the next build. It is (re)created from `kernel/user.asm`
-only when missing or with `--fresh`. If `user.asm` is newer than a reused
-image, the build warns that `HAKU.ELF` on disk is stale. `headless` always
+session survive the next build. It is (re)created from `kernel/user.asm` and
+`kernel/exec_target.asm` only when missing or with `--fresh`. If either
+assembly source is newer than a reused image, the build warns that its test
+ELFs on disk may be stale. `headless` always
 starts from a fresh image (its fault-injection tests mutate the disk) and,
 after the serial-log check passes, re-verifies the post-run image on the
 host side.
@@ -102,28 +103,35 @@ allocation state so reserved pages cannot accidentally be released.
 
 ### Processes and preemptive scheduling
 
-`kernel/scheduler.c` runs two instances of the ELF test program with separate
-address spaces and kernel stacks. The 100 Hz PIT preempts runnable processes
-by saving the complete interrupt frame and restoring another process's frame
-through `iret`. Each process has an 8 KiB ring-0 stack; `gdt_set_kernel_stack`
-updates `TSS.esp0` at every switch so the next ring-3 interrupt or syscall
-enters on the correct stack. User exceptions and `exit` mark a process for
-reaping; its address space and kernel stack are reclaimed after execution has
-moved to another stack. When all processes exit, the scheduler runs a
-dedicated kernel idle context.
+`kernel/scheduler.c` starts the initial process from `HAKU.ELF`; a successful
+`execve` replaces that process image with another ELF loaded from the root
+filesystem. Each process has its own address space and an 8 KiB ring-0 stack;
+`gdt_set_kernel_stack` updates `TSS.esp0` at every task switch so the next
+ring-3 interrupt or syscall enters on the correct stack. The 100 Hz PIT
+scheduler saves and restores complete interrupt frames through `iret`.
+User exceptions and `exit` mark a process for reaping; its address space and
+kernel stack are reclaimed after execution has moved to another stack. When
+no user process is runnable, the scheduler runs a dedicated kernel idle
+context.
 
 `kernel/gdt.c` installs flat ring-0/ring-3 code and data descriptors plus a
 32-bit TSS. `kernel/paging.c` gives each process supervisor-only kernel
 identity mappings and maps its user program and two-page user stack with
 user permissions.
 
-`kernel/user.asm` is built as an ELF32 image, loaded separately for each
-process and entered via `iret` at CPL 3. The initial syscall ABI follows the
-i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
-`read` (3), `write` (4), `open` (5), `close` (6), `unlink` (10), `lseek`
-(19), `getpid` (20), `rename` (38), `dup` (41), `dup2` (63), `stat` (106),
-and `fstat` (108), with arguments in `ebx`, `ecx`, and `edx` and syscall
-number/result in `eax`.
+`kernel/user.asm` is built as an ELF32 image and entered via `iret` at CPL 3.
+It tests `execve` (11), which loads another ELF32 image, builds an aligned
+initial user stack containing `argc`, `argv`, `envp`, and a terminating
+`AT_NULL` auxiliary-vector entry, and replaces the calling process without
+changing its PID or open file descriptors. Each vector is limited to 64
+strings; their strings are limited to 4096 combined bytes including NUL
+terminators and must fit the two-page initial stack. Larger inputs return
+`E2BIG`, and invalid user pointers return `EFAULT`. The syscall ABI follows
+the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
+`read` (3), `write` (4), `open` (5), `close` (6), `unlink` (10), `execve`
+(11), `lseek` (19), `getpid` (20), `rename` (38), `dup` (41), `dup2` (63),
+`stat` (106), and `fstat` (108), with arguments in `ebx`, `ecx`, and `edx`
+and syscall number/result in `eax`.
 
 ### User-mode system calls
 
@@ -137,8 +145,8 @@ negative errno values (a future libc can translate these to `errno`).
 Every FAT12 failure class keeps one distinct errno end to end: missing
 files give `ENOENT`, bad flags/whence/pointers give `EINVAL`, existing
 files give `EEXIST`, bad descriptors give `EBADF`, a full volume gives
-`ENOSPC`, and disk I/O failures give `EIO`. After both user processes
-exit, the idle task runs an error self-test (`FS-ERRORS-OK`) including a
+`ENOSPC`, and disk I/O failures give `EIO`. After the user process exits,
+the idle task runs an error self-test (`FS-ERRORS-OK`) including a
 root-fill probe that must fail with `ENOSPC` (`FS-ENOSPC-OK`). The same
 pass also covers empty files, exact-sector and boundary-spanning I/O
 (`FS-FILE-EDGE-OK`), injected cut/bad/reserved/cyclic FAT chains (each
@@ -212,15 +220,15 @@ simultaneously open regular files per process and the `O_RDONLY`,
 The filesystem remains intentionally small: no partition tables, subfolders,
 long filenames, permissions, mount points, journaling, FAT16,
 or FAT32. This is a minimal single-volume VFS, not full POSIX filesystem
-conformance. The QEMU headless test creates separate `P1.TXT` and `P2.TXT`
-files from the two user processes and verifies multi-sector writes, reads,
-seeks, close, and reopen.
+conformance. The QEMU headless test creates `P1.TXT` and verifies
+multi-sector writes, reads, seeks, close, and reopen.
 
-`tools/mkfat12.py` puts the assembled `HAKU.ELF` test program on a generated
-1.44 MB FAT12 image. QEMU attaches this image as the primary-master IDE disk
-while the existing boot floppy still starts the kernel. At startup, the
-kernel reads the ELF file into temporary heap memory, loads it into separate
-user address spaces and releases the temporary buffer.
+`tools/mkfat12.py` puts `HAKU.ELF` and the exec target `NEXT.ELF` on a
+generated 1.44 MB FAT12 image. QEMU attaches this image as the primary-master
+IDE disk while the existing boot floppy still starts the kernel. The kernel
+loads the initial ELF at startup; `execve` uses VFS to load subsequent ELF
+files from the disk into a fresh address space before replacing the current
+image.
 
 ### ELF32 program loading
 
@@ -264,7 +272,8 @@ Haku/
   boot/stage2.asm      CHS kernel loader (up to 448 KiB) → A20 → GDT → protected mode
   kernel/entry.asm     32-bit entry stub (_entry, linked first via /ENTRY)
   kernel/isr.asm       interrupt stubs, GDT/TSS load, ring-3 transition + syscalls
-  kernel/user.asm      minimal ELF32 ring-3 test program
+  kernel/user.asm      ELF32 initial process and syscall integration test
+  kernel/exec_target.asm second ELF32 image for execve tests
   kernel/ata.h/.c      primary-master ATA LBA28 polling PIO driver
   kernel/fat12.h/.c    writable FAT12 root-directory file operations
   kernel/fat12_vfs.h/.c FAT12 backend: vfs_fs_ops vector + errno translation

@@ -226,3 +226,49 @@ int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
     }
     return 1;
 }
+
+int paging_copy_to_user_space(const address_space_t *space,
+                              uint32_t virtual_addr, const void *source,
+                              uint32_t length) {
+    const uint8_t *input = (const uint8_t *)source;
+    uint32_t directory_phys;
+    uint32_t copied = 0;
+    uint32_t end;
+    uint32_t *directory;
+
+    if (!space || !space->directory_phys || (!source && length) ||
+        virtual_addr < 0x40000000u ||
+        virtual_addr >= PAGING_USER_LIMIT ||
+        length > PAGING_USER_LIMIT - virtual_addr)
+        return 0;
+    if (!length) return 1;
+
+    directory_phys = space->directory_phys;
+    if (directory_phys >= PAGING_IDMAP_MB * 1024u * 1024u) return 0;
+    directory = (uint32_t *)directory_phys;
+    end = virtual_addr + length;
+
+    while (virtual_addr < end) {
+        uint32_t pde = directory[virtual_addr >> 22];
+        uint32_t table_phys;
+        uint32_t pte;
+        uint32_t page_offset = virtual_addr & 0xFFFu;
+        uint32_t amount = 0x1000u - page_offset;
+
+        if ((pde & (PAGE_PRESENT | PAGE_USER | PAGE_RW)) !=
+            (PAGE_PRESENT | PAGE_USER | PAGE_RW))
+            return 0;
+        table_phys = pde & 0xFFFFF000u;
+        if (table_phys >= PAGING_IDMAP_MB * 1024u * 1024u) return 0;
+        pte = ((uint32_t *)table_phys)[(virtual_addr >> 12) & 0x3FFu];
+        if ((pte & (PAGE_PRESENT | PAGE_USER | PAGE_RW)) !=
+            (PAGE_PRESENT | PAGE_USER | PAGE_RW))
+            return 0;
+        if (amount > end - virtual_addr) amount = end - virtual_addr;
+        memcpy((void *)((pte & 0xFFFFF000u) + page_offset),
+               input + copied, amount);
+        virtual_addr += amount;
+        copied += amount;
+    }
+    return 1;
+}

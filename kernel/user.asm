@@ -11,6 +11,7 @@
 %define SYS_CLOSE  6
 %define SYS_READ   3
 %define SYS_WRITE  4
+%define SYS_EXECVE 11
 %define SYS_UNLINK 10
 %define SYS_LSEEK 19
 %define SYS_GETPID 20
@@ -963,9 +964,74 @@ _user_program_start:
     cmp eax, edx
     jne .fail
 
-    mov eax, SYS_EXIT
-    xor ebx, ebx
+    ; Failed exec attempts must leave this process image intact.
+    mov esi, 60
+    mov eax, SYS_EXECVE
+    mov ebx, 0x1000             ; unmapped pathname
+    xor ecx, ecx
+    xor edx, edx
     int 0x80
+    cmp eax, -14
+    jne .fail
+    mov eax, SYS_EXECVE
+    mov ebx, USER_DATA_BASE + (missing_exec_path - data_start)
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    cmp eax, -2
+    jne .fail
+    mov eax, SYS_EXECVE
+    mov ebx, USER_DATA_BASE + (exec_path - data_start)
+    mov ecx, 0x1000
+    xor edx, edx
+    int 0x80
+    cmp eax, -14
+    jne .fail
+    mov eax, SYS_EXECVE
+    mov ebx, USER_DATA_BASE + (exec_path - data_start)
+    mov ecx, USER_DATA_BASE + (exec_bad_argv - data_start)
+    xor edx, edx
+    int 0x80
+    cmp eax, -14
+    jne .fail
+    mov eax, SYS_EXECVE
+    mov ebx, USER_DATA_BASE + (exec_path - data_start)
+    mov ecx, USER_DATA_BASE + (exec_argv - data_start)
+    mov edx, 0x1000
+    int 0x80
+    cmp eax, -14
+    jne .fail
+    mov eax, SYS_EXECVE
+    mov ebx, USER_DATA_BASE + (exec_path - data_start)
+    mov ecx, USER_DATA_BASE + (exec_many_argv - data_start)
+    xor edx, edx
+    int 0x80
+    cmp eax, -7
+    jne .fail
+    mov eax, SYS_EXECVE
+    mov ebx, USER_DATA_BASE + (exec_path - data_start)
+    mov ecx, USER_DATA_BASE + (exec_large_argv - data_start)
+    xor edx, edx
+    int 0x80
+    cmp eax, -7
+    jne .fail
+
+    ; Keep one open file across exec. The replacement ELF validates fd 3.
+    mov eax, SYS_OPEN
+    mov ebx, USER_DATA_BASE + (exec_preserved_path - data_start)
+    xor ecx, ecx                ; O_RDONLY
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jne .fail
+    mov eax, SYS_EXECVE
+    mov ebx, USER_DATA_BASE + (exec_path - data_start)
+    mov ecx, USER_DATA_BASE + (exec_argv - data_start)
+    mov edx, USER_DATA_BASE + (exec_envp - data_start)
+    int 0x80
+    ; A successful execve never resumes this instruction.
+    mov esi, 61
+    jmp .fail
 .hang:
     jmp .hang
 
@@ -1046,6 +1112,48 @@ dup_buf:
     times 4 db 0
 stat_buf:
     times 8 db 0
+exec_path:
+    db "NEXT.ELF", 0
+exec_preserved_path:
+    db "HAKU.ELF", 0
+missing_exec_path:
+    db "NOFILE.ELF", 0
+exec_bad_argv:
+    dd 0x1000, 0
+exec_many_argv:
+%rep 65
+    dd USER_DATA_BASE + (exec_empty_arg - data_start)
+%endrep
+    dd 0
+exec_large_argv:
+%rep 64
+    dd USER_DATA_BASE + (exec_long_arg - data_start)
+%endrep
+    dd 0
+exec_argv:
+    dd USER_DATA_BASE + (exec_arg0 - data_start)
+    dd USER_DATA_BASE + (exec_arg1 - data_start)
+    dd USER_DATA_BASE + (exec_arg2 - data_start)
+    dd 0
+exec_envp:
+    dd USER_DATA_BASE + (exec_env0 - data_start)
+    dd USER_DATA_BASE + (exec_env1 - data_start)
+    dd 0
+exec_arg0:
+    db "NEXT.ELF", 0
+exec_arg1:
+    db "arg one", 0
+exec_arg2:
+    db "arg two", 0
+exec_env0:
+    db "MODE=exec-test", 0
+exec_env1:
+    db "EMPTY=", 0
+exec_empty_arg:
+    db 0
+exec_long_arg:
+    times 64 db 'X'
+    db 0
 append_payload:
     db 'B'
 file_payload:

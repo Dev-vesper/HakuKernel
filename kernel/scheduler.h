@@ -6,11 +6,12 @@
 
 #define SCHEDULER_MAX_PROCESSES 4u
 
-int scheduler_init(loaded_elf_t *programs, uint32_t count);
+int scheduler_init(loaded_elf_t *initial_program);
 int scheduler_user_tasks_done(void);
 void scheduler_start(void);
 regs_t *scheduler_preempt(regs_t *frame);
 regs_t *scheduler_exit_current(regs_t *frame);
+int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame);
 uint32_t scheduler_current_pid(void);
 
 #endif

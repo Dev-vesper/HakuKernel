@@ -16,6 +16,7 @@
 #define SYS_CLOSE 6u
 #define SYS_READ  3u
 #define SYS_WRITE 4u
+#define SYS_EXECVE 11u
 #define SYS_UNLINK 10u
 #define SYS_LSEEK 19u
 #define SYS_GETPID 20u
@@ -31,12 +32,15 @@
 /* Raw syscall errors are returned as -errno; a future libc sets errno. */
 #define HAKU_ENOENT 2u
 #define HAKU_EIO    5u
+#define HAKU_ENOEXEC 8u
 #define HAKU_EBADF  9u
 #define HAKU_EFAULT 14u
+#define HAKU_ENOMEM 12u
 #define HAKU_EEXIST 17u
 #define HAKU_EINVAL 22u
 #define HAKU_EMFILE 24u
 #define HAKU_ENOSPC 28u
+#define HAKU_E2BIG 7u
 #define HAKU_ENAMETOOLONG 36u
 #define HAKU_ENOSYS 38u
 
