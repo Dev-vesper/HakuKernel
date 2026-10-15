@@ -1,6 +1,6 @@
-<p align="center">
-# Haku v0.1 — a tiny x86 operating system in C
-</p>
+<h1 align="center">
+ Haku v0.1 — a tiny x86 operating system in C
+</h1>
 
 Bootloader (NASM) loads a C kernel and switches the CPU to 32-bit protected
 mode. The kernel initializes paging, interrupts and a GDT/TSS, then reads
