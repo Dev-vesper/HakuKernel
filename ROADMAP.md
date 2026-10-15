@@ -96,7 +96,7 @@ tested, and common FAT tools can still read the disk image.
   the parent's descriptors, and exit releases them).
 - [x] Add `dup`/`dup2` with a shared, refcounted open-file-description
   (`USER-DUP-OK`: shared offset, surviving duplicate, EBADF cases).
-- [ ] Add limited `brk`/`mmap`.
+- [x] Add limited `brk`/`mmap`.
 - [x] Add time syscalls such as `gettimeofday`/`nanosleep` (`gettimeofday`
   reads the PIT tick counter; `nanosleep` parks the task until its wake tick
   in the timer IRQ instead of busy-waiting; `USER-TIME-OK`).

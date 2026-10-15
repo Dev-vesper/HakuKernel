@@ -12,8 +12,10 @@
 %define HAKU_SYS_GETPID  20
 %define HAKU_SYS_RENAME  38
 %define HAKU_SYS_DUP     41
+%define HAKU_SYS_BRK     45
 %define HAKU_SYS_DUP2    63
 %define HAKU_SYS_GETTIMEOFDAY 78
+%define HAKU_SYS_MMAP    90
 %define HAKU_SYS_STAT    106
 %define HAKU_SYS_FSTAT   108
 %define HAKU_SYS_NANOSLEEP    162
@@ -55,6 +57,15 @@
 %define HAKU_NSEC_PER_SEC  1000000000
 %define HAKU_TIMEVAL_SIZE  8
 %define HAKU_TIMESPEC_SIZE 8
+%define HAKU_PROT_NONE  0x0
+%define HAKU_PROT_READ  0x1
+%define HAKU_PROT_WRITE 0x2
+%define HAKU_PROT_EXEC  0x4
+%define HAKU_MAP_SHARED    0x01
+%define HAKU_MAP_PRIVATE   0x02
+%define HAKU_MAP_FIXED     0x10
+%define HAKU_MAP_ANONYMOUS 0x20
+%define HAKU_MMAP_ARG_SIZE 24
 
 ; Names kept for the existing assembly integration programs.
 %define SYS_EXIT    HAKU_SYS_EXIT
@@ -69,7 +80,9 @@
 %define SYS_GETPID  HAKU_SYS_GETPID
 %define SYS_RENAME  HAKU_SYS_RENAME
 %define SYS_DUP     HAKU_SYS_DUP
+%define SYS_BRK     HAKU_SYS_BRK
 %define SYS_DUP2    HAKU_SYS_DUP2
+%define SYS_MMAP    HAKU_SYS_MMAP
 %define SYS_STAT    HAKU_SYS_STAT
 %define SYS_FSTAT   HAKU_SYS_FSTAT
 %define SYS_GETTIMEOFDAY HAKU_SYS_GETTIMEOFDAY

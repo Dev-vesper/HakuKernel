@@ -6,6 +6,7 @@
 #include "klog.h"
 #include "paging.h"
 #include "pit.h"
+#include "usermode.h"
 #include "vfs.h"
 
 #define TASK_KERNEL_STACK_PAGES 2u
@@ -30,6 +31,9 @@ typedef struct {
     uint32_t wait_pid;
     uint32_t wait_status_user;
     uint32_t wake_tick;
+    uint32_t heap_brk;    /* current program break (0 = not yet used) */
+    uint32_t heap_top;    /* highest heap page ever mapped (grow only) */
+    uint32_t mmap_next;   /* next anonymous mmap address (0 = not yet used) */
 } task_t;
 
 #define SCHEDULER_IDLE_INDEX ((int)SCHEDULER_MAX_PROCESSES)
@@ -330,6 +334,10 @@ int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
     previous = task->program;
     task->program = *replacement;
     replacement->address_space.directory_phys = 0;
+    /* A fresh image starts with a fresh, lazily-mapped heap. */
+    task->heap_brk = 0;
+    task->heap_top = 0;
+    task->mmap_next = 0;
 
     frame->gs = USER_DS;
     frame->fs = USER_DS;
@@ -521,4 +529,81 @@ regs_t *scheduler_sleep_ticks(uint32_t ticks, regs_t *frame) {
      * when the isr return path executes iret. */
     return next == SCHEDULER_IDLE_INDEX ? idle_task.frame :
                                           tasks[next].frame;
+}
+
+/* Map [start, end) as zero-filled, user-writable pages in the given
+ * address space (page-aligned range). Caller holds no locks; a partial
+ * failure leaves the pages already mapped, which the address-space
+ * teardown reclaims when the process exits. */
+static int map_user_zero_pages(address_space_t *space, uint32_t start,
+                               uint32_t end) {
+    for (uint32_t address = start; address < end; address += USER_PAGE_SIZE) {
+        void *page = frame_alloc();
+        if (!page) return 0;
+        memset(page, 0, USER_PAGE_SIZE);
+        if (!paging_map_user_page(space, address, (uint32_t)page, 1)) {
+            frame_free(page);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* brk(2) with a fixed heap region: grow the per-process break, mapping
+ * zero-filled pages as it rises. The break is page-rounded and never
+ * returns below USER_HEAP_BASE. A zero request just queries the current
+ * break; an invalid size returns -EINVAL/-ENOMEM. */
+uint32_t scheduler_brk(uint32_t requested) {
+    task_t *task;
+    address_space_t *space;
+    uint32_t current;
+    uint32_t rounded;
+
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0u - HAKU_EINVAL;
+    task = &tasks[current_task];
+    space = &task->program.address_space;
+    if (!space->directory_phys) return 0u - HAKU_EINVAL;
+    if (task->heap_brk == 0) task->heap_brk = USER_HEAP_BASE;
+    if (task->heap_top == 0) task->heap_top = USER_HEAP_BASE;
+    current = task->heap_brk;
+    if (requested == 0) return current;
+    if (requested < USER_HEAP_BASE) return 0u - HAKU_EINVAL;
+    if (requested > USER_HEAP_LIMIT) return 0u - HAKU_ENOMEM;
+
+    rounded = (requested + USER_PAGE_SIZE - 1u) & 0xFFFFF000u;
+    if (rounded > task->heap_top) {
+        if (!map_user_zero_pages(space, task->heap_top, rounded))
+            return 0u - HAKU_ENOMEM;
+        task->heap_top = rounded;
+    }
+    task->heap_brk = rounded;
+    return rounded;
+}
+
+/* Limited mmap(2): anonymous private pages from a per-process bump
+ * region, always zero-filled and writable. Returns the mapped base
+ * address or -errno. */
+uint32_t scheduler_mmap(uint32_t length) {
+    task_t *task;
+    address_space_t *space;
+    uint32_t rounded;
+    uint32_t base;
+
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0u - HAKU_EINVAL;
+    if (length == 0 || length > USER_MMAP_LIMIT - USER_MMAP_BASE)
+        return 0u - (length == 0 ? HAKU_EINVAL : HAKU_ENOMEM);
+    task = &tasks[current_task];
+    space = &task->program.address_space;
+    if (!space->directory_phys) return 0u - HAKU_EINVAL;
+    if (task->mmap_next == 0) task->mmap_next = USER_MMAP_BASE;
+
+    rounded = (length + USER_PAGE_SIZE - 1u) & 0xFFFFF000u;
+    base = task->mmap_next;
+    if (base > USER_MMAP_LIMIT - rounded) return 0u - HAKU_ENOMEM;
+    if (!map_user_zero_pages(space, base, base + rounded))
+        return 0u - HAKU_ENOMEM;
+    task->mmap_next = base + rounded;
+    return base;
 }

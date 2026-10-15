@@ -599,6 +599,22 @@ static regs_t *sys_nanosleep(regs_t *frame, uint32_t user_req,
     return scheduler_sleep_ticks(ticks, frame);
 }
 
+/* Limited mmap(2) via the i386 old_mmap argument block. Only address 0
+ * (kernel-chosen placement), read/write protection, anonymous private
+ * mappings, and offset 0 are accepted; the file descriptor is ignored. */
+static uint32_t sys_mmap(uint32_t user_arg) {
+    uint32_t arg[HAKU_MMAP_ARG_SIZE / sizeof(uint32_t)];
+
+    if (!copy_from_user(arg, user_arg, sizeof(arg)))
+        return copy_from_user_error(HAKU_EFAULT);
+    if (arg[0] != 0u ||
+        (arg[2] & ~(uint32_t)(HAKU_PROT_READ | HAKU_PROT_WRITE)) != 0u ||
+        arg[3] != (uint32_t)(HAKU_MAP_PRIVATE | HAKU_MAP_ANONYMOUS) ||
+        arg[5] != 0u)
+        return copy_from_user_error(HAKU_EINVAL);
+    return scheduler_mmap(arg[1]);
+}
+
 regs_t *user_syscall(regs_t *r) {
     switch (r->eax) {
     case HAKU_SYS_EXIT:
@@ -645,6 +661,12 @@ regs_t *user_syscall(regs_t *r) {
         return r;
     case HAKU_SYS_DUP2:
         r->eax = (uint32_t)vfs_dup2(scheduler_current_pid(), r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_BRK:
+        r->eax = scheduler_brk(r->ebx);
+        return r;
+    case HAKU_SYS_MMAP:
+        r->eax = sys_mmap(r->ebx);
         return r;
     case HAKU_SYS_STAT:
         r->eax = sys_stat(r->ebx, r->ecx);

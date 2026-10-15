@@ -17,8 +17,11 @@
 #define HAKU_SYS_GETPID  20u
 #define HAKU_SYS_RENAME  38u
 #define HAKU_SYS_DUP     41u
+#define HAKU_SYS_BRK     45u
 #define HAKU_SYS_DUP2    63u
 #define HAKU_SYS_GETTIMEOFDAY 78u
+/* i386 old_mmap: a single pointer to haku_mmap_arg_t in ebx. */
+#define HAKU_SYS_MMAP    90u
 #define HAKU_SYS_STAT    106u
 #define HAKU_SYS_FSTAT   108u
 #define HAKU_SYS_NANOSLEEP    162u
@@ -68,6 +71,18 @@
 #define HAKU_TIMEVAL_SIZE  8u
 #define HAKU_TIMESPEC_SIZE 8u
 
+/* mmap(2) protection and mapping flags. Only anonymous private mappings
+ * are supported today; the values match Linux. */
+#define HAKU_PROT_NONE  0x0u
+#define HAKU_PROT_READ  0x1u
+#define HAKU_PROT_WRITE 0x2u
+#define HAKU_PROT_EXEC  0x4u
+#define HAKU_MAP_SHARED    0x01u
+#define HAKU_MAP_PRIVATE   0x02u
+#define HAKU_MAP_FIXED     0x10u
+#define HAKU_MAP_ANONYMOUS 0x20u
+#define HAKU_MMAP_ARG_SIZE 24u
+
 typedef unsigned int haku_u32;
 
 /* stat/fstat user buffer layout; fields are fixed-width 32-bit values. */
@@ -88,6 +103,16 @@ typedef struct {
     haku_u32 tv_nsec;
 } haku_timespec_t;
 
+/* mmap(2) argument block (i386 old_mmap ABI). */
+typedef struct {
+    haku_u32 addr;
+    haku_u32 length;
+    haku_u32 prot;
+    haku_u32 flags;
+    haku_u32 fd;
+    haku_u32 offset;
+} haku_mmap_arg_t;
+
 typedef char haku_u32_must_be_32_bits[(sizeof(haku_u32) == 4u) ? 1 : -1];
 typedef char haku_stat_must_be_8_bytes[
     (sizeof(haku_stat_t) == HAKU_STAT_SIZE) ? 1 : -1];
@@ -95,5 +120,7 @@ typedef char haku_timeval_must_be_8_bytes[
     (sizeof(haku_timeval_t) == HAKU_TIMEVAL_SIZE) ? 1 : -1];
 typedef char haku_timespec_must_be_8_bytes[
     (sizeof(haku_timespec_t) == HAKU_TIMESPEC_SIZE) ? 1 : -1];
+typedef char haku_mmap_arg_must_be_24_bytes[
+    (sizeof(haku_mmap_arg_t) == HAKU_MMAP_ARG_SIZE) ? 1 : -1];
 
 #endif

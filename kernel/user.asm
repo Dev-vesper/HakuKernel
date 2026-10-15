@@ -1270,6 +1270,93 @@ _user_program_start:
     cmp eax, edx
     jne .fail
 
+    ; brk grows a zero-filled heap; mmap maps anonymous zeroed pages.
+    mov esi, 84
+    mov eax, SYS_BRK
+    xor ebx, ebx                ; query the initial program break
+    int 0x80
+    cmp eax, 0x50000000
+    jne .fail
+    mov [USER_DATA_BASE + (brk_base - data_start)], eax
+    mov esi, 85
+    mov eax, SYS_BRK
+    mov ebx, [USER_DATA_BASE + (brk_base - data_start)]
+    add ebx, 0x2000
+    int 0x80
+    mov edx, [USER_DATA_BASE + (brk_base - data_start)]
+    add edx, 0x2000
+    cmp eax, edx
+    jne .fail
+    mov esi, 86
+    mov edi, [USER_DATA_BASE + (brk_base - data_start)]
+    cmp dword [edi], 0          ; freshly grown pages read as zero
+    jne .fail
+    cmp dword [edi + 0xFFC], 0
+    jne .fail
+    mov dword [edi], 0xDEADBEEF ; and are writable
+    cmp dword [edi], 0xDEADBEEF
+    jne .fail
+    mov esi, 87                 ; a break below the heap base is invalid
+    mov eax, SYS_BRK
+    mov ebx, 0x40000000
+    int 0x80
+    cmp eax, -22
+    jne .fail
+    mov esi, 88                 ; a break past the heap limit is out of memory
+    mov eax, SYS_BRK
+    mov ebx, 0x54001000
+    int 0x80
+    cmp eax, -12
+    jne .fail
+    mov esi, 89
+    mov eax, SYS_MMAP
+    mov ebx, USER_DATA_BASE + (mmap_arg - data_start)
+    int 0x80
+    cmp eax, 0x60000000
+    jne .fail
+    mov [USER_DATA_BASE + (mmap_first - data_start)], eax
+    mov esi, 90
+    mov edi, eax
+    cmp dword [edi], 0          ; anonymous page reads as zero
+    jne .fail
+    mov dword [edi], 0x12345678 ; and is writable
+    cmp dword [edi], 0x12345678
+    jne .fail
+    mov esi, 91
+    mov eax, SYS_MMAP
+    mov ebx, USER_DATA_BASE + (mmap_arg - data_start)
+    int 0x80
+    mov edx, [USER_DATA_BASE + (mmap_first - data_start)]
+    add edx, 0x1000
+    cmp eax, edx                ; the next mapping follows the first
+    jne .fail
+    mov esi, 92
+    mov eax, SYS_MMAP
+    mov ebx, USER_DATA_BASE + (mmap_bad_len - data_start)
+    int 0x80
+    cmp eax, -22
+    jne .fail
+    mov esi, 93
+    mov eax, SYS_MMAP
+    mov ebx, USER_DATA_BASE + (mmap_bad_flags - data_start)
+    int 0x80
+    cmp eax, -22
+    jne .fail
+    mov esi, 94
+    mov eax, SYS_MMAP
+    xor ebx, ebx                ; NULL argument block
+    int 0x80
+    cmp eax, -14
+    jne .fail
+    mov esi, 95
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (mem_message - data_start)
+    mov edx, mem_message_end - mem_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
     ; Failed exec attempts must leave this process image intact.
     mov esi, 61
     mov eax, SYS_EXECVE
@@ -1462,6 +1549,19 @@ timespec_bad:
 time_message:
     db "USER-TIME-OK gettimeofday and nanosleep advance", 10
 time_message_end:
+brk_base:
+    dd 0
+mmap_first:
+    dd 0
+mmap_arg:
+    dd 0, 0x1000, HAKU_PROT_READ | HAKU_PROT_WRITE, HAKU_MAP_PRIVATE | HAKU_MAP_ANONYMOUS, -1, 0
+mmap_bad_len:
+    dd 0, 0, HAKU_PROT_READ | HAKU_PROT_WRITE, HAKU_MAP_PRIVATE | HAKU_MAP_ANONYMOUS, -1, 0
+mmap_bad_flags:
+    dd 0, 0x1000, HAKU_PROT_READ | HAKU_PROT_WRITE, HAKU_MAP_PRIVATE, -1, 0
+mem_message:
+    db "USER-MEM-OK brk grows a heap and mmap maps anonymous pages", 10
+mem_message_end:
 stat_buf:
     times 8 db 0
 exec_path:
