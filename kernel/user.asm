@@ -3,7 +3,7 @@
 [org 0]
 
 %define USER_CODE_BASE 0x40000000
-%define USER_DATA_BASE 0x40001000
+%define USER_DATA_BASE 0x40002000
 %define USER_STACK_TOP 0xC0000000
 
 %include "haku/abi.inc"
@@ -25,12 +25,13 @@
     dw 40, 0, 0                   ; no section headers
 
 ; RX code segment: file offset 0x1000, virtual address 0x40000000.
+; Two 4 KiB pages are reserved for the code so the tests can grow.
     dd 1, 0x1000, USER_CODE_BASE, USER_CODE_BASE
     dd code_end - code_start, code_end - code_start
     dd 5, 0x1000
 
-; RW data segment: file offset 0x2000, virtual address 0x40001000.
-    dd 1, 0x2000, USER_DATA_BASE, USER_DATA_BASE
+; RW data segment: file offset 0x3000, virtual address 0x40002000.
+    dd 1, 0x3000, USER_DATA_BASE, USER_DATA_BASE
     dd data_file_end - data_start, data_end - data_start
     dd 6, 0x1000
 
@@ -948,6 +949,123 @@ _user_program_start:
     cmp eax, edx
     jne .fail
 
+    ; Standard descriptors 0/1/2 are real per-process handles backed by the
+    ; console device, so dup2 can redirect them (a shell-style redirect) and
+    ; close() makes them unusable (EBADF) until dup2 restores them.
+    mov esi, 70
+    mov eax, SYS_OPEN
+    mov ebx, USER_DATA_BASE + (stdio_path - data_start)
+    mov ecx, 0x242             ; O_CREAT | O_RDWR | O_TRUNC
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jb .fail
+    mov [USER_DATA_BASE + (stdio_fd - data_start)], eax
+
+    ; save stdout, then point fd 1 at the file.
+    mov eax, SYS_DUP
+    mov ebx, 1
+    int 0x80
+    cmp eax, 3
+    jb .fail
+    mov [USER_DATA_BASE + (stdio_saved - data_start)], eax
+    mov eax, SYS_DUP2
+    mov ebx, [USER_DATA_BASE + (stdio_fd - data_start)]
+    mov ecx, 1
+    int 0x80
+    cmp eax, 1
+    jne .fail
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (stdio_payload - data_start)
+    mov edx, stdio_payload_end - stdio_payload
+    int 0x80
+    cmp eax, stdio_payload_end - stdio_payload
+    jne .fail
+
+    ; restore stdout, then prove the redirected bytes landed in the file.
+    mov eax, SYS_DUP2
+    mov ebx, [USER_DATA_BASE + (stdio_saved - data_start)]
+    mov ecx, 1
+    int 0x80
+    cmp eax, 1
+    jne .fail
+    mov eax, SYS_CLOSE
+    mov ebx, [USER_DATA_BASE + (stdio_saved - data_start)]
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_LSEEK
+    mov ebx, [USER_DATA_BASE + (stdio_fd - data_start)]
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_READ
+    mov ebx, [USER_DATA_BASE + (stdio_fd - data_start)]
+    mov ecx, USER_DATA_BASE + (stdio_buf - data_start)
+    mov edx, stdio_payload_end - stdio_payload
+    int 0x80
+    cmp eax, stdio_payload_end - stdio_payload
+    jne .fail
+    push esi
+    push edi
+    mov esi, USER_DATA_BASE + (stdio_payload - data_start)
+    mov edi, USER_DATA_BASE + (stdio_buf - data_start)
+    mov ecx, stdio_payload_end - stdio_payload
+    cld
+    repe cmpsb
+    pop edi
+    pop esi
+    jne .fail
+    mov eax, SYS_CLOSE
+    mov ebx, [USER_DATA_BASE + (stdio_fd - data_start)]
+    int 0x80
+    test eax, eax
+    jne .fail
+
+    ; A closed standard descriptor is unusable (EBADF) until dup2 restores it.
+    mov esi, 71
+    mov eax, SYS_DUP
+    mov ebx, 1
+    int 0x80
+    cmp eax, 3
+    jb .fail
+    mov [USER_DATA_BASE + (stdio_saved - data_start)], eax
+    mov eax, SYS_CLOSE
+    mov ebx, 1
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (stdio_payload - data_start)
+    mov edx, 1
+    int 0x80
+    cmp eax, -9                ; EBADF: stdout is closed
+    jne .fail
+    mov eax, SYS_DUP2
+    mov ebx, [USER_DATA_BASE + (stdio_saved - data_start)]
+    mov ecx, 1
+    int 0x80
+    cmp eax, 1
+    jne .fail
+    mov eax, SYS_CLOSE
+    mov ebx, [USER_DATA_BASE + (stdio_saved - data_start)]
+    int 0x80
+    test eax, eax
+    jne .fail
+
+    mov esi, 72
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (stdio_message - data_start)
+    mov edx, stdio_message_end - stdio_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
     ; waitpid validates options and user status pointers before blocking.
     mov esi, 59
     mov eax, SYS_WAITPID
@@ -970,6 +1088,31 @@ _user_program_start:
     mov edx, 1
     int 0x80
     cmp eax, -22              ; EINVAL
+    jne .fail
+
+    ; Open a file and leave it at fd 3 so the spawned child inherits it.
+    mov esi, 73
+    mov eax, SYS_OPEN
+    mov ebx, USER_DATA_BASE + (inherit_path - data_start)
+    mov ecx, 0x242             ; O_CREAT | O_RDWR | O_TRUNC
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jne .fail
+    mov edi, eax
+    mov eax, SYS_WRITE
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (inherit_payload - data_start)
+    mov edx, inherit_payload_end - inherit_payload
+    int 0x80
+    cmp eax, inherit_payload_end - inherit_payload
+    jne .fail
+    mov eax, SYS_LSEEK
+    mov ebx, edi
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    test eax, eax
     jne .fail
 
     mov eax, SYS_SPAWN
@@ -999,6 +1142,53 @@ _user_program_start:
     mov ebx, 1
     mov ecx, USER_DATA_BASE + (waitpid_message - data_start)
     mov edx, waitpid_message_end - waitpid_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
+    ; The child inherited fd 3, read it, and closed it. The parent's copy is
+    ; still usable because both descriptors shared one open file description,
+    ; and the child's descriptors were all released when it exited.
+    mov esi, 74
+    mov eax, SYS_LSEEK
+    mov ebx, edi
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_READ
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (inherit_buf - data_start)
+    mov edx, inherit_payload_end - inherit_payload
+    int 0x80
+    cmp eax, inherit_payload_end - inherit_payload
+    jne .fail
+    push esi
+    push edi
+    mov esi, USER_DATA_BASE + (inherit_payload - data_start)
+    mov edi, USER_DATA_BASE + (inherit_buf - data_start)
+    mov ecx, inherit_payload_end - inherit_payload
+    cld
+    repe cmpsb
+    pop edi
+    pop esi
+    jne .fail
+    mov esi, 75
+    mov eax, SYS_CLOSE
+    mov ebx, edi
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_UNLINK
+    mov ebx, USER_DATA_BASE + (inherit_path - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (inherit_message - data_start)
+    mov edx, inherit_message_end - inherit_message
     int 0x80
     cmp eax, edx
     jne .fail
@@ -1086,7 +1276,7 @@ _user_program_start:
     jmp .hang
 code_end:
 
-    times 0x2000 - ($ - $$) db 0
+    times 0x3000 - ($ - $$) db 0
 data_start:
 startup_message:
     db "USERMODE-OK ELF32 RX/RW + POSIX-style file syscalls", 10
@@ -1158,6 +1348,30 @@ dup_fd_b:
     dd 0
 dup_buf:
     times 4 db 0
+stdio_path:
+    db "S1.TXT", 0
+stdio_fd:
+    dd 0
+stdio_saved:
+    dd 0
+stdio_payload:
+    db "STDIO-REDIRECT-PAYLOAD"
+stdio_payload_end:
+stdio_buf:
+    times stdio_payload_end - stdio_payload db 0
+stdio_message:
+    db "USER-STDIO-OK stdio 0/1/2 redirect, close, restore", 10
+stdio_message_end:
+inherit_path:
+    db "I1.TXT", 0
+inherit_payload:
+    db "INHERITED-FD"
+inherit_payload_end:
+inherit_buf:
+    times inherit_payload_end - inherit_payload db 0
+inherit_message:
+    db "USER-FD-INHERIT-OK child shared inherited fd 3", 10
+inherit_message_end:
 stat_buf:
     times 8 db 0
 exec_path:

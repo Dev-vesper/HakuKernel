@@ -53,13 +53,38 @@ typedef struct vfs_fs_ops {
     int32_t (*fstat)(void *handle, vfs_stat_t *out);
 } vfs_fs_ops_t;
 
+/* Character-device backend for the standard descriptors 0/1/2. These are
+ * not path-openable: VFS installs one for stdio and dup/dup2 may redirect
+ * it. read/write return 1 or a negative -VFS_E* errno and report the
+ * transferred byte count via out_count; a device may block (console input
+ * does) so VFS calls them without masking interrupts. Devices do not seek
+ * or stat, so those operations fail with EINVAL. */
+typedef struct vfs_device_ops {
+    const char *name;
+    int32_t (*read)(void *buffer, uint32_t count, uint32_t *out_count);
+    int32_t (*write)(const void *buffer, uint32_t count,
+                     uint32_t *out_count);
+} vfs_device_ops_t;
+
 /* Boot-time assembly: backends register here, then one is mounted as the
  * root filesystem that all descriptor operations route to. register
  * returns 1/0; mount_root returns 1 or a negative -VFS_E* errno. */
 int vfs_register_fs(const vfs_fs_ops_t *ops);
 int32_t vfs_mount_root(const char *name);
+/* Install a character device (the console) for the standard descriptors. */
+int vfs_register_device(const vfs_device_ops_t *ops);
 
 void vfs_init(void);
+/* Create the standard descriptors 0 (read console), 1 and 2 (write
+ * console) for a process. Called when a process is created; spawned
+ * children instead inherit their parent's table (see vfs_inherit). */
+int vfs_open_stdio(uint32_t pid);
+/* Copy the parent's descriptor table into the child, sharing the open
+ * file descriptions (each copy bumps the reference count). Called on
+ * spawn before the child runs. Returns 1 or a negative -VFS_E* errno. */
+int32_t vfs_inherit(uint32_t parent_pid, uint32_t child_pid);
+/* Number of descriptors currently open for a process (0..VFS_FD_COUNT). */
+uint32_t vfs_open_count(uint32_t pid);
 int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags);
 int32_t vfs_close(uint32_t pid, uint32_t fd);
 int32_t vfs_read(uint32_t pid, uint32_t fd, void *buffer, uint32_t count);
@@ -69,8 +94,9 @@ int32_t vfs_seek(uint32_t pid, uint32_t fd, int32_t offset, uint32_t whence);
 /* dup/dup2 share the open file description behind a descriptor: the copy
  * sees the same offset/access mode and keeps the file alive until the last
  * of them closes. dup returns the lowest free fd, dup2 returns newfd (or
- * closes and reuses it if already open); both return 1 or -VFS_E*. fd
- * numbers stay within the file range VFS_FIRST_FILE_FD..VFS_FD_COUNT-1. */
+ * closes and reuses it if already open); both return 1 or -VFS_E*. Any fd
+ * in 0..VFS_FD_COUNT-1 is valid, including the standard descriptors, so
+ * dup2 can redirect 0/1/2 onto a file or another handle. */
 int32_t vfs_dup(uint32_t pid, uint32_t fd);
 int32_t vfs_dup2(uint32_t pid, uint32_t oldfd, uint32_t newfd);
 /* Namespace and metadata operations. Unlink removes the name at once;

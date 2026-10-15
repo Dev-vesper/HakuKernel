@@ -111,8 +111,10 @@ allocation state so reserved pages cannot accidentally be released.
 suspends the parent until the requested child exits. Exit status is returned
 in the traditional high-byte wait status format; a successful wait reaps the
 child record. The current spawn interface accepts a pathname only and starts
-the child with empty argument and environment vectors; child file descriptors
-are not inherited. `waitpid` accepts a specific child PID or `-1` (any child)
+the child with empty argument and environment vectors; the child inherits a
+copy of the parent's descriptor table (standard descriptors and any open
+files, each sharing the parent's open file description). `waitpid` accepts a
+specific child PID or `-1` (any child)
 and currently supports only options `0`. `execve` replaces a process image
 from the root filesystem.
 Each process has its own address space and an 8 KiB ring-0 stack;
@@ -155,6 +157,9 @@ flags, and the `stat` buffer layout. `haku_stat_t` contains 32-bit `size` and
 
 `read` supports stdin from the PS/2 keyboard and regular files; `write`
 supports stdout/stderr to VGA and serial as well as writable regular files.
+The standard descriptors `0`/`1`/`2` are real per-process descriptors backed
+by a registered console device rather than special cases in the syscall
+layer: they resolve through the same VFS descriptor table as file handles.
 `open`, `close`, `lseek`, `unlink`, `rename`, `stat`, `fstat`, and per-process
 file descriptors are backed by the VFS/FAT12 layer. `stat`/`fstat` report
 byte size and mode (`S_IFREG | 0644`) through an 8-byte user buffer. Reads
@@ -204,6 +209,16 @@ both report `EBADF` for an invalid source without disturbing the target. The
 user program proves the shared offset, the surviving duplicate, and the
 error cases in both processes (`USER-DUP-OK`).
 
+Because `0`/`1`/`2` are ordinary descriptors, `dup2` can redirect stdout to a
+file (a shell-style redirect) and `close` revokes a standard descriptor so
+later I/O returns `EBADF` until `dup2` restores it. `spawn` copies the
+parent's descriptors into the child, and every exit path releases the exiting
+process's descriptors, so files a child leaves open are closed automatically
+when it terminates. The user program and its child prove the redirect,
+revoke, inherited-descriptor, and close-on-exit paths (`USER-STDIO-OK`,
+`USER-FD-INHERIT-OK`); after both processes exit, the idle self-test asserts
+their descriptor tables are empty.
+
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It
 rejects unmapped/kernel pointers, wraparound, invalid descriptors and
@@ -232,8 +247,9 @@ per-open handle allocation, errno mapping) and registers it at boot, after
 which one backend is mounted as the root filesystem. Disk I/O is serialized
 against the preemptive scheduler; file contents and directory/FAT metadata
 are written through to the ATA disk. The current VFS supports up to five
-simultaneously open regular files per process and the `O_RDONLY`,
-`O_WRONLY`, `O_RDWR`, `O_CREAT`, `O_EXCL`, `O_TRUNC`, and `O_APPEND` flags.
+simultaneously open regular files per process (descriptors 3-7; `0`/`1`/`2`
+are the console) and the `O_RDONLY`, `O_WRONLY`, `O_RDWR`, `O_CREAT`,
+`O_EXCL`, `O_TRUNC`, and `O_APPEND` flags.
 
 The filesystem remains intentionally small: no partition tables, subfolders,
 long filenames, permissions, mount points, journaling, FAT16,

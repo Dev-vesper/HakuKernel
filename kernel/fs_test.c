@@ -714,6 +714,13 @@ void fs_error_self_test(void) {
     if (test_done || !scheduler_user_tasks_done()) return;
     test_done = 1;
 
+    /* Automatic close-on-exit: by the time only the idle task runs, every
+     * process that ran (the initial program and the spawned child) must
+     * have had all of its descriptors -- standard 0/1/2 and any files --
+     * released, so their tables are empty. */
+    pass &= expect("exit-closes-fds-1", (int32_t)vfs_open_count(1), 0);
+    pass &= expect("exit-closes-fds-2", (int32_t)vfs_open_count(2), 0);
+
     /* The errno mapper itself: every FAT12 failure class must land on
      * exactly one VFS errno, unknown codes fall back to EIO. */
     pass &= expect("map-ok", fat12_map_errno(1), 0);

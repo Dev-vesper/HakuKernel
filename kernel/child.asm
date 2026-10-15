@@ -44,6 +44,31 @@ code_start:
     jne .fail
     cmp dword [esp + 16], 0
     jne .fail
+
+    ; fd 3 was inherited from the parent and holds known bytes: the child
+    ; sees the same open file description the parent does.
+    mov eax, SYS_READ
+    mov ebx, 3
+    mov ecx, USER_DATA_BASE + (inherit_check - data_start)
+    mov edx, expected_payload_end - expected_payload
+    int 0x80
+    cmp eax, expected_payload_end - expected_payload
+    jne .fail
+    mov esi, USER_DATA_BASE + (expected_payload - data_start)
+    mov edi, USER_DATA_BASE + (inherit_check - data_start)
+    mov ecx, expected_payload_end - expected_payload
+    cld
+    repe cmpsb
+    jne .fail
+
+    ; Close it: only the child's reference goes away, the parent keeps its
+    ; own copy of the shared description.
+    mov eax, SYS_CLOSE
+    mov ebx, 3
+    int 0x80
+    test eax, eax
+    jne .fail
+
     mov eax, SYS_WRITE
     mov ebx, 1
     mov ecx, USER_DATA_BASE + (child_message - data_start)
@@ -51,6 +76,30 @@ code_start:
     int 0x80
     cmp eax, child_message_end - child_message
     jne .fail
+
+    ; Exit with a descriptor still open on an unlinked file; the automatic
+    ; close-on-exit must release it (and free the removed data).
+    mov eax, SYS_OPEN
+    mov ebx, USER_DATA_BASE + (scratch_path - data_start)
+    mov ecx, 0x242             ; O_CREAT | O_RDWR | O_TRUNC
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jb .fail
+    mov edi, eax
+    mov eax, SYS_WRITE
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (child_message - data_start)
+    mov edx, 1
+    int 0x80
+    cmp eax, 1
+    jne .fail
+    mov eax, SYS_UNLINK
+    mov ebx, USER_DATA_BASE + (scratch_path - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+
     mov eax, SYS_EXIT
     mov ebx, 42
     int 0x80
@@ -69,4 +118,11 @@ data_start:
 child_message:
     db "SPAWN-CHILD-RAN", 10
 child_message_end:
+expected_payload:
+    db "INHERITED-FD"
+expected_payload_end:
+scratch_path:
+    db "KIDW.TMP", 0
+inherit_check:
+    times expected_payload_end - expected_payload db 0
 data_end:

@@ -9,14 +9,23 @@
 #define VFS_SUPPORTED_FLAGS \
     (VFS_O_ACCMODE | VFS_O_CREAT | VFS_O_EXCL | VFS_O_TRUNC | VFS_O_APPEND)
 
-/* One open file description per successful open, shared by every descriptor
- * that dup/dup2 points at it (Linux semantics): offset, access mode and the
- * backend handle live here, not in the descriptor. refs counts the
- * descriptors still referencing it; the backend handle is released only when
- * the last one closes, so a dup'd descriptor survives its sibling's close
- * and open-on-a-removed-file keeps working until the final close. */
+/* An open file description is shared by every descriptor that dup/dup2
+ * points at it (Linux semantics): offset, access mode and the backend handle
+ * live here, not in the descriptor. refs counts the descriptors still
+ * referencing it; the backend handle is released only when the last one
+ * closes, so a dup'd descriptor survives its sibling's close and
+ * open-on-a-removed-file keeps working until the final close. A description
+ * is either a regular file (ops/backend) or a character device such as the
+ * console behind the standard descriptors (device). */
+typedef enum {
+    VFS_OFD_FILE,
+    VFS_OFD_DEVICE
+} vfs_ofd_kind_t;
+
 typedef struct {
-    const vfs_fs_ops_t *ops;
+    vfs_ofd_kind_t kind;
+    const vfs_fs_ops_t *ops;        /* file backend, when kind == FILE */
+    const vfs_device_ops_t *device; /* char device, when kind == DEVICE */
     void *backend;      /* backend-allocated per-open handle */
     uint32_t accmode;   /* VFS_O_RDONLY/WRONLY/RDWR, fixed at open */
     uint32_t refs;
@@ -33,6 +42,7 @@ static vfs_ofd_t ofd_table[VFS_MAX_PROCESSES * VFS_FD_COUNT];
 static const vfs_fs_ops_t *fs_table[VFS_MAX_FS];
 static uint32_t fs_count;
 static const vfs_fs_ops_t *root_fs;
+static const vfs_device_ops_t *stdio_device;
 
 static int pid_valid(uint32_t pid) {
     return pid > 0 && pid <= VFS_MAX_PROCESSES;
@@ -55,10 +65,9 @@ static int ofd_alloc(void) {
 }
 
 /* Resolve a descriptor to its open file description, or 0 if the slot is
- * empty or out of the file range (0-2 are the stdio handles usermode.c owns). */
+ * empty or out of range. 0-2 are the standard descriptors (console). */
 static vfs_ofd_t *fd_ofd(uint32_t pid, uint32_t fd) {
-    if (!pid_valid(pid) || fd < VFS_FIRST_FILE_FD || fd >= VFS_FD_COUNT)
-        return 0;
+    if (!pid_valid(pid) || fd >= VFS_FD_COUNT) return 0;
     if (!descriptors[pid - 1u][fd].used) return 0;
     return &ofd_table[descriptors[pid - 1u][fd].ofd];
 }
@@ -67,15 +76,34 @@ static vfs_ofd_t *fd_ofd(uint32_t pid, uint32_t fd) {
  * the description is torn down only when the count hits zero. Returns the
  * backend's 1 / -VFS_E* result (1 when a sibling still holds it open). */
 static int32_t ofd_release(vfs_ofd_t *ofd) {
-    uint32_t irq_flags;
     int32_t closed = 1;
     if (--ofd->refs == 0) {
-        irq_flags = cpu_irq_save();
-        closed = ofd->ops->close(ofd->backend);
-        cpu_irq_restore(irq_flags);
+        if (ofd->kind == VFS_OFD_FILE) {
+            uint32_t irq_flags = cpu_irq_save();
+            closed = ofd->ops->close(ofd->backend);
+            cpu_irq_restore(irq_flags);
+        }
         memset(ofd, 0, sizeof(*ofd));
     }
     return closed;
+}
+
+/* Allocate a free open file description, or 0 when the table is full. */
+static vfs_ofd_t *ofd_create(vfs_ofd_kind_t kind, uint32_t accmode) {
+    int index = ofd_alloc();
+    vfs_ofd_t *ofd;
+    if (index < 0) return 0;
+    ofd = &ofd_table[index];
+    memset(ofd, 0, sizeof(*ofd));
+    ofd->kind = kind;
+    ofd->accmode = accmode;
+    ofd->refs = 1;
+    ofd->used = 1;
+    return ofd;
+}
+
+static uint32_t ofd_slot(const vfs_ofd_t *ofd) {
+    return (uint32_t)(ofd - ofd_table);
 }
 
 int vfs_register_fs(const vfs_fs_ops_t *ops) {
@@ -114,6 +142,69 @@ void vfs_init(void) {
     memset(ofd_table, 0, sizeof(ofd_table));
     fs_count = 0;
     root_fs = 0;
+    stdio_device = 0;
+}
+
+int vfs_register_device(const vfs_device_ops_t *ops) {
+    if (!ops || !ops->name || !ops->read || !ops->write) return 0;
+    if (stdio_device) return 0;
+    stdio_device = ops;
+    return 1;
+}
+
+/* Point one descriptor slot at a fresh description of the console. */
+static int stdio_bind(uint32_t pid, uint32_t fd, uint32_t accmode) {
+    vfs_ofd_t *ofd = ofd_create(VFS_OFD_DEVICE, accmode);
+    if (!ofd) return 0;
+    ofd->device = stdio_device;
+    descriptors[pid - 1u][fd].ofd = ofd_slot(ofd);
+    descriptors[pid - 1u][fd].used = 1;
+    return 1;
+}
+
+int vfs_open_stdio(uint32_t pid) {
+    if (!pid_valid(pid) || !stdio_device) return 0;
+    if (!descriptors[pid - 1u][0].used && !stdio_bind(pid, 0, VFS_O_RDONLY))
+        return 0;
+    if (!descriptors[pid - 1u][1].used && !stdio_bind(pid, 1, VFS_O_WRONLY))
+        return 0;
+    if (!descriptors[pid - 1u][2].used && !stdio_bind(pid, 2, VFS_O_WRONLY))
+        return 0;
+    return 1;
+}
+
+int32_t vfs_inherit(uint32_t parent_pid, uint32_t child_pid) {
+    uint32_t irq_flags;
+    if (!pid_valid(parent_pid) || !pid_valid(child_pid))
+        return -VFS_EINVAL;
+    if (parent_pid == child_pid) return -VFS_EINVAL;
+    irq_flags = cpu_irq_save();
+    /* A reused pid must start clean; releasing stale descriptors is a
+     * no-op when the slot was already released on its previous exit. */
+    for (uint32_t fd = 0; fd < VFS_FD_COUNT; fd++) {
+        vfs_fd_t *slot = &descriptors[child_pid - 1u][fd];
+        if (slot->used) {
+            slot->used = 0;
+            ofd_release(&ofd_table[slot->ofd]);
+        }
+    }
+    for (uint32_t fd = 0; fd < VFS_FD_COUNT; fd++) {
+        vfs_fd_t *parent = &descriptors[parent_pid - 1u][fd];
+        if (!parent->used) continue;
+        ofd_table[parent->ofd].refs++;
+        descriptors[child_pid - 1u][fd] = *parent;
+        descriptors[child_pid - 1u][fd].used = 1;
+    }
+    cpu_irq_restore(irq_flags);
+    return 1;
+}
+
+uint32_t vfs_open_count(uint32_t pid) {
+    uint32_t count = 0;
+    if (!pid_valid(pid)) return 0;
+    for (uint32_t fd = 0; fd < VFS_FD_COUNT; fd++)
+        if (descriptors[pid - 1u][fd].used) count++;
+    return count;
 }
 
 int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
@@ -142,6 +233,7 @@ int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
     cpu_irq_restore(irq_flags);
     if (opened != 1) return opened;
     ofd = &ofd_table[ofd_index];
+    ofd->kind = VFS_OFD_FILE;
     ofd->ops = root_fs;
     ofd->accmode = flags & VFS_O_ACCMODE;
     ofd->backend = handle;
@@ -157,8 +249,7 @@ int32_t vfs_close(uint32_t pid, uint32_t fd) {
     vfs_fd_t *slot;
     vfs_ofd_t *ofd;
     int32_t closed;
-    if (!pid_valid(pid) || fd < VFS_FIRST_FILE_FD || fd >= VFS_FD_COUNT)
-        return -VFS_EBADF;
+    if (!pid_valid(pid) || fd >= VFS_FD_COUNT) return -VFS_EBADF;
     slot = &descriptors[pid - 1u][fd];
     if (!slot->used) return -VFS_EBADF;
     ofd = &ofd_table[slot->ofd];
@@ -175,7 +266,7 @@ int32_t vfs_dup(uint32_t pid, uint32_t fd) {
     uint32_t irq_flags;
     ofd = fd_ofd(pid, fd);
     if (!ofd) return -VFS_EBADF;
-    for (newfd = VFS_FIRST_FILE_FD; newfd < VFS_FD_COUNT; newfd++)
+    for (newfd = 0; newfd < VFS_FD_COUNT; newfd++)
         if (!descriptors[pid - 1u][newfd].used) break;
     if (newfd == VFS_FD_COUNT) return -VFS_EMFILE;
     irq_flags = cpu_irq_save();
@@ -190,8 +281,7 @@ int32_t vfs_dup2(uint32_t pid, uint32_t oldfd, uint32_t newfd) {
     vfs_fd_t *slot;
     vfs_ofd_t *ofd;
     uint32_t irq_flags;
-    if (!pid_valid(pid) || oldfd < VFS_FIRST_FILE_FD || oldfd >= VFS_FD_COUNT ||
-        newfd < VFS_FIRST_FILE_FD || newfd >= VFS_FD_COUNT)
+    if (!pid_valid(pid) || oldfd >= VFS_FD_COUNT || newfd >= VFS_FD_COUNT)
         return -VFS_EBADF;
     if (!descriptors[pid - 1u][oldfd].used) return -VFS_EBADF;
     if (oldfd == newfd) return (int32_t)newfd;
@@ -215,15 +305,19 @@ int32_t vfs_dup2(uint32_t pid, uint32_t oldfd, uint32_t newfd) {
 int32_t vfs_read(uint32_t pid, uint32_t fd, void *buffer, uint32_t count) {
     vfs_ofd_t *ofd;
     uint32_t copied = 0;
-    uint32_t irq_flags;
     int32_t read_result;
     ofd = fd_ofd(pid, fd);
     if (!ofd) return -VFS_EBADF;
     if (ofd->accmode == VFS_O_WRONLY) return -VFS_EBADF;
     if (!buffer && count) return -VFS_EINVAL;
-    irq_flags = cpu_irq_save();
-    read_result = ofd->ops->read(ofd->backend, buffer, count, &copied);
-    cpu_irq_restore(irq_flags);
+    if (ofd->kind == VFS_OFD_DEVICE) {
+        /* Devices may block (console input), so IRQs stay enabled. */
+        read_result = ofd->device->read(buffer, count, &copied);
+    } else {
+        uint32_t irq_flags = cpu_irq_save();
+        read_result = ofd->ops->read(ofd->backend, buffer, count, &copied);
+        cpu_irq_restore(irq_flags);
+    }
     if (copied) return (int32_t)copied;
     if (read_result == 1) return 0;
     return read_result;
@@ -233,15 +327,18 @@ int32_t vfs_write(uint32_t pid, uint32_t fd, const void *buffer,
                   uint32_t count) {
     vfs_ofd_t *ofd;
     uint32_t written = 0;
-    uint32_t irq_flags;
     int32_t write_result;
     ofd = fd_ofd(pid, fd);
     if (!ofd) return -VFS_EBADF;
     if (ofd->accmode == VFS_O_RDONLY) return -VFS_EBADF;
     if (!buffer && count) return -VFS_EINVAL;
-    irq_flags = cpu_irq_save();
-    write_result = ofd->ops->write(ofd->backend, buffer, count, &written);
-    cpu_irq_restore(irq_flags);
+    if (ofd->kind == VFS_OFD_DEVICE) {
+        write_result = ofd->device->write(buffer, count, &written);
+    } else {
+        uint32_t irq_flags = cpu_irq_save();
+        write_result = ofd->ops->write(ofd->backend, buffer, count, &written);
+        cpu_irq_restore(irq_flags);
+    }
     if (written) return (int32_t)written;
     if (write_result == 1) return 0;
     return write_result;
@@ -255,6 +352,7 @@ int32_t vfs_seek(uint32_t pid, uint32_t fd, int32_t offset,
     int32_t moved;
     ofd = fd_ofd(pid, fd);
     if (!ofd) return -VFS_EBADF;
+    if (ofd->kind != VFS_OFD_FILE) return -VFS_EINVAL;
     irq_flags = cpu_irq_save();
     moved = ofd->ops->seek(ofd->backend, offset, whence, &position);
     cpu_irq_restore(irq_flags);
@@ -303,6 +401,7 @@ int32_t vfs_fstat(uint32_t pid, uint32_t fd, vfs_stat_t *out) {
     ofd = fd_ofd(pid, fd);
     if (!ofd) return -VFS_EBADF;
     if (!out) return -VFS_EINVAL;
+    if (ofd->kind != VFS_OFD_FILE) return -VFS_EINVAL;
     irq_flags = cpu_irq_save();
     stated = ofd->ops->fstat(ofd->backend, out);
     cpu_irq_restore(irq_flags);
@@ -311,7 +410,7 @@ int32_t vfs_fstat(uint32_t pid, uint32_t fd, vfs_stat_t *out) {
 
 void vfs_close_all(uint32_t pid) {
     if (!pid_valid(pid)) return;
-    for (uint32_t fd = VFS_FIRST_FILE_FD; fd < VFS_FD_COUNT; fd++) {
+    for (uint32_t fd = 0; fd < VFS_FD_COUNT; fd++) {
         vfs_fd_t *slot = &descriptors[pid - 1u][fd];
         if (!slot->used) continue;
         slot->used = 0;

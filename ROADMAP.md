@@ -90,8 +90,10 @@ tested, and common FAT tools can still read the disk image.
   and encoded status validated in QEMU).
 - [x] Define the initial user-stack convention for `argc`, `argv`, `envp`,
   and the terminating `AT_NULL` auxiliary-vector entry.
-- [ ] Add standard descriptors 0/1/2, descriptor inheritance or transfer, and
-  automatic close-on-exit behavior.
+- [x] Add standard descriptors 0/1/2, descriptor inheritance or transfer, and
+  automatic close-on-exit behavior (a registered console device backs fds
+  0/1/2; `dup2` redirects and `close` revokes them; spawned children inherit
+  the parent's descriptors, and exit releases them).
 - [x] Add `dup`/`dup2` with a shared, refcounted open-file-description
   (`USER-DUP-OK`: shared offset, surviving duplicate, EBADF cases).
 - [ ] Add limited `brk`/`mmap`.

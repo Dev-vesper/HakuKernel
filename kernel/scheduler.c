@@ -173,6 +173,9 @@ int scheduler_init(loaded_elf_t *initial_program) {
     tasks[0].state = TASK_RUNNABLE;
     tasks[0].program = *initial_program;
     if (!initialize_stack(&tasks[0], 1)) goto fail;
+    /* The initial process owns the standard descriptors; every spawned
+     * child inherits them from its parent. */
+    if (!vfs_open_stdio(tasks[0].pid)) goto fail;
     idle_task.state = TASK_RUNNABLE;
     if (!initialize_stack(&idle_task, 0)) goto fail;
     initial_program->address_space.directory_phys = 0;
@@ -180,9 +183,12 @@ int scheduler_init(loaded_elf_t *initial_program) {
     klog_prefix();
     klog_write("sched: SCHED-READY tasks=1");
     klog_write(" kernel-stack=per-task\n");
+    klog_prefix();
+    klog_write("STDIO-OK: fds 0/1/2 on console\n");
     return 1;
 
 fail:
+    vfs_close_all(1);
     if (tasks[0].kernel_stack)
         frame_free_pages((void *)tasks[0].kernel_stack,
                          TASK_KERNEL_STACK_PAGES);
@@ -377,6 +383,17 @@ int32_t scheduler_spawn(loaded_elf_t *program) {
         memset(child, 0, sizeof(*child));
         cpu_irq_restore(irq_flags);
         return -12;
+    }
+    /* Inherit the parent's descriptors: the child shares the same open
+     * file descriptions (refcounted), so its standard handles and any
+     * redirections work from the first instruction. They are released
+     * together when the child exits. */
+    if (vfs_inherit(parent_pid, child->pid) != 1) {
+        frame_free_pages((void *)child->kernel_stack,
+                         TASK_KERNEL_STACK_PAGES);
+        memset(child, 0, sizeof(*child));
+        cpu_irq_restore(irq_flags);
+        return -(int32_t)HAKU_EMFILE;
     }
     program->address_space.directory_phys = 0;
     cpu_irq_restore(irq_flags);

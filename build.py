@@ -413,8 +413,11 @@ def main():
             "USER-FILE-IO-OK", # FAT12 create/write/read/seek/close passed
             "USER-FILE-OPS-OK", # unlink/rename/stat/fstat, open-file removed/renamed
             "USER-DUP-OK",   # dup/dup2 share one open file description
+            "STDIO-OK",      # standard descriptors 0/1/2 installed on the console
+            "USER-STDIO-OK", # stdio redirect via dup2, close, and restore
             "SPAWN-CHILD-RAN",
             "USER-WAITPID-OK child status=42 reaped",
+            "USER-FD-INHERIT-OK", # spawn inherited fd 3; child exit closed it
             "EXECVE-OK pid=1", # exec replaced the image and preserved descriptors
             "USER-EXEC-TARGET-OK", # argv/envp stack and image replacement passed
             "USER-EXIT-OK status=0 pid=1",

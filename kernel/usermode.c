@@ -25,6 +25,40 @@ typedef struct {
     uint32_t envp_offsets[USER_EXEC_MAX_ARGUMENTS];
 } exec_arguments_t;
 
+/* The console behind the standard descriptors. Output mirrors the VGA text
+ * console and COM1 (with CRLF on serial, as the boot log expects); input is
+ * the canonical PS/2 keyboard stream, returning after a newline or count
+ * bytes. It is registered with VFS, which installs it as fds 0/1/2. */
+static int32_t console_read(void *buffer, uint32_t count, uint32_t *out_count) {
+    uint8_t *bytes = (uint8_t *)buffer;
+    uint32_t copied = 0;
+    while (copied < count) {
+        char ch = kbd_getchar();
+        bytes[copied++] = (uint8_t)ch;
+        if (ch == '\n') break;
+    }
+    *out_count = copied;
+    return 1;
+}
+
+static int32_t console_write(const void *buffer, uint32_t count,
+                             uint32_t *out_count) {
+    const uint8_t *bytes = (const uint8_t *)buffer;
+    for (uint32_t i = 0; i < count; i++) {
+        console_putc((char)bytes[i]);
+        if (bytes[i] == '\n') serial_putc('\r'); /* serial is CRLF */
+        serial_putc((char)bytes[i]);
+    }
+    *out_count = count;
+    return 1;
+}
+
+static const vfs_device_ops_t console_device = {
+    "console",
+    console_read,
+    console_write,
+};
+
 static int elf_rejection_self_test(const uint8_t *image,
                                    uint32_t image_size) {
     uint8_t invalid[116];
@@ -61,6 +95,7 @@ int usermode_init(void) {
      * the root filesystem. Everything below (syscalls, self-tests) only
      * speaks the vfs_* interface from here on. */
     vfs_init();
+    if (!vfs_register_device(&console_device)) return 0;
     if (!vfs_register_fs(&fat12_fs_ops)) return 0;
     if (vfs_mount_root("fat12") != 1) return 0;
     image = (uint8_t *)kmalloc(USER_ELF_MAX_SIZE);
@@ -256,38 +291,23 @@ static uint32_t sys_write(uint32_t fd, uint32_t user_buffer,
         return copy_from_user_error(HAKU_EINVAL);
     if (!paging_user_range_valid(user_buffer, count, 0))
         return copy_from_user_error(HAKU_EFAULT);
-    if (fd > HAKU_STDERR_FILENO) {
-        int32_t result;
-        if (count == 0)
-            return (uint32_t)vfs_write(scheduler_current_pid(), fd, 0, 0);
-        while (offset < count) {
-            uint32_t amount = count - offset;
-            if (amount > sizeof(chunk)) amount = sizeof(chunk);
-            if (!copy_from_user(chunk, user_buffer + offset, amount))
-                return offset ? offset : copy_from_user_error(HAKU_EFAULT);
-            result = vfs_write(scheduler_current_pid(), fd, chunk, amount);
-            if (result < 0)
-                return offset ? offset : (uint32_t)result;
-            offset += (uint32_t)result;
-            if ((uint32_t)result < amount) break;
-        }
-        return offset;
-    }
-    if (fd == HAKU_STDIN_FILENO) return copy_from_user_error(HAKU_EBADF);
-    if (fd != HAKU_STDOUT_FILENO && fd != HAKU_STDERR_FILENO)
-        return copy_from_user_error(HAKU_EBADF);
+    if (count == 0)
+        return (uint32_t)vfs_write(scheduler_current_pid(), fd, 0, 0);
 
+    /* Every descriptor, including the standard 0/1/2, resolves through the
+     * VFS descriptor table, so a dup2 redirection is honoured and a closed
+     * standard descriptor reports EBADF like any other. */
     while (offset < count) {
         uint32_t amount = count - offset;
+        int32_t result;
         if (amount > sizeof(chunk)) amount = sizeof(chunk);
         if (!copy_from_user(chunk, user_buffer + offset, amount))
             return offset ? offset : copy_from_user_error(HAKU_EFAULT);
-        for (uint32_t i = 0; i < amount; i++) {
-            console_putc(chunk[i]);
-            if (chunk[i] == '\n') serial_putc('\r'); /* serial is CRLF */
-            serial_putc(chunk[i]);
-        }
-        offset += amount;
+        result = vfs_write(scheduler_current_pid(), fd, chunk, amount);
+        if (result < 0)
+            return offset ? offset : (uint32_t)result;
+        offset += (uint32_t)result;
+        if ((uint32_t)result < amount) break;
     }
     return offset;
 }
@@ -299,35 +319,24 @@ static uint32_t sys_read(uint32_t fd, uint32_t user_buffer,
 
     if (count > USER_IO_MAX) return copy_from_user_error(HAKU_EINVAL);
     if (count == 0)
-        return fd == HAKU_STDIN_FILENO ? 0u :
-               (uint32_t)vfs_read(scheduler_current_pid(), fd, 0, 0);
+        return (uint32_t)vfs_read(scheduler_current_pid(), fd, 0, 0);
     if (!paging_user_range_valid(user_buffer, count, 1))
         return copy_from_user_error(HAKU_EFAULT);
-    if (fd != 0u) {
-        while (copied < count) {
-            uint32_t amount = count - copied;
-            int32_t result;
-            if (amount > sizeof(chunk)) amount = sizeof(chunk);
-            result = vfs_read(scheduler_current_pid(), fd, chunk, amount);
-            if (result < 0)
-                return copied ? copied : (uint32_t)result;
-            if (result == 0) break;
-            if (!copy_to_user(user_buffer + copied, chunk,
-                              (uint32_t)result))
-                return copied ? copied : copy_from_user_error(HAKU_EFAULT);
-            copied += (uint32_t)result;
-            if ((uint32_t)result < amount) break;
-        }
-        return copied;
-    }
 
-    /* The PS/2 console is canonical: return after newline or count bytes. */
+    /* One path for the keyboard (fd 0) and files: the console device is
+     * canonical and returns after a newline, which ends the loop early. */
     while (copied < count) {
-        char ch = kbd_getchar();
-        if (!copy_to_user(user_buffer + copied, &ch, 1))
+        uint32_t amount = count - copied;
+        int32_t result;
+        if (amount > sizeof(chunk)) amount = sizeof(chunk);
+        result = vfs_read(scheduler_current_pid(), fd, chunk, amount);
+        if (result < 0)
+            return copied ? copied : (uint32_t)result;
+        if (result == 0) break;
+        if (!copy_to_user(user_buffer + copied, chunk, (uint32_t)result))
             return copied ? copied : copy_from_user_error(HAKU_EFAULT);
-        copied++;
-        if (ch == '\n') break;
+        copied += (uint32_t)result;
+        if ((uint32_t)result < amount) break;
     }
     return copied;
 }
