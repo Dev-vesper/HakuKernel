@@ -4,6 +4,7 @@
 #include "kbd.h"
 #include "klog.h"
 #include "paging.h"
+#include "pit.h"
 #include "scheduler.h"
 #include "fat12.h"
 #include "heap.h"
@@ -549,6 +550,55 @@ static uint32_t sys_fstat(uint32_t fd, uint32_t user_buf) {
     return 0;
 }
 
+/* Seconds and microseconds since boot, derived from the 100 Hz tick
+ * counter. A NULL tv is allowed (the caller just wants success); the
+ * timezone argument is not modelled and is ignored. */
+static uint32_t sys_gettimeofday(uint32_t user_tv) {
+    haku_timeval_t tv;
+    uint32_t ticks;
+    uint32_t hz;
+
+    if (user_tv && !paging_user_range_valid(user_tv, sizeof(tv), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    ticks = pit_ticks();
+    hz = pit_hz();
+    tv.tv_sec = ticks / hz;
+    tv.tv_usec = (ticks % hz) * (HAKU_USEC_PER_SEC / hz);
+    if (user_tv && !copy_to_user(user_tv, &tv, sizeof(tv)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0;
+}
+
+/* Block the calling task for at least the requested interval, rounded up
+ * to the next timer tick. Returns 0; there are no signals, so the sleep
+ * is never interrupted and the leftover-time pointer is unused. */
+static regs_t *sys_nanosleep(regs_t *frame, uint32_t user_req,
+                             uint32_t user_rem) {
+    haku_timespec_t req;
+    uint32_t hz;
+    uint32_t ns_per_tick;
+    uint32_t subticks;
+    uint32_t ticks;
+
+    (void)user_rem;
+    if (!copy_from_user(&req, user_req, sizeof(req))) {
+        frame->eax = copy_from_user_error(HAKU_EFAULT);
+        return frame;
+    }
+    if (req.tv_nsec >= HAKU_NSEC_PER_SEC) {
+        frame->eax = copy_from_user_error(HAKU_EINVAL);
+        return frame;
+    }
+    hz = pit_hz();
+    ns_per_tick = HAKU_NSEC_PER_SEC / hz;
+    subticks = (req.tv_nsec + ns_per_tick - 1u) / ns_per_tick;
+    if (req.tv_sec > 0x00FFFFFFu)
+        ticks = 0xFFFFFFFFu;
+    else
+        ticks = req.tv_sec * hz + subticks;
+    return scheduler_sleep_ticks(ticks, frame);
+}
+
 regs_t *user_syscall(regs_t *r) {
     switch (r->eax) {
     case HAKU_SYS_EXIT:
@@ -605,6 +655,11 @@ regs_t *user_syscall(regs_t *r) {
     case HAKU_SYS_GETPID:
         r->eax = scheduler_current_pid();
         return r;
+    case HAKU_SYS_GETTIMEOFDAY:
+        r->eax = sys_gettimeofday(r->ebx);
+        return r;
+    case HAKU_SYS_NANOSLEEP:
+        return sys_nanosleep(r, r->ebx, r->ecx);
     default:
         r->eax = copy_from_user_error(HAKU_ENOSYS);
         return r;

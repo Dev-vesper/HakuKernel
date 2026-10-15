@@ -18,8 +18,10 @@
 #define HAKU_SYS_RENAME  38u
 #define HAKU_SYS_DUP     41u
 #define HAKU_SYS_DUP2    63u
+#define HAKU_SYS_GETTIMEOFDAY 78u
 #define HAKU_SYS_STAT    106u
 #define HAKU_SYS_FSTAT   108u
+#define HAKU_SYS_NANOSLEEP    162u
 
 /* Haku-specific syscall for starting a child ELF from a pathname. */
 #define HAKU_SYS_SPAWN 0x1000u
@@ -59,6 +61,13 @@
 #define HAKU_STAT_SIZE     8u
 #define HAKU_STAT_MODE_REG 0x81A4u
 
+/* Time conversion factors and the fixed-width user structs used by
+ * gettimeofday(2) and nanosleep(2). Values are 32-bit on this ABI. */
+#define HAKU_USEC_PER_SEC  1000000u
+#define HAKU_NSEC_PER_SEC  1000000000u
+#define HAKU_TIMEVAL_SIZE  8u
+#define HAKU_TIMESPEC_SIZE 8u
+
 typedef unsigned int haku_u32;
 
 /* stat/fstat user buffer layout; fields are fixed-width 32-bit values. */
@@ -67,8 +76,24 @@ typedef struct {
     haku_u32 mode;
 } haku_stat_t;
 
+/* gettimeofday(2): seconds + microseconds since boot. */
+typedef struct {
+    haku_u32 tv_sec;
+    haku_u32 tv_usec;
+} haku_timeval_t;
+
+/* nanosleep(2): requested/completed duration in seconds + nanoseconds. */
+typedef struct {
+    haku_u32 tv_sec;
+    haku_u32 tv_nsec;
+} haku_timespec_t;
+
 typedef char haku_u32_must_be_32_bits[(sizeof(haku_u32) == 4u) ? 1 : -1];
 typedef char haku_stat_must_be_8_bytes[
     (sizeof(haku_stat_t) == HAKU_STAT_SIZE) ? 1 : -1];
+typedef char haku_timeval_must_be_8_bytes[
+    (sizeof(haku_timeval_t) == HAKU_TIMEVAL_SIZE) ? 1 : -1];
+typedef char haku_timespec_must_be_8_bytes[
+    (sizeof(haku_timespec_t) == HAKU_TIMESPEC_SIZE) ? 1 : -1];
 
 #endif

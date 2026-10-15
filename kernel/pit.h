@@ -10,5 +10,6 @@
 void pit_init(uint32_t hz);
 uint32_t pit_ticks(void);
 uint32_t pit_seconds(void);
+uint32_t pit_hz(void);
 
 #endif

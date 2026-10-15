@@ -143,7 +143,8 @@ terminators and must fit the two-page initial stack. Larger inputs return
 the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `read` (3), `write` (4), `open` (5), `close` (6), `waitpid` (7),
 `unlink` (10), `execve` (11), `lseek` (19), `getpid` (20), `rename` (38),
-`dup` (41), `dup2` (63), `stat` (106), and `fstat` (108), with arguments in
+`dup` (41), `dup2` (63), `gettimeofday` (78), `stat` (106), `fstat` (108),
+and `nanosleep` (162), with arguments in
 `ebx`, `ecx`, and `edx` and syscall number/result in `eax`.
 The custom `spawn` syscall uses `0x1000`.
 The public ABI definitions are in `include/haku/abi.h` for C and
@@ -151,7 +152,8 @@ The public ABI definitions are in `include/haku/abi.h` for C and
 constants stay synchronized. They define syscall numbers, errno values, open
 flags, and the `stat` buffer layout. `haku_stat_t` contains 32-bit `size` and
 `mode` fields; `stat` and `fstat` currently report regular files with mode
-`0644`.
+`0644`. `haku_timeval_t` (`tv_sec`, `tv_usec`) and `haku_timespec_t`
+(`tv_sec`, `tv_nsec`) are the 8-byte user time structures.
 
 ### User-mode system calls
 
@@ -176,6 +178,17 @@ pass also covers empty files, exact-sector and boundary-spanning I/O
 restored, reads must give `EIO`, loops must terminate) plus a crafted
 full data area (`FS-CORRUPT-OK`), and ATA bounds/NULL-transfer rejection
 (`FS-ATA-OK`).
+
+`gettimeofday` reports whole seconds and microseconds since boot derived
+from the 100 Hz PIT tick counter; a NULL timeval is allowed (a no-op query),
+an unmapped one gives `EFAULT`, and the unused timezone argument is ignored.
+`nanosleep` rounds the requested interval up to the next timer tick, marks
+the calling task `TASK_SLEEPING`, switches away, and lets the timer IRQ wake
+it when its deadline passes, so it does not busy-wait. A zero interval
+succeeds immediately; `tv_nsec` outside `[0, 1e9)` gives `EINVAL` and a NULL
+request gives `EFAULT`. There are no signals, so a sleep is never
+interrupted. The number of sleeping tasks is not counted against idle, so a
+sleeping process keeps the idle loop in the scheduler.
 
 Writes are not atomic: there is no journal, so a failing multi-sector
 write leaves exactly its durable prefix (a short count means those bytes
@@ -228,8 +241,9 @@ against the interrupt/wakeup race. Ring-3 page faults are contained and
 reported rather than halting the kernel. These syscalls are an initial
 POSIX-inspired kernel interface, not full POSIX conformance. Run
 `python build.py headless` to test read/write/open/close/lseek/getpid/exit,
-bad pointers, descriptor errors, input copying, disk-backed create/write/read
-across a sector boundary, and continued timer operation.
+gettimeofday/nanosleep, bad pointers, descriptor errors, input copying,
+disk-backed create/write/read across a sector boundary, and continued timer
+operation.
 
 ### ATA PIO and FAT12
 

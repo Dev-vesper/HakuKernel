@@ -1193,6 +1193,83 @@ _user_program_start:
     cmp eax, edx
     jne .fail
 
+    ; Time: gettimeofday reads the tick counter and nanosleep blocks for
+    ; at least the requested interval (the task is parked until its wake
+    ; tick passes, not busy-waited).
+    mov esi, 76
+    mov eax, SYS_GETTIMEOFDAY
+    mov ebx, USER_DATA_BASE + (timeval1 - data_start)
+    xor ecx, ecx
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 77
+    mov eax, SYS_GETTIMEOFDAY
+    mov ebx, 0x1000           ; EFAULT for an unmapped timeval
+    xor ecx, ecx
+    int 0x80
+    cmp eax, -14
+    jne .fail
+    mov eax, SYS_GETTIMEOFDAY ; a NULL timeval is allowed (no-op query)
+    xor ebx, ebx
+    xor ecx, ecx
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 78
+    mov eax, SYS_NANOSLEEP
+    xor ebx, ebx
+    xor ecx, ecx
+    int 0x80
+    cmp eax, -14              ; EFAULT for a NULL request
+    jne .fail
+    mov esi, 79
+    mov eax, SYS_NANOSLEEP
+    mov ebx, USER_DATA_BASE + (timespec_bad - data_start)
+    xor ecx, ecx
+    int 0x80
+    cmp eax, -22              ; EINVAL: tv_nsec is out of range
+    jne .fail
+    mov esi, 80
+    mov eax, SYS_NANOSLEEP
+    mov ebx, USER_DATA_BASE + (timespec_zero - data_start)
+    xor ecx, ecx
+    int 0x80
+    test eax, eax             ; a zero interval succeeds immediately
+    jne .fail
+    mov esi, 81
+    mov eax, SYS_NANOSLEEP
+    mov ebx, USER_DATA_BASE + (timespec_50ms - data_start)
+    xor ecx, ecx
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 82
+    mov eax, SYS_GETTIMEOFDAY
+    mov ebx, USER_DATA_BASE + (timeval2 - data_start)
+    xor ecx, ecx
+    int 0x80
+    test eax, eax
+    jne .fail
+    ; The elapsed interval must cover the requested 50 ms: either the
+    ; seconds field advanced, or the microseconds grew by >= 30000.
+    mov eax, [USER_DATA_BASE + (timeval2 - data_start)]
+    sub eax, [USER_DATA_BASE + (timeval1 - data_start)]
+    jne .time_ok
+    mov eax, [USER_DATA_BASE + (timeval2 - data_start) + 4]
+    sub eax, [USER_DATA_BASE + (timeval1 - data_start) + 4]
+    cmp eax, 30000
+    jb .fail
+.time_ok:
+    mov esi, 83
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (time_message - data_start)
+    mov edx, time_message_end - time_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
     ; Failed exec attempts must leave this process image intact.
     mov esi, 61
     mov eax, SYS_EXECVE
@@ -1372,6 +1449,19 @@ inherit_buf:
 inherit_message:
     db "USER-FD-INHERIT-OK child shared inherited fd 3", 10
 inherit_message_end:
+timeval1:
+    times 8 db 0
+timeval2:
+    times 8 db 0
+timespec_zero:
+    dd 0, 0
+timespec_50ms:
+    dd 0, 50000000
+timespec_bad:
+    dd 0, 1000000000
+time_message:
+    db "USER-TIME-OK gettimeofday and nanosleep advance", 10
+time_message_end:
 stat_buf:
     times 8 db 0
 exec_path:

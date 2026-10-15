@@ -5,6 +5,7 @@
 #include "gdt.h"
 #include "klog.h"
 #include "paging.h"
+#include "pit.h"
 #include "vfs.h"
 
 #define TASK_KERNEL_STACK_PAGES 2u
@@ -13,6 +14,7 @@ typedef enum {
     TASK_UNUSED,
     TASK_RUNNABLE,
     TASK_WAITING,
+    TASK_SLEEPING,
     TASK_ZOMBIE,
     TASK_REAP_PENDING
 } task_state_t;
@@ -27,6 +29,7 @@ typedef struct {
     uint32_t exit_status;
     uint32_t wait_pid;
     uint32_t wait_status_user;
+    uint32_t wake_tick;
 } task_t;
 
 #define SCHEDULER_IDLE_INDEX ((int)SCHEDULER_MAX_PROCESSES)
@@ -40,10 +43,24 @@ int scheduler_user_tasks_done(void) {
     if (!scheduler_started) return 0;
     for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
         if (tasks[i].state == TASK_RUNNABLE ||
-            tasks[i].state == TASK_WAITING)
+            tasks[i].state == TASK_WAITING ||
+            tasks[i].state == TASK_SLEEPING)
             return 0;
     }
     return 1;
+}
+
+/* Wake every sleeper whose deadline has been reached. Called from the
+ * timer IRQ so a sleeping task resumes once its wake tick passes. The
+ * unsigned subtraction compares correctly across the 32-bit tick wrap. */
+static void wake_expired_sleepers(void) {
+    uint32_t now = pit_ticks();
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        task_t *task = &tasks[i];
+        if (task->state == TASK_SLEEPING &&
+            (int32_t)(now - task->wake_tick) >= 0)
+            task->state = TASK_RUNNABLE;
+    }
 }
 
 static void scheduler_idle_loop(void) {
@@ -225,6 +242,7 @@ regs_t *scheduler_preempt(regs_t *frame) {
     }
 
     reap_completed_tasks();
+    wake_expired_sleepers();
     if (current_task == SCHEDULER_IDLE_INDEX) {
         idle_task.frame = frame;
     } else if (current_task >= 0 &&
@@ -475,6 +493,32 @@ regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
     parent->frame = frame;
     next = find_next_task();
     activate_task(next);
+    return next == SCHEDULER_IDLE_INDEX ? idle_task.frame :
+                                          tasks[next].frame;
+}
+
+regs_t *scheduler_sleep_ticks(uint32_t ticks, regs_t *frame) {
+    task_t *task;
+    int next;
+
+    if (!frame || current_task < 0 ||
+        current_task >= SCHEDULER_IDLE_INDEX)
+        return frame;
+    if (ticks == 0) {
+        frame->eax = 0;
+        return frame;
+    }
+
+    cpu_cli();
+    task = &tasks[current_task];
+    frame->eax = 0;
+    task->wake_tick = pit_ticks() + ticks;
+    task->state = TASK_SLEEPING;
+    task->frame = frame;
+    next = find_next_task();
+    activate_task(next);
+    /* IRQs stay masked here; the returned frame's eflags restore them
+     * when the isr return path executes iret. */
     return next == SCHEDULER_IDLE_INDEX ? idle_task.frame :
                                           tasks[next].frame;
 }
