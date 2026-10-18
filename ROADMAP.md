@@ -121,8 +121,13 @@ address-space or descriptor sharing.
 
 ### 4. Concurrency and Memory Management
 
-- [ ] Add kernel synchronization primitives (spinlocks and IRQ-save locks) and
-  define locking rules for the scheduler, allocators, VFS, and drivers.
+- [x] Add kernel synchronization primitives (spinlocks and IRQ-save locks) and
+  define locking rules for the scheduler, allocators, VFS, and drivers
+  (`kernel/sync.h`/`.c`: `irq_lock`/`irq_unlock`, task-context
+  `spin_lock`/`spin_unlock`, and `spin_lock_irqsave`; VFS uses one
+  task-context lock around descriptor/OFD changes and backend calls, the
+  frame/heap allocators and console use IRQ-save locks, ATA and the keyboard
+  ring buffer are serialized per the README "Locking" rules).
 - [ ] Separate wait queues and sleep/wakeup from busy-waiting so blocking I/O
   sleeps the current process instead of spinning.
 - [ ] Extend allocation beyond the current identity-mapped range and add

@@ -6,6 +6,7 @@
 #include "klog.h"
 #include "paging.h"
 #include "pit.h"
+#include "sync.h"
 #include "usermode.h"
 #include "vfs.h"
 
@@ -13,6 +14,7 @@
 
 typedef enum {
     TASK_UNUSED,
+    TASK_STARTING,
     TASK_RUNNABLE,
     TASK_WAITING,
     TASK_SLEEPING,
@@ -46,7 +48,8 @@ static int timer_marker_written;
 int scheduler_user_tasks_done(void) {
     if (!scheduler_started) return 0;
     for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
-        if (tasks[i].state == TASK_RUNNABLE ||
+        if (tasks[i].state == TASK_STARTING ||
+            tasks[i].state == TASK_RUNNABLE ||
             tasks[i].state == TASK_WAITING ||
             tasks[i].state == TASK_SLEEPING)
             return 0;
@@ -223,7 +226,7 @@ fail:
 
 void scheduler_start(void) {
     int first = 0;
-    cpu_cli();
+    (void)irq_lock();
     scheduler_started = 1;
     activate_task(first);
     klog_prefix();
@@ -234,6 +237,11 @@ void scheduler_start(void) {
     for (;;) __asm hlt
 }
 
+/* The scheduler's own state is protected by the IRQ-save rule below:
+ * every task-array mutation runs with interrupts disabled (either in an IRQ
+ * handler or under irq_lock()), so no spinlock is needed here. Never take a
+ * task-context spinlock (VFS, ATA) with interrupts disabled: a preempted
+ * holder would never run again to release it. */
 regs_t *scheduler_preempt(regs_t *frame) {
     int next;
 
@@ -272,7 +280,12 @@ regs_t *scheduler_exit_current(regs_t *frame) {
         return frame;
 
     exiting = &tasks[current_task];
+    /* Closing descriptors takes the task-context VFS lock, so it must run
+     * with interrupts enabled. The task-state transition below is then
+     * committed under the scheduler's IRQ-save rule: interrupts stay off
+     * through the context switch, and iret restores the next task's IF. */
     vfs_close_all(exiting->pid);
+    (void)irq_lock();
     exiting->exit_status = (frame->ebx & 0xFFu) << 8;
     exiting->state = TASK_ZOMBIE;
     exiting->frame = frame;
@@ -321,7 +334,7 @@ regs_t *scheduler_exit_current(regs_t *frame) {
 int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
     task_t *task;
     loaded_elf_t previous;
-    uint32_t irq_flags;
+    irqflags_t flags;
     if (!scheduler_started || !replacement || !frame ||
         !replacement->address_space.directory_phys ||
         !replacement->entry || !replacement->user_stack ||
@@ -329,7 +342,7 @@ int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
         (frame->cs & 3u) != 3u)
         return 0;
 
-    irq_flags = cpu_irq_save();
+    flags = irq_lock();
     task = &tasks[current_task];
     previous = task->program;
     task->program = *replacement;
@@ -360,7 +373,7 @@ int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
 
     paging_activate_user_space(&task->program.address_space);
     paging_destroy_user_space(&previous.address_space);
-    cpu_irq_restore(irq_flags);
+    irq_unlock(flags);
 
     klog_prefix();
     klog_write("exec: EXECVE-OK pid=");
@@ -376,7 +389,7 @@ uint32_t scheduler_current_pid(void) {
 }
 
 int32_t scheduler_spawn(loaded_elf_t *program) {
-    uint32_t irq_flags;
+    irqflags_t flags;
     uint32_t parent_pid;
     uint32_t slot;
     task_t *child = 0;
@@ -387,7 +400,11 @@ int32_t scheduler_spawn(loaded_elf_t *program) {
         current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
         return -(int32_t)HAKU_ENOMEM;
 
-    irq_flags = cpu_irq_save();
+    /* Reserve a slot without holding interrupts across the VFS inherit:
+     * vfs_inherit takes the task-context VFS spinlock, which must never be
+     * acquired with interrupts disabled. A STARTING task is ignored by the
+     * scheduler until it is fully built. */
+    flags = irq_lock();
     parent_pid = tasks[current_task].pid;
     for (slot = 1; slot < SCHEDULER_MAX_PROCESSES; slot++) {
         if (tasks[slot].state == TASK_UNUSED) {
@@ -396,18 +413,20 @@ int32_t scheduler_spawn(loaded_elf_t *program) {
         }
     }
     if (!child) {
-        cpu_irq_restore(irq_flags);
+        irq_unlock(flags);
         return -(int32_t)HAKU_EAGAIN;
     }
-
     memset(child, 0, sizeof(*child));
     child->pid = slot + 1u;
     child->parent_pid = parent_pid;
-    child->state = TASK_RUNNABLE;
+    child->state = TASK_STARTING;
+    irq_unlock(flags);
+
     child->program = *program;
     if (!initialize_stack(child, 1)) {
+        flags = irq_lock();
         memset(child, 0, sizeof(*child));
-        cpu_irq_restore(irq_flags);
+        irq_unlock(flags);
         return -12;
     }
     /* Inherit the parent's descriptors: the child shares the same open
@@ -415,14 +434,18 @@ int32_t scheduler_spawn(loaded_elf_t *program) {
      * redirections work from the first instruction. They are released
      * together when the child exits. */
     if (vfs_inherit(parent_pid, child->pid) != 1) {
+        flags = irq_lock();
         frame_free_pages((void *)child->kernel_stack,
                          TASK_KERNEL_STACK_PAGES);
         memset(child, 0, sizeof(*child));
-        cpu_irq_restore(irq_flags);
+        irq_unlock(flags);
         return -(int32_t)HAKU_EMFILE;
     }
     program->address_space.directory_phys = 0;
-    cpu_irq_restore(irq_flags);
+
+    flags = irq_lock();
+    child->state = TASK_RUNNABLE;
+    irq_unlock(flags);
     klog_prefix();
     klog_write("sched: SPAWN-OK parent=");
     klog_dec(parent_pid);
@@ -438,25 +461,25 @@ regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
     task_t *zombie = 0;
     int has_child = 0;
     int next;
-    uint32_t irq_flags;
+    irqflags_t flags;
 
     if (!frame || current_task < 0 ||
         current_task >= SCHEDULER_IDLE_INDEX)
         return frame;
-    irq_flags = cpu_irq_save();
+    flags = irq_lock();
     if (options != 0 || pid == 0) {
         frame->eax = 0u - HAKU_EINVAL;
-        cpu_irq_restore(irq_flags);
+        irq_unlock(flags);
         return frame;
     }
     if (pid != 0xFFFFFFFFu && pid > 0x7FFFFFFFu) {
         frame->eax = 0u - HAKU_EINVAL;
-        cpu_irq_restore(irq_flags);
+        irq_unlock(flags);
         return frame;
     }
     if (pid != 0xFFFFFFFFu && pid > SCHEDULER_MAX_PROCESSES) {
         frame->eax = 0u - HAKU_ECHILD;
-        cpu_irq_restore(irq_flags);
+        irq_unlock(flags);
         return frame;
     }
 
@@ -476,7 +499,7 @@ regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
     }
     if (!has_child) {
         frame->eax = 0u - HAKU_ECHILD;
-        cpu_irq_restore(irq_flags);
+        irq_unlock(flags);
         return frame;
     }
 
@@ -486,12 +509,12 @@ regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
                                        user_status, &zombie->exit_status,
                                        sizeof(zombie->exit_status))) {
             frame->eax = 0u - 14u;
-            cpu_irq_restore(irq_flags);
+            irq_unlock(flags);
             return frame;
         }
         frame->eax = zombie->pid;
         zombie->state = TASK_REAP_PENDING;
-        cpu_irq_restore(irq_flags);
+        irq_unlock(flags);
         return frame;
     }
 
@@ -517,7 +540,7 @@ regs_t *scheduler_sleep_ticks(uint32_t ticks, regs_t *frame) {
         return frame;
     }
 
-    cpu_cli();
+    (void)irq_lock();
     task = &tasks[current_task];
     frame->eax = 0;
     task->wake_tick = pit_ticks() + ticks;

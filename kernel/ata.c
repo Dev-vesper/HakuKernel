@@ -1,6 +1,7 @@
 #include "ata.h"
 #include "console.h"
 #include "klog.h"
+#include "sync.h"
 
 #define ATA_DATA       0x1F0u
 #define ATA_ERROR      0x1F1u
@@ -21,6 +22,10 @@
 
 static uint32_t primary_master_sectors;
 static uint16_t identify_words[256];
+/* Serializes command sequences and the shared register/data window. A
+ * task-context spinlock: the polling transfer may be preempted, and any
+ * other ATA caller busy-waits until the current sequence completes. */
+static spinlock_t ata_lock = SPINLOCK_INIT;
 
 static int wait_status(uint8_t required) {
     for (uint32_t attempt = 0; attempt < ATA_TIMEOUT; attempt++) {
@@ -33,7 +38,7 @@ static int wait_status(uint8_t required) {
     return 0;
 }
 
-int ata_init(void) {
+static int ata_init_unlocked(void) {
     uint8_t status;
     primary_master_sectors = 0;
 
@@ -81,7 +86,15 @@ int ata_init(void) {
     return 1;
 }
 
-int ata_read_sectors(uint32_t lba, uint8_t count, void *buffer) {
+int ata_init(void) {
+    int result;
+    spin_lock(&ata_lock);
+    result = ata_init_unlocked();
+    spin_unlock(&ata_lock);
+    return result;
+}
+
+static int ata_read_sectors_unlocked(uint32_t lba, uint8_t count, void *buffer) {
     uint8_t *destination = (uint8_t *)buffer;
     if (!buffer || !count || !primary_master_sectors ||
         lba >= primary_master_sectors ||
@@ -126,7 +139,16 @@ int ata_read_sectors(uint32_t lba, uint8_t count, void *buffer) {
     return 1;
 }
 
-int ata_write_sectors(uint32_t lba, uint8_t count, const void *buffer) {
+int ata_read_sectors(uint32_t lba, uint8_t count, void *buffer) {
+    int result;
+    spin_lock(&ata_lock);
+    result = ata_read_sectors_unlocked(lba, count, buffer);
+    spin_unlock(&ata_lock);
+    return result;
+}
+
+static int ata_write_sectors_unlocked(uint32_t lba, uint8_t count,
+                                      const void *buffer) {
     const uint8_t *source = (const uint8_t *)buffer;
     if (!buffer || !count || !primary_master_sectors ||
         lba >= primary_master_sectors ||
@@ -171,6 +193,15 @@ int ata_write_sectors(uint32_t lba, uint8_t count, const void *buffer) {
     return 1;
 }
 
+int ata_write_sectors(uint32_t lba, uint8_t count, const void *buffer) {
+    int result;
+    spin_lock(&ata_lock);
+    result = ata_write_sectors_unlocked(lba, count, buffer);
+    spin_unlock(&ata_lock);
+    return result;
+}
+
 uint32_t ata_sector_count(void) {
+    /* A 32-bit aligned load; the capacity is written once by ata_init. */
     return primary_master_sectors;
 }

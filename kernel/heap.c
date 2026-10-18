@@ -9,8 +9,10 @@
 #include "heap.h"
 #include "console.h"
 #include "klog.h"
+#include "sync.h"
 
 static heap_block_t *heap_head = 0;
+static spinlock_t heap_lock = SPINLOCK_INIT;
 
 /* Align size up to 16 bytes (MSVC stack alignment + future SIMD). */
 static size_t align16(size_t n) {
@@ -35,9 +37,11 @@ void heap_init(void) {
 
 size_t heap_free_bytes(void) {
     size_t total = 0;
+    irqflags_t flags = spin_lock_irqsave(&heap_lock);
     for (heap_block_t *b = heap_head; b; b = b->next)
         if (b->magic == HEAP_MAGIC_FREE)
             total += b->size;
+    spin_unlock_irqrestore(&heap_lock, flags);
     return total;
 }
 
@@ -56,7 +60,7 @@ static void try_split(heap_block_t *b, size_t need) {
     }
 }
 
-void *kmalloc(size_t size) {
+static void *kmalloc_unlocked(size_t size) {
     if (size == 0) return 0;
     size = align16(size);
     for (heap_block_t *b = heap_head; b; b = b->next) {
@@ -67,6 +71,14 @@ void *kmalloc(size_t size) {
         }
     }
     return 0; /* OOM */
+}
+
+void *kmalloc(size_t size) {
+    void *result;
+    irqflags_t flags = spin_lock_irqsave(&heap_lock);
+    result = kmalloc_unlocked(size);
+    spin_unlock_irqrestore(&heap_lock, flags);
+    return result;
 }
 
 void *kzalloc(size_t size) {
@@ -91,7 +103,7 @@ static void coalesce(heap_block_t *b) {
     }
 }
 
-void kfree(void *ptr) {
+static void kfree_unlocked(void *ptr) {
     if (!valid_ptr(ptr)) return;
     heap_block_t *b = (heap_block_t *)ptr - 1;
     if (b->magic != HEAP_MAGIC_USED) return; /* double-free or corruption */
@@ -99,9 +111,15 @@ void kfree(void *ptr) {
     coalesce(b);
 }
 
-void *krealloc(void *ptr, size_t new_size) {
-    if (!ptr) return kmalloc(new_size);
-    if (new_size == 0) { kfree(ptr); return 0; }
+void kfree(void *ptr) {
+    irqflags_t flags = spin_lock_irqsave(&heap_lock);
+    kfree_unlocked(ptr);
+    spin_unlock_irqrestore(&heap_lock, flags);
+}
+
+static void *krealloc_unlocked(void *ptr, size_t new_size) {
+    if (!ptr) return kmalloc_unlocked(new_size);
+    if (new_size == 0) { kfree_unlocked(ptr); return 0; }
     if (!valid_ptr(ptr)) return 0;
 
     heap_block_t *b = (heap_block_t *)ptr - 1;
@@ -125,11 +143,19 @@ void *krealloc(void *ptr, size_t new_size) {
     }
 
     /* Can't grow in place — allocate, copy, free. */
-    void *fresh = kmalloc(new_size);
+    void *fresh = kmalloc_unlocked(new_size);
     if (!fresh) return 0;
     memcpy(fresh, ptr, b->size < new_size ? b->size : new_size);
-    kfree(ptr);
+    kfree_unlocked(ptr);
     return fresh;
+}
+
+void *krealloc(void *ptr, size_t new_size) {
+    void *result;
+    irqflags_t flags = spin_lock_irqsave(&heap_lock);
+    result = krealloc_unlocked(ptr, new_size);
+    spin_unlock_irqrestore(&heap_lock, flags);
+    return result;
 }
 
 /* ------------------------------------------------------------------ */

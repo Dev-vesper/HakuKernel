@@ -9,6 +9,9 @@
 #include "heap.h"
 #include "klog.h"
 #include "paging.h"
+#include "sync.h"
+
+static spinlock_t frame_lock = SPINLOCK_INIT;
 
 #define E820_MAP_PHYS 0x7000u
 #define E820_MAX_ENTRIES 24u
@@ -202,37 +205,48 @@ void frame_init(void) {
 }
 
 void *frame_alloc(void) {
+    void *result = 0;
+    irqflags_t flags;
     if (!frame_bitmap || !frame_usable) return 0;
+    flags = spin_lock_irqsave(&frame_lock);
     for (uint32_t frame = 0; frame < FRAME_ALLOC_ENTRIES; frame++) {
         if (bitmap_test(frame_usable, frame) &&
             !bitmap_test(frame_bitmap, frame)) {
             bitmap_set(frame_bitmap, frame);
-            return (void *)(frame * FRAME_SIZE);
+            result = (void *)(frame * FRAME_SIZE);
+            break;
         }
     }
-    return 0;
+    spin_unlock_irqrestore(&frame_lock, flags);
+    return result;
 }
 
 void frame_free(void *phys) {
     uint32_t address = (uint32_t)phys;
     uint32_t frame;
+    irqflags_t flags;
     if (!frame_bitmap || !frame_usable ||
         (address & (FRAME_SIZE - 1u)) != 0 ||
         address >= FRAME_ALLOC_ENTRIES * FRAME_SIZE)
         return;
     frame = address / FRAME_SIZE;
+    flags = spin_lock_irqsave(&frame_lock);
     if (bitmap_test(frame_usable, frame) &&
         bitmap_test(frame_bitmap, frame))
         bitmap_clear(frame_bitmap, frame);
+    spin_unlock_irqrestore(&frame_lock, flags);
 }
 
 void *frame_alloc_pages(uint32_t n) {
     uint32_t run = 0;
     uint32_t start = 0;
+    void *result = 0;
+    irqflags_t flags;
     if (!frame_bitmap || !frame_usable || n == 0 ||
         n > FRAME_ALLOC_ENTRIES)
         return 0;
 
+    flags = spin_lock_irqsave(&frame_lock);
     for (uint32_t frame = 0; frame < FRAME_ALLOC_ENTRIES; frame++) {
         if (bitmap_test(frame_usable, frame) &&
             !bitmap_test(frame_bitmap, frame)) {
@@ -242,18 +256,21 @@ void *frame_alloc_pages(uint32_t n) {
                 for (uint32_t allocated = start;
                      allocated < start + n; allocated++)
                     bitmap_set(frame_bitmap, allocated);
-                return (void *)(start * FRAME_SIZE);
+                result = (void *)(start * FRAME_SIZE);
+                break;
             }
         } else {
             run = 0;
         }
     }
-    return 0;
+    spin_unlock_irqrestore(&frame_lock, flags);
+    return result;
 }
 
 void frame_free_pages(void *phys, uint32_t n) {
     uint32_t address = (uint32_t)phys;
     uint32_t start;
+    irqflags_t flags;
     if (!frame_bitmap || !frame_usable || n == 0 ||
         (address & (FRAME_SIZE - 1u)) != 0 ||
         address >= FRAME_ALLOC_ENTRIES * FRAME_SIZE)
@@ -261,32 +278,42 @@ void frame_free_pages(void *phys, uint32_t n) {
     start = address / FRAME_SIZE;
     if (n > FRAME_ENTRIES - start) return;
 
+    flags = spin_lock_irqsave(&frame_lock);
     for (uint32_t frame = start; frame < start + n; frame++) {
         if (!bitmap_test(frame_usable, frame) ||
-            !bitmap_test(frame_bitmap, frame))
+            !bitmap_test(frame_bitmap, frame)) {
+            spin_unlock_irqrestore(&frame_lock, flags);
             return;
+        }
     }
     for (uint32_t frame = start; frame < start + n; frame++)
         bitmap_clear(frame_bitmap, frame);
+    spin_unlock_irqrestore(&frame_lock, flags);
 }
 
 uint32_t frame_total_count(void) { return FRAME_ENTRIES; }
 
 uint32_t frame_usable_count(void) {
     uint32_t count = 0;
+    irqflags_t flags;
     if (!frame_usable) return 0;
+    flags = spin_lock_irqsave(&frame_lock);
     for (uint32_t frame = 0; frame < FRAME_ENTRIES; frame++)
         if (bitmap_test(frame_usable, frame)) count++;
+    spin_unlock_irqrestore(&frame_lock, flags);
     return count;
 }
 
 uint32_t frame_free_count(void) {
     uint32_t count = 0;
+    irqflags_t flags;
     if (!frame_bitmap || !frame_usable) return 0;
+    flags = spin_lock_irqsave(&frame_lock);
     for (uint32_t frame = 0; frame < FRAME_ALLOC_ENTRIES; frame++)
         if (bitmap_test(frame_usable, frame) &&
             !bitmap_test(frame_bitmap, frame))
             count++;
+    spin_unlock_irqrestore(&frame_lock, flags);
     return count;
 }
 

@@ -315,6 +315,44 @@ loads the initial ELF at startup; `execve` uses VFS to load subsequent ELF
 files from the disk into a fresh address space before replacing the current
 image.
 
+### Locking
+
+`kernel/sync.h` provides three primitives on top of `cpu_irq_save`/`restore`:
+
+- `irq_lock`/`irq_unlock` — a plain IRQ-save pair for short critical sections
+  that never block and never call into a blocking path. Nests correctly.
+- `spin_lock`/`spin_unlock` — a task-context spinlock. The critical section
+  runs with interrupts enabled, so a preempted holder can be scheduled again
+  while waiters busy-wait. Must never be acquired with interrupts disabled
+  and never held across a blocking call.
+- `spin_lock_irqsave`/`spin_unlock_irqrestore` — a spinlock whose holder also
+  disables interrupts, making it non-preemptible and safe from IRQ context.
+
+The locking rules per subsystem:
+
+- **Scheduler**: every task-array mutation runs with interrupts disabled (in an
+  IRQ handler or under `irq_lock`), so no spinlock is needed. A task-context
+  spinlock must never be taken with interrupts disabled — a preempted holder
+  would never run again to release it. `scheduler_spawn` therefore reserves a
+  task slot, then re-enables interrupts for `vfs_inherit` before publishing the
+  task as runnable.
+- **Allocators** (`kernel/frame.c`, `kernel/heap.c`): IRQ-save spinlocks. The
+  free-list/bitmap updates are short and the holder cannot be preempted, so the
+  allocators are safe from both task and interrupt context.
+- **VFS** (`kernel/vfs.c`): one task-context spinlock, `vfs_lock`, around all
+  descriptor/OFD table changes and file-backend calls. Interrupts stay enabled
+  during disk I/O, so a preempted holder can finish; console device I/O drops
+  the lock first because it may block. `ofd_release` does not lock — callers
+  hold `vfs_lock`.
+- **Drivers**: `kernel/ata.c` uses a task-context spinlock around the polling
+  transfers; `kernel/kbd.c` uses an IRQ-save pair around the ring-buffer poll
+  (single-producer IRQ1, single-consumer task); `kernel/console.c` protects
+  VGA/UART state with IRQ-save spinlocks because `klog` may run from interrupt
+  context.
+
+Locks are non-recursive; the only ordering rule is VFS → backend, never the
+reverse.
+
 ### ELF32 program loading
 
 `kernel/elf.c` loads static ELF32 little-endian i386 `ET_EXEC` images read
@@ -366,6 +404,7 @@ Haku/
   kernel/vfs.h/.c      fs-independent descriptors, registry, root mount
   kernel/elf.h/.c      validated ELF32 PT_LOAD loader and fresh user address spaces
   kernel/cpu.h/cpu.c   types, port I/O, tiny libc (memset & friends, no CRT)
+  kernel/sync.h/.c     spinlocks and IRQ-save locks + locking rules
   kernel/console.h/.c  VGA text + COM1 serial drivers
   kernel/idt.h/idt.c   IDT gates, exception/IRQ dispatchers (+ #PF handler)
   kernel/gdt.h/.c      flat ring-0/ring-3 GDT and dedicated TSS stack

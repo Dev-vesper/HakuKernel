@@ -9,6 +9,7 @@
 #include "idt.h"
 #include "kbd.h"
 #include "pic.h"
+#include "sync.h"
 
 #define KBD_DATA_PORT   0x60
 #define KBD_STATUS_PORT 0x64
@@ -73,10 +74,10 @@ int kbd_has_char(void) {
 char kbd_getchar(void) {
     for (;;) {
         int c;
-        cpu_cli();
+        irqflags_t flags = irq_lock();
         c = kbd_poll();
         if (c >= 0) {
-            cpu_sti();
+            irq_unlock(flags);
             return (char)c;
         }
         /* STI's interrupt shadow makes the check-and-sleep race-free. */

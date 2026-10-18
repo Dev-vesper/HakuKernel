@@ -1,18 +1,26 @@
 /* Haku console: VGA text mode + COM1 serial output. */
 #include "console.h"
+#include "sync.h"
 
 static volatile uint16_t *const VGA = (uint16_t *)0xB8000;
 static uint8_t vga_row = 0;
 static uint8_t vga_col = 0;
 static uint8_t vga_color = 0x0F; /* bright white on black */
+/* The console may be written from both task and interrupt context (klog),
+ * so cursor/UART state uses IRQ-save locks: a holder is never preempted,
+ * which makes the short critical sections safe from every context. */
+static spinlock_t vga_lock = SPINLOCK_INIT;
+static spinlock_t serial_lock = SPINLOCK_INIT;
 
 void vga_clear(uint8_t color) {
     uint16_t blank = (uint16_t)((color << 8) | ' ');
+    irqflags_t flags = spin_lock_irqsave(&vga_lock);
     for (int i = 0; i < VGA_COLS * VGA_ROWS; i++)
         VGA[i] = blank;
     vga_row = 0;
     vga_col = 0;
     vga_color = color;
+    spin_unlock_irqrestore(&vga_lock, flags);
 }
 
 static void vga_scroll(void) {
@@ -25,9 +33,11 @@ static void vga_scroll(void) {
 }
 
 static void vga_putc(char c) {
+    irqflags_t flags = spin_lock_irqsave(&vga_lock);
     if (c == '\n') {
         vga_col = 0;
         if (++vga_row >= VGA_ROWS) vga_scroll();
+        spin_unlock_irqrestore(&vga_lock, flags);
         return;
     }
     VGA[vga_row * VGA_COLS + vga_col] =
@@ -36,6 +46,7 @@ static void vga_putc(char c) {
         vga_col = 0;
         if (++vga_row >= VGA_ROWS) vga_scroll();
     }
+    spin_unlock_irqrestore(&vga_lock, flags);
 }
 
 void console_putc(char c) {
@@ -75,10 +86,13 @@ void vga_dec(uint32_t v) {
 /* Draw a short status string at the top-right corner (overwrites in place). */
 void vga_corner(const char *s) {
     size_t len = strlen(s);
+    irqflags_t flags;
     if (len > VGA_COLS) len = VGA_COLS;
+    flags = spin_lock_irqsave(&vga_lock);
     for (size_t i = 0; i < len; i++)
         VGA[(VGA_COLS - len) + i] =
             (uint16_t)(((uint16_t)0x0E << 8) | (uint8_t)s[i]); /* yellow */
+    spin_unlock_irqrestore(&vga_lock, flags);
 }
 
 #define COM1 0x3F8
@@ -98,8 +112,10 @@ void serial_init(void) {
 }
 
 void serial_putc(char c) {
+    irqflags_t flags = spin_lock_irqsave(&serial_lock);
     while (!serial_ready()) { /* spin */ }
     outb(COM1, (uint8_t)c);
+    spin_unlock_irqrestore(&serial_lock, flags);
 }
 
 void serial_write(const char *s) {
