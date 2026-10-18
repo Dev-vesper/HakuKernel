@@ -20,6 +20,7 @@
 #define VFS_EINVAL HAKU_EINVAL
 #define VFS_EMFILE HAKU_EMFILE
 #define VFS_ENOSPC HAKU_ENOSPC
+#define VFS_EROFS  HAKU_EROFS
 #define VFS_ENOTDIR HAKU_ENOTDIR
 #define VFS_EISDIR  HAKU_EISDIR
 #define VFS_ENOTEMPTY HAKU_ENOTEMPTY
@@ -77,9 +78,14 @@ typedef struct vfs_device_ops {
 
 /* Boot-time assembly: backends register here, then one is mounted as the
  * root filesystem that all descriptor operations route to. register
- * returns 1/0; mount_root returns 1 or a negative -VFS_E* errno. */
+ * returns 1/0; mount_root returns 1 or a negative -VFS_E* errno.
+ * VFS_MOUNT_RDONLY mounts the root read-only: reads and metadata still
+ * work, while create/write/truncate/unlink/rename/mkdir/rmdir return
+ * -VFS_EROFS. An existing mount keeps serving if the new mount fails. */
+#define VFS_MOUNT_RDONLY 0x1u
 int vfs_register_fs(const vfs_fs_ops_t *ops);
 int32_t vfs_mount_root(const char *name);
+int32_t vfs_mount_root_flags(const char *name, uint32_t flags);
 /* Install a character device (the console) for the standard descriptors. */
 int vfs_register_device(const vfs_device_ops_t *ops);
 

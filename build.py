@@ -426,6 +426,7 @@ def main():
             "USER-EXIT-OK status=0 pid=1",
             "SCHED-REAP-OK",
             "FS-ERRORS-OK",  # missing/invalid/exists/badfd map to distinct errno
+            "FS-EROFS-OK",   # read-only mount rejects every mutating path
             "FS-FILE-EDGE-OK", # empty files, exact-sector, span, partial writes
             "FS-CORRUPT-OK", # cut/bad/reserved/cyclic chains + data-full ENOSPC
             "FS-ATA-OK",     # ATA bounds/null transfers rejected

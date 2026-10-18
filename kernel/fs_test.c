@@ -708,6 +708,74 @@ static int test_ata_errors(void) {
     return ok;
 }
 
+/* Read-only mount: reads and metadata stay available while every mutating
+ * path reports EROFS. A writable descriptor opened before the remount must
+ * fail its writes too, and remounting read-write restores the write path. */
+static int test_read_only(void) {
+    int pass = 1;
+    int32_t fd;
+    int32_t writable;
+
+    writable = vfs_open(FS_TEST_PID, "HAKU.ELF", VFS_O_RDWR);
+    pass &= expect("ro-preopen", writable >= 3 ? 0 : writable, 0);
+
+    pass &= expect("ro-mount",
+                   vfs_mount_root_flags("fat12", VFS_MOUNT_RDONLY), 1);
+
+    fd = vfs_open(FS_TEST_PID, "HAKU.ELF", VFS_O_RDONLY);
+    pass &= expect("ro-open-read", fd >= 3 ? 0 : fd, 0);
+    if (fd >= 3) {
+        pass &= expect("ro-read",
+                       vfs_read(FS_TEST_PID, (uint32_t)fd, scratch, 4), 4);
+        pass &= expect("ro-close",
+                       vfs_close(FS_TEST_PID, (uint32_t)fd), 0);
+    } else {
+        pass = 0;
+    }
+
+    pass &= expect("ro-open-write",
+                   vfs_open(FS_TEST_PID, "HAKU.ELF", VFS_O_WRONLY),
+                   -VFS_EROFS);
+    pass &= expect("ro-create",
+                   vfs_open(FS_TEST_PID, "RO.TXT",
+                            VFS_O_CREAT | VFS_O_WRONLY),
+                   -VFS_EROFS);
+    pass &= expect("ro-trunc",
+                   vfs_open(FS_TEST_PID, "HAKU.ELF",
+                            VFS_O_RDWR | VFS_O_TRUNC),
+                   -VFS_EROFS);
+    pass &= expect("ro-unlink", vfs_unlink(FS_TEST_PID, "HAKU.ELF"),
+                   -VFS_EROFS);
+    pass &= expect("ro-rename",
+                   vfs_rename(FS_TEST_PID, "HAKU.ELF", "RO.ELF"),
+                   -VFS_EROFS);
+    pass &= expect("ro-mkdir", vfs_mkdir(FS_TEST_PID, "RODIR"), -VFS_EROFS);
+    pass &= expect("ro-rmdir", vfs_rmdir(FS_TEST_PID, "RODIR"), -VFS_EROFS);
+
+    if (writable >= 3) {
+        pass &= expect("ro-late-write",
+                       vfs_write(FS_TEST_PID, (uint32_t)writable, scratch, 1),
+                       -VFS_EROFS);
+        pass &= expect("ro-late-close",
+                       vfs_close(FS_TEST_PID, (uint32_t)writable), 0);
+    } else {
+        pass = 0;
+    }
+
+    pass &= expect("ro-remount", vfs_mount_root_flags("fat12", 0), 1);
+    fd = vfs_open(FS_TEST_PID, "RO.TXT", VFS_O_CREAT | VFS_O_RDWR);
+    pass &= expect("rw-create", fd >= 3 ? 0 : fd, 0);
+    if (fd >= 3) {
+        pass &= expect("rw-write",
+                       vfs_write(FS_TEST_PID, (uint32_t)fd, scratch, 1), 1);
+        pass &= expect("rw-close", vfs_close(FS_TEST_PID, (uint32_t)fd), 0);
+        pass &= expect("rw-unlink", vfs_unlink(FS_TEST_PID, "RO.TXT"), 1);
+    } else {
+        pass = 0;
+    }
+    return pass;
+}
+
 void fs_error_self_test(void) {
     int32_t fd;
     int pass = 1;
@@ -802,6 +870,15 @@ void fs_error_self_test(void) {
     } else {
         klog_prefix();
         klog_write("FS-ERRORS-FAIL\n");
+    }
+
+    /* Read-only mount: EROFS on every mutating path, reads unaffected. */
+    if (test_read_only()) {
+        klog_prefix();
+        klog_write("FS-EROFS-OK: read-only mount rejects writes\n");
+    } else {
+        klog_prefix();
+        klog_write("FS-EROFS-FAIL\n");
     }
 
     /* Empty files and exact/crossing sector boundaries. */

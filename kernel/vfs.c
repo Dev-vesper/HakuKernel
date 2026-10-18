@@ -42,6 +42,7 @@ static vfs_ofd_t ofd_table[VFS_MAX_PROCESSES * VFS_FD_COUNT];
 static const vfs_fs_ops_t *fs_table[VFS_MAX_FS];
 static uint32_t fs_count;
 static const vfs_fs_ops_t *root_fs;
+static int root_read_only;
 static const vfs_device_ops_t *stdio_device;
 
 static int pid_valid(uint32_t pid) {
@@ -122,9 +123,13 @@ int vfs_register_fs(const vfs_fs_ops_t *ops) {
 }
 
 int32_t vfs_mount_root(const char *name) {
+    return vfs_mount_root_flags(name, 0);
+}
+
+int32_t vfs_mount_root_flags(const char *name, uint32_t flags) {
     const vfs_fs_ops_t *ops = 0;
     int32_t mounted;
-    if (!name) return -VFS_EINVAL;
+    if (!name || (flags & ~VFS_MOUNT_RDONLY)) return -VFS_EINVAL;
     for (uint32_t i = 0; i < fs_count; i++) {
         if (name_equal(fs_table[i]->name, name)) {
             ops = fs_table[i];
@@ -135,6 +140,7 @@ int32_t vfs_mount_root(const char *name) {
     mounted = ops->mount();
     if (mounted != 1) return mounted;
     root_fs = ops;
+    root_read_only = (flags & VFS_MOUNT_RDONLY) ? 1 : 0;
     return 1;
 }
 
@@ -143,6 +149,7 @@ void vfs_init(void) {
     memset(ofd_table, 0, sizeof(ofd_table));
     fs_count = 0;
     root_fs = 0;
+    root_read_only = 0;
     stdio_device = 0;
 }
 
@@ -222,6 +229,10 @@ int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
         ((flags & VFS_O_TRUNC) &&
          (flags & VFS_O_ACCMODE) == VFS_O_RDONLY))
         return -VFS_EINVAL;
+    if (root_read_only &&
+        ((flags & VFS_O_ACCMODE) != VFS_O_RDONLY ||
+         (flags & (VFS_O_CREAT | VFS_O_TRUNC))))
+        return -VFS_EROFS;
     if (!root_fs) return -VFS_EIO;
     for (fd = VFS_FIRST_FILE_FD; fd < VFS_FD_COUNT; fd++)
         if (!descriptors[pid - 1u][fd].used) break;
@@ -332,6 +343,7 @@ int32_t vfs_write(uint32_t pid, uint32_t fd, const void *buffer,
     ofd = fd_ofd(pid, fd);
     if (!ofd) return -VFS_EBADF;
     if (ofd->accmode == VFS_O_RDONLY) return -VFS_EBADF;
+    if (ofd->kind == VFS_OFD_FILE && root_read_only) return -VFS_EROFS;
     if (!buffer && count) return -VFS_EINVAL;
     if (ofd->kind == VFS_OFD_DEVICE) {
         write_result = ofd->device->write(buffer, count, &written);
@@ -367,6 +379,7 @@ int32_t vfs_unlink(uint32_t pid, const char *path) {
     int32_t removed;
     if (!pid_valid(pid) || !path) return -VFS_EINVAL;
     if (!root_fs) return -VFS_EIO;
+    if (root_read_only) return -VFS_EROFS;
     irq_flags = cpu_irq_save();
     removed = root_fs->unlink(path);
     cpu_irq_restore(irq_flags);
@@ -378,6 +391,7 @@ int32_t vfs_rename(uint32_t pid, const char *oldpath, const char *newpath) {
     int32_t renamed;
     if (!pid_valid(pid) || !oldpath || !newpath) return -VFS_EINVAL;
     if (!root_fs) return -VFS_EIO;
+    if (root_read_only) return -VFS_EROFS;
     irq_flags = cpu_irq_save();
     renamed = root_fs->rename(oldpath, newpath);
     cpu_irq_restore(irq_flags);
@@ -389,6 +403,7 @@ int32_t vfs_mkdir(uint32_t pid, const char *path) {
     int32_t created;
     if (!pid_valid(pid) || !path) return -VFS_EINVAL;
     if (!root_fs) return -VFS_EIO;
+    if (root_read_only) return -VFS_EROFS;
     irq_flags = cpu_irq_save();
     created = root_fs->mkdir(path);
     cpu_irq_restore(irq_flags);
@@ -400,6 +415,7 @@ int32_t vfs_rmdir(uint32_t pid, const char *path) {
     int32_t removed;
     if (!pid_valid(pid) || !path) return -VFS_EINVAL;
     if (!root_fs) return -VFS_EIO;
+    if (root_read_only) return -VFS_EROFS;
     irq_flags = cpu_irq_save();
     removed = root_fs->rmdir(path);
     cpu_irq_restore(irq_flags);

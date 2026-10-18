@@ -191,10 +191,15 @@ files give `ENOENT`, bad flags/whence/pointers give `EINVAL`, existing
 files give `EEXIST`, bad descriptors give `EBADF`, a full volume gives
 `ENOSPC`, a non-directory path component gives `ENOTDIR`, opening or
 unlinking a directory gives `EISDIR`, removing a non-empty directory gives
-`ENOTEMPTY`, and disk I/O failures give `EIO`. After the user process exits,
+`ENOTEMPTY`, and disk I/O failures give `EIO`. A root mounted with
+`VFS_MOUNT_RDONLY` rejects create, write, truncate, unlink, rename, mkdir,
+and rmdir with `EROFS` while reads and metadata keep working. After the
+user process exits,
 the idle task runs an error self-test (`FS-ERRORS-OK`) including a
 root-fill probe that must fail with `ENOSPC` (`FS-ENOSPC-OK`). The same
-pass also covers empty files, exact-sector and boundary-spanning I/O
+pass also remounts read-only, checks every mutating path returns `EROFS`,
+remounts read-write (`FS-EROFS-OK`), covers empty files, exact-sector and
+boundary-spanning I/O
 (`FS-FILE-EDGE-OK`), injected cut/bad/reserved/cyclic FAT chains (each
 restored, reads must give `EIO`, loops must terminate) plus a crafted
 full data area (`FS-CORRUPT-OK`), and ATA bounds/NULL-transfer rejection
@@ -283,7 +288,10 @@ rename/mkdir/rmdir/stat/fstat, each returning 1 or a `-VFS_E*` errno). VFS
 never names a concrete filesystem;
 `kernel/fat12_vfs.c` implements the vector for FAT12 (flag translation,
 per-open handle allocation, errno mapping) and registers it at boot, after
-which one backend is mounted as the root filesystem. Disk I/O is serialized
+which one backend is mounted as the root filesystem. A root can be mounted
+read-only (`vfs_mount_root_flags(..., VFS_MOUNT_RDONLY)`); VFS then returns
+`EROFS` for every mutating operation instead of calling the backend. Disk
+I/O is serialized
 against the preemptive scheduler; file contents and directory/FAT metadata
 are written through to the ATA disk. The current VFS supports up to five
 simultaneously open regular files per process (descriptors 3-7; `0`/`1`/`2`

@@ -74,10 +74,11 @@ unexpectedly lost image data across restarts.
   unlink/rename are path-aware; `stat` reports `S_IFDIR`; directories are
   single-cluster and do not grow yet; proven from ring 3 as `USER-DIR-OK`
   and the host-side inspector now recurses into subdirectories).
-- [ ] Implement and test relevant POSIX errors such as `EEXIST`, `ENOENT`,
-  `ENOSPC`, `ENOTDIR`, `EISDIR`, and `EROFS` (`EEXIST`/`ENOENT`/`ENOSPC`/
-  `ENOTDIR`/`EISDIR`/`ENOTEMPTY` are covered; `EROFS` still needs a
-  read-only mount).
+- [x] Implement and test relevant POSIX errors such as `EEXIST`, `ENOENT`,
+  `ENOSPC`, `ENOTDIR`, `EISDIR`, and `EROFS` (all covered, plus
+  `ENOTEMPTY`; root mounts can be read-only via `VFS_MOUNT_RDONLY`, which
+  rejects create/write/truncate/unlink/rename/mkdir/rmdir with `EROFS`
+  while reads keep working, tested as `FS-EROFS-OK`).
 - [ ] Introduce appropriate disk and file locks instead of disabling
   interrupts for the duration of all I/O; add a sector cache if needed.
 - [ ] Decide separately whether to support long filenames, partition tables,

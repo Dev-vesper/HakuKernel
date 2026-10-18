@@ -47,6 +47,7 @@
 #define HAKU_EINVAL        22u
 #define HAKU_EMFILE        24u
 #define HAKU_ENOSPC        28u
+#define HAKU_EROFS         30u
 #define HAKU_ENAMETOOLONG  36u
 #define HAKU_ENOSYS        38u
 #define HAKU_ENOTEMPTY     39u
