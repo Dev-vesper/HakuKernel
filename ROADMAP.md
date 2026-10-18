@@ -123,7 +123,7 @@ address-space or descriptor sharing.
 
 - [x] Add kernel synchronization primitives (spinlocks and IRQ-save locks) and
   define locking rules for the scheduler, allocators, VFS, and drivers
-  (`kernel/sync.h`/`.c`: `irq_lock`/`irq_unlock`, task-context
+  (`kernel/kernel/sync.h`/`.c`: `irq_lock`/`irq_unlock`, task-context
   `spin_lock`/`spin_unlock`, and `spin_lock_irqsave`; VFS uses one
   task-context lock around descriptor/OFD changes and backend calls, the
   frame/heap allocators and console use IRQ-save locks, ATA and the keyboard

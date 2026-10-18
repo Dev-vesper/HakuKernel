@@ -9,12 +9,13 @@ Usage:
     python build.py inspect ...     examine a FAT12 image (see --help there)
 
 Pipeline:
-    user.asm + exec_target.asm --nasm--> ELF files --mkfat12--> haku_fs.img
-    (fresh only)
-    kernel/*.c --cl--> kernel objects + entry/isr.asm --nasm--> entry objects
+    arch/x86/user/{user,child,exec_target}.asm --nasm--> ELF files
+        --mkfat12--> haku_fs.img (fresh only)
+    kernel/**/*.c --cl--> kernel objects
+    + arch/x86/kernel/{entry,isr}.asm --nasm--> entry objects
     kernel objects + entry objects --link--> kernel.pe --pe2bin--> kernel.bin
-    stage1.asm --nasm--> stage1.bin (512 B)
-    stage2.asm --nasm (kernel entry + size from PE)--> stage2.bin
+    arch/x86/boot/stage1.asm --nasm--> stage1.bin (512 B)
+    arch/x86/boot/stage2.asm --nasm (kernel entry + size from PE)--> stage2.bin
     stage1 + stage2 + kernel.bin --mkimg--> haku.img (boot floppy)
     QEMU boots haku.img and attaches haku_fs.img as primary-master ATA disk
 
@@ -238,19 +239,34 @@ def main():
         sys.exit(f"unexpected argument: {positionals[1]}")
 
     kernel_dir = os.path.join(ROOT, "kernel")
+    arch_dir = os.path.join(kernel_dir, "arch", "x86")
     include_dir = os.path.join(ROOT, "include")
     verify_abi_headers(include_dir)
-    c_files = sorted(glob.glob(os.path.join(kernel_dir, "*.c")))
+    c_files = sorted(glob.glob(os.path.join(kernel_dir, "**", "*.c"),
+                                recursive=True))
     if not c_files:
-        sys.exit("no kernel/*.c files found")
-    entry_asm = os.path.join(kernel_dir, "entry.asm")
-    isr_asm = os.path.join(kernel_dir, "isr.asm")
-    user_asm = os.path.join(kernel_dir, "user.asm")
-    exec_target_asm = os.path.join(kernel_dir, "exec_target.asm")
-    child_asm = os.path.join(kernel_dir, "child.asm")
-    boot_dir = os.path.join(ROOT, "boot")
+        sys.exit("no kernel/**/*.c files found")
+    entry_asm = os.path.join(arch_dir, "kernel", "entry.asm")
+    isr_asm = os.path.join(arch_dir, "kernel", "isr.asm")
+    user_asm = os.path.join(arch_dir, "user", "user.asm")
+    exec_target_asm = os.path.join(arch_dir, "user", "exec_target.asm")
+    child_asm = os.path.join(arch_dir, "user", "child.asm")
+    boot_dir = os.path.join(arch_dir, "boot")
     stage1_asm = os.path.join(boot_dir, "stage1.asm")
     stage2_asm = os.path.join(boot_dir, "stage2.asm")
+    # Every kernel header directory is an include path so flat
+    # #include "foo.h" directives keep working across subdirectories
+    # (Linux-style ccflags; header names are unique across the tree).
+    kernel_header_dirs = [
+        os.path.join(arch_dir, "kernel"),
+        os.path.join(arch_dir, "mm"),
+        os.path.join(arch_dir, "elf"),
+        os.path.join(kernel_dir, "drivers"),
+        os.path.join(kernel_dir, "fs", "fat12"),
+        os.path.join(kernel_dir, "fs", "vfs"),
+        os.path.join(kernel_dir, "fs", "test"),
+        os.path.join(kernel_dir, "kernel"),
+    ]
     fat12_script = os.path.join(ROOT, "tools", "mkfat12.py")
     entry_obj = os.path.join(BUILD, "entry.obj")
     isr_obj = os.path.join(BUILD, "isr.obj")
@@ -290,7 +306,7 @@ def main():
                            os.path.getmtime(exec_target_asm),
                            os.path.getmtime(child_asm))
         if source_mtime > os.path.getmtime(filesystem_image):
-            log("WARNING: kernel/user.asm is newer than the data image - "
+            log(f"WARNING: {os.path.basename(user_asm)} is newer than the data image - "
                 "test ELFs on disk may be stale; rerun with --fresh")
 
     # 2. kernel C files -> COFF objects
@@ -298,13 +314,15 @@ def main():
     for src in c_files:
         obj = os.path.join(BUILD, os.path.splitext(os.path.basename(src))[0] + ".obj")
         run(cc + ["/nologo", "/c", "/GS-", "/Os", "/W3",
-                  "/I" + include_dir, "/Fo" + obj, src])
+                  "/I" + include_dir]
+            + ["/I" + d for d in kernel_header_dirs]
+            + ["/Fo" + obj, src])
         c_objs.append(obj)
     log(f"{len(c_objs)} C objects built")
 
     # 3. asm stubs -> COFF (entry linked FIRST so the image starts there)
-    run([nasm, "-f", "win32", entry_asm, "-o", entry_obj])
-    run([nasm, "-f", "win32", isr_asm, "-o", isr_obj])
+    run([nasm, "-I" + nasm_include, "-f", "win32", entry_asm, "-o", entry_obj])
+    run([nasm, "-I" + nasm_include, "-f", "win32", isr_asm, "-o", isr_obj])
     log("entry.obj + isr.obj built")
 
     # 4. link a fixed-base PE (/ENTRY:entry — link prepends _ for x86;

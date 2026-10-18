@@ -37,8 +37,8 @@ replacement, process exit/reaping, and timer IRQs through the serial log.
 
 `build/haku_fs.img` is the ATA data disk and is treated as user data: an
 existing image is reused untouched, so files created in a previous QEMU
-session survive the next build. It is (re)created from `kernel/user.asm`,
-`kernel/exec_target.asm`, and `kernel/child.asm` only when missing or with
+session survive the next build. It is (re)created from `kernel/arch/x86/user/user.asm`,
+`kernel/arch/x86/user/exec_target.asm`, and `kernel/arch/x86/user/child.asm` only when missing or with
 `--fresh`. If any test-program assembly source is newer than a reused image,
 the build warns that its test ELFs on disk may be stale. `headless` always
 starts from a fresh image (its fault-injection tests mutate the disk) and,
@@ -58,11 +58,11 @@ lists just work.
 
 ```
 BIOS (0x7C00)
-  └─ boot/stage1.asm + boot/stage2.asm (16-bit): load kernel at 0x10000
-     → A20 (Linux-style: test after BIOS/KBC/fast methods) → GDT → CR0.PE=1
-        └─ far jump to KERNEL_ENTRY (= PE entry point from link.exe)
-              └─ kernel/entry.asm (_entry stub) → call kernel_main
-                    └─ kernel/kernel.c: paging/IDT → GDT+TSS → scheduler
+  └─ kernel/arch/x86/boot/{stage1,stage2}.asm (16-bit): load kernel at 0x10000
+      → A20 (Linux-style: test after BIOS/KBC/fast methods) → GDT → CR0.PE=1
+         └─ far jump to KERNEL_ENTRY (= PE entry point from link.exe)
+               └─ kernel/arch/x86/kernel/entry.asm (_entry stub) → call kernel_main
+                     └─ kernel/kernel/kernel_main.c: paging/IDT → GDT+TSS → scheduler
                           └─ timer-preempted ring-3 processes → int 0x80
 ```
 
@@ -85,9 +85,9 @@ Memory map:
 
 ### Interrupts (IDT)
 
-`kernel/isr.asm` builds a uniform stack frame for all 256 vectors (dummy
-error code where the CPU pushes none), saves all data segments, and calls
-into C. `kernel/idt.c`
+`kernel/arch/x86/kernel/isr.asm` builds a uniform stack frame for all 256
+vectors (dummy error code where the CPU pushes none), saves all data segments,
+and calls into C. `kernel/arch/x86/kernel/idt.c`
 installs 32 exception gates (0–31), 16 IRQ gates (32–47, used once the
 8259 is remapped) and a catch-all for 48–255 that reports instead of
 triple-faulting. The syscall gate at vector 128 is DPL 3; all other gates
@@ -96,7 +96,7 @@ The boot proves the exception path with an `INT3` self-test.
 
 ### Physical frame allocator
 
-`kernel/frame.c` now builds its usable-frame bitmap from the 64-bit base and
+`kernel/arch/x86/mm/frame.c` now builds its usable-frame bitmap from the 64-bit base and
 length fields in the E820 entries. Only complete 4 KiB pages wholly inside
 type-1 usable ranges are admitted; invalid entries and overlapping reserved
 ranges are excluded. The allocator explicitly reserves low boot/firmware
@@ -108,7 +108,7 @@ allocation state so reserved pages cannot accidentally be released.
 
 ### Processes and preemptive scheduling
 
-`kernel/scheduler.c` starts the initial process from `HAKU.ELF`; a successful
+`kernel/kernel/scheduler.c` starts the initial process from `HAKU.ELF`; a successful
 `spawn` creates a child process from a root-filesystem ELF and `waitpid`
 suspends the parent until the requested child exits. Exit status is returned
 in the traditional high-byte wait status format; a successful wait reaps the
@@ -128,12 +128,12 @@ kernel stack are reclaimed after execution has moved to another stack. When
 no user process is runnable, the scheduler runs a dedicated kernel idle
 context.
 
-`kernel/gdt.c` installs flat ring-0/ring-3 code and data descriptors plus a
-32-bit TSS. `kernel/paging.c` gives each process supervisor-only kernel
+`kernel/arch/x86/kernel/gdt.c` installs flat ring-0/ring-3 code and data descriptors plus a
+32-bit TSS. `kernel/arch/x86/mm/paging.c` gives each process supervisor-only kernel
 identity mappings and maps its user program and two-page user stack with
 user permissions.
 
-`kernel/user.asm` is built as an ELF32 image and entered via `iret` at CPL 3.
+`kernel/arch/x86/user/user.asm` is built as an ELF32 image and entered via `iret` at CPL 3.
 It tests `spawn` (`0x1000`, Haku-specific) and `waitpid` (7), as well as
 `execve` (11), which loads another ELF32 image, builds an aligned
 initial user stack containing `argc`, `argv`, `envp`, and a terminating
@@ -273,20 +273,20 @@ operation.
 
 ### ATA PIO and FAT12
 
-`kernel/ata.c` detects the primary-master ATA device with IDENTIFY and reads
-and writes LBA28 sectors using bounded polling PIO. `kernel/fat12.c` mounts a
+`kernel/drivers/ata.c` detects the primary-master ATA device with IDENTIFY and reads
+and writes LBA28 sectors using bounded polling PIO. `kernel/fs/fat12/fat12.c` mounts a
 FAT12 superfloppy and supports creating, reading, writing, truncating and
 seeking 8.3-named files anywhere in the tree, plus `mkdir`/`rmdir` of
 single-cluster subdirectories with real `.`/`..` entries. Paths are
 `/`-separated and resolved from the root; `.` and `..` are handled during
 resolution. Cluster allocation, release, mirrored FAT updates and
 volume/chain bounds checks are shared by files and directories.
-`kernel/vfs.c` supplies per-process descriptors and the user `open`, `close`,
+`kernel/fs/vfs/vfs.c` supplies per-process descriptors and the user `open`, `close`,
 `read`, `write`, and `lseek` interface through a filesystem-independent
 operations vector (`vfs_fs_ops`: mount/open/close/read/write/seek/unlink/
 rename/mkdir/rmdir/stat/fstat, each returning 1 or a `-VFS_E*` errno). VFS
 never names a concrete filesystem;
-`kernel/fat12_vfs.c` implements the vector for FAT12 (flag translation,
+`kernel/fs/fat12/fat12_vfs.c` implements the vector for FAT12 (flag translation,
 per-open handle allocation, errno mapping) and registers it at boot, after
 which one backend is mounted as the root filesystem. A root can be mounted
 read-only (`vfs_mount_root_flags(..., VFS_MOUNT_RDONLY)`); VFS then returns
@@ -317,7 +317,7 @@ image.
 
 ### Locking
 
-`kernel/sync.h` provides three primitives on top of `cpu_irq_save`/`restore`:
+`kernel/kernel/sync.h` provides three primitives on top of `cpu_irq_save`/`restore`:
 
 - `irq_lock`/`irq_unlock` — a plain IRQ-save pair for short critical sections
   that never block and never call into a blocking path. Nests correctly.
@@ -336,26 +336,26 @@ The locking rules per subsystem:
   would never run again to release it. `scheduler_spawn` therefore reserves a
   task slot, then re-enables interrupts for `vfs_inherit` before publishing the
   task as runnable.
-- **Allocators** (`kernel/frame.c`, `kernel/heap.c`): IRQ-save spinlocks. The
-  free-list/bitmap updates are short and the holder cannot be preempted, so the
-  allocators are safe from both task and interrupt context.
-- **VFS** (`kernel/vfs.c`): one task-context spinlock, `vfs_lock`, around all
+- **Allocators** (`kernel/arch/x86/mm/frame.c`, `kernel/kernel/heap.c`): IRQ-save
+  spinlocks. The free-list/bitmap updates are short and the holder cannot be
+  preempted, so the allocators are safe from both task and interrupt context.
+- **VFS** (`kernel/fs/vfs/vfs.c`): one task-context spinlock, `vfs_lock`, around all
   descriptor/OFD table changes and file-backend calls. Interrupts stay enabled
   during disk I/O, so a preempted holder can finish; console device I/O drops
   the lock first because it may block. `ofd_release` does not lock — callers
   hold `vfs_lock`.
-- **Drivers**: `kernel/ata.c` uses a task-context spinlock around the polling
-  transfers; `kernel/kbd.c` uses an IRQ-save pair around the ring-buffer poll
-  (single-producer IRQ1, single-consumer task); `kernel/console.c` protects
-  VGA/UART state with IRQ-save spinlocks because `klog` may run from interrupt
-  context.
+- **Drivers**: `kernel/drivers/ata.c` uses a task-context spinlock around the polling
+  transfers; `kernel/arch/x86/kernel/kbd.c` uses an IRQ-save pair around the
+  ring-buffer poll (single-producer IRQ1, single-consumer task);
+  `kernel/drivers/console.c` protects VGA/UART state with IRQ-save spinlocks
+  because `klog` may run from interrupt context.
 
 Locks are non-recursive; the only ordering rule is VFS → backend, never the
 reverse.
 
 ### ELF32 program loading
 
-`kernel/elf.c` loads static ELF32 little-endian i386 `ET_EXEC` images read
+`kernel/arch/x86/elf/elf.c` loads static ELF32 little-endian i386 `ET_EXEC` images read
 from FAT12. It validates the ELF header and program-header bounds, accepts
 non-overlapping readable `PT_LOAD` segments, checks address arithmetic and
 file ranges, and rejects dynamic/interpreted images and writable-executable
@@ -374,7 +374,7 @@ loader buffer are not supported.
 
 MS `link.exe` cannot emit flat binaries and raw COFF objects carry
 MSVC-specific relocations, so we let the **real linker** do its job:
-`entry.obj + kernel/isr/user objects + kernel C objects` → fixed-base PE
+`entry.obj + arch/x86/kernel/isr + arch/x86/user objects + kernel C objects` → fixed-base PE
 (`/BASE:0x10000 /ENTRY:entry`),
 then the Python script only copies section bytes to their RVA — zero
 relocation math on our side, zero MSVC quirks to chase. The reported
@@ -391,32 +391,38 @@ loop), and the COM1 init mirrors Linux `early_serial_init`.
 
 ```
 Haku/
-  boot/stage1.asm      16-bit boot sector; loads stage 2
-  boot/stage2.asm      CHS kernel loader (up to 448 KiB) → A20 → GDT → protected mode
-  kernel/entry.asm     32-bit entry stub (_entry, linked first via /ENTRY)
-  kernel/isr.asm       interrupt stubs, GDT/TSS load, ring-3 transition + syscalls
-  kernel/user.asm      ELF32 initial process and syscall integration test
-  kernel/exec_target.asm second ELF32 image for execve tests
-  kernel/child.asm     ELF32 child for spawn/waitpid tests
-  kernel/ata.h/.c      primary-master ATA LBA28 polling PIO driver
-  kernel/fat12.h/.c    writable FAT12 files, subdirectories, and paths
-  kernel/fat12_vfs.h/.c FAT12 backend: vfs_fs_ops vector + errno translation
-  kernel/vfs.h/.c      fs-independent descriptors, registry, root mount
-  kernel/elf.h/.c      validated ELF32 PT_LOAD loader and fresh user address spaces
-  kernel/cpu.h/cpu.c   types, port I/O, tiny libc (memset & friends, no CRT)
-  kernel/sync.h/.c     spinlocks and IRQ-save locks + locking rules
-  kernel/console.h/.c  VGA text + COM1 serial drivers
-  kernel/idt.h/idt.c   IDT gates, exception/IRQ dispatchers (+ #PF handler)
-  kernel/gdt.h/.c      flat ring-0/ring-3 GDT and dedicated TSS stack
-  kernel/usermode.h/.c user mappings, bounded write/exit syscall ABI
-  kernel/paging.h/.c   i386 page tables: 8 MiB identity map + user pages
-  kernel/frame.h/.c    E820-backed frame inventory (128 MiB tracked, allocations within mapped 8 MiB)
-  kernel/kernel.c      kernel startup, ring-3 demo, PIC/PIT + keyboard loop
+  kernel/
+    arch/x86/
+      boot/             stage1.asm + stage2.asm: 16-bit boot sector and CHS
+                        kernel loader (up to 448 KiB) → A20 → GDT → protected mode
+      kernel/           entry.asm + isr.asm: 32-bit entry, interrupt stubs,
+                        GDT/TSS load, ring-3 transition + syscalls
+                        cpu/gdt/idt/pic/pit/kbd: port I/O, descriptor tables,
+                        PIC/PIT, and the PS/2 keyboard driver
+      mm/               paging.c/.h: i386 page tables (8 MiB identity map + user)
+                        frame.c/.h: E820-backed physical page inventory
+      elf/              elf.c/.h: validated ELF32 PT_LOAD loader + user spaces
+      user/             user.asm, child.asm, exec_target.asm: ELF32 test
+                        programs (syscall, spawn/waitpid, execve coverage)
+    drivers/            ata.c/.h: primary-master ATA LBA28 polling PIO
+                        console.c/.h: VGA text + COM1 serial
+    fs/
+      fat12/            fat12.c/.h: writable FAT12 files, subdirectories, paths
+                        fat12_vfs.c/.h: FAT12 vfs_fs_ops backend + errno mapping
+      vfs/              vfs.c/.h: fs-independent descriptors, registry, root mount
+      test/             fs_test.c/.h: kernel-side filesystem self-tests
+    kernel/             kernel_main.c: kernel startup
+                        scheduler.c/.h: preemptive process scheduler
+                        sync.c/.h: spinlocks and IRQ-save locks + locking rules
+                        usermode.c/.h: user mappings, syscall ABI, heap/mmap
+                        klog.c/.h: timestamped console logging
+                        heap.c/.h: kernel kmalloc/kfree allocator
+  include/haku/         abi.h + abi.inc: shared user/kernel ABI constants
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       boot floppy size/signature checks
   tools/mkfat12.py     FAT12 image builder for the user ELF
   build.py             the whole build: cl/link/nasm/qemu orchestration
-  build/               generated files (stage*.bin, kernel.obj/pe, haku.img, ...)
+  build/               generated files (stage*.bin, *.obj/pe, haku.img, ...)
   haku.img             bootable floppy image
   build/haku_fs.img    1.44 MB FAT12 ATA disk image with HAKU.ELF
 ```
