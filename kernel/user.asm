@@ -1357,6 +1357,148 @@ _user_program_start:
     cmp eax, edx
     jne .fail
 
+    ; Subdirectories and basic paths, including "." and ".." rules.
+    mov esi, 96
+    mov eax, SYS_MKDIR
+    mov ebx, USER_DATA_BASE + (dir_path - data_start)      ; "DIR1"
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 97
+    mov eax, SYS_MKDIR
+    mov ebx, USER_DATA_BASE + (dir_path - data_start)
+    int 0x80
+    cmp eax, -17                ; a repeated mkdir is EEXIST
+    jne .fail
+    mov esi, 98
+    mov eax, SYS_STAT
+    mov ebx, USER_DATA_BASE + (dir_path - data_start)
+    mov ecx, USER_DATA_BASE + (stat_buf - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, [USER_DATA_BASE + (stat_buf - data_start) + 4]
+    and eax, 0xF000
+    cmp eax, HAKU_S_IFDIR       ; stat reports the directory mode
+    jne .fail
+    mov esi, 99
+    mov eax, SYS_OPEN
+    mov ebx, USER_DATA_BASE + (dir_file_path - data_start) ; "DIR1/T.TXT"
+    mov ecx, HAKU_O_RDWR | HAKU_O_CREAT
+    int 0x80
+    cmp eax, 3
+    jne .fail
+    mov [USER_DATA_BASE + (dir_fd - data_start)], eax
+    mov esi, 100
+    mov eax, SYS_WRITE
+    mov ebx, [USER_DATA_BASE + (dir_fd - data_start)]
+    mov ecx, USER_DATA_BASE + (dir_payload - data_start)
+    mov edx, dir_payload_end - dir_payload
+    int 0x80
+    cmp eax, dir_payload_end - dir_payload
+    jne .fail
+    mov esi, 101
+    mov eax, SYS_CLOSE
+    mov ebx, [USER_DATA_BASE + (dir_fd - data_start)]
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 102
+    mov eax, SYS_OPEN                ; "./DIR1/../DIR1/T.TXT"
+    mov ebx, USER_DATA_BASE + (dir_dotdot_path - data_start)
+    xor ecx, ecx
+    int 0x80
+    cmp eax, 3
+    jne .fail
+    mov [USER_DATA_BASE + (dir_fd - data_start)], eax
+    mov esi, 103
+    mov eax, SYS_READ
+    mov ebx, [USER_DATA_BASE + (dir_fd - data_start)]
+    mov ecx, USER_DATA_BASE + (dir_readback - data_start)
+    mov edx, dir_payload_end - dir_payload
+    int 0x80
+    cmp eax, dir_payload_end - dir_payload
+    jne .fail
+    mov ecx, dir_payload_end - dir_payload
+    xor edi, edi
+.dir_cmp:
+    mov al, [USER_DATA_BASE + (dir_readback - data_start) + edi]
+    cmp al, [USER_DATA_BASE + (dir_payload - data_start) + edi]
+    jne .fail
+    inc edi
+    cmp edi, ecx
+    jb .dir_cmp
+    mov esi, 104
+    mov eax, SYS_CLOSE
+    mov ebx, [USER_DATA_BASE + (dir_fd - data_start)]
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 105
+    mov eax, SYS_OPEN                ; open on a directory is EISDIR
+    mov ebx, USER_DATA_BASE + (dir_path - data_start)
+    xor ecx, ecx
+    int 0x80
+    cmp eax, -21
+    jne .fail
+    mov esi, 106
+    mov eax, SYS_OPEN                ; a file used as a directory is ENOTDIR
+    mov ebx, USER_DATA_BASE + (dir_notdir_path - data_start) ; "HAKU.ELF/X"
+    xor ecx, ecx
+    int 0x80
+    cmp eax, -20
+    jne .fail
+    mov esi, 107
+    mov eax, SYS_MKDIR               ; a missing parent is ENOENT
+    mov ebx, USER_DATA_BASE + (dir_missing - data_start) ; "NOPE/DIR"
+    int 0x80
+    cmp eax, -2
+    jne .fail
+    mov esi, 108
+    mov eax, SYS_UNLINK              ; unlink on a directory is EISDIR
+    mov ebx, USER_DATA_BASE + (dir_path - data_start)
+    int 0x80
+    cmp eax, -21
+    jne .fail
+    mov esi, 109
+    mov eax, SYS_RMDIR               ; a non-empty directory is ENOTEMPTY
+    mov ebx, USER_DATA_BASE + (dir_path - data_start)
+    int 0x80
+    cmp eax, -39
+    jne .fail
+    mov esi, 110
+    mov eax, SYS_UNLINK
+    mov ebx, USER_DATA_BASE + (dir_file_path - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 111
+    mov eax, SYS_RMDIR
+    mov ebx, USER_DATA_BASE + (dir_path - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 112
+    mov eax, SYS_MKDIR               ; a plain empty directory round-trips
+    mov ebx, USER_DATA_BASE + (dir_empty_path - data_start) ; "EMPTY"
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 113
+    mov eax, SYS_RMDIR
+    mov ebx, USER_DATA_BASE + (dir_empty_path - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 114
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (dir_message - data_start)
+    mov edx, dir_message_end - dir_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
     ; Failed exec attempts must leave this process image intact.
     mov esi, 61
     mov eax, SYS_EXECVE
@@ -1562,6 +1704,28 @@ mmap_bad_flags:
 mem_message:
     db "USER-MEM-OK brk grows a heap and mmap maps anonymous pages", 10
 mem_message_end:
+dir_path:
+    db "DIR1", 0
+dir_file_path:
+    db "DIR1/T.TXT", 0
+dir_dotdot_path:
+    db "./DIR1/../DIR1/T.TXT", 0
+dir_notdir_path:
+    db "HAKU.ELF/X", 0
+dir_missing:
+    db "NOPE/DIR", 0
+dir_empty_path:
+    db "EMPTY", 0
+dir_fd:
+    dd 0
+dir_payload:
+    db "DIR-HELLO"
+dir_payload_end:
+dir_readback:
+    times dir_payload_end - dir_payload db 0
+dir_message:
+    db "USER-DIR-OK subdirectories, paths, and . / .. resolution", 10
+dir_message_end:
 stat_buf:
     times 8 db 0
 exec_path:

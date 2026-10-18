@@ -343,7 +343,7 @@ static uint32_t sys_read(uint32_t fd, uint32_t user_buffer,
 }
 
 static uint32_t sys_open(uint32_t user_path, uint32_t flags) {
-    char path[13];
+    char path[VFS_PATH_MAX];
     for (uint32_t i = 0; i < sizeof(path); i++) {
         if (user_path > 0xFFFFFFFFu - i ||
             !paging_user_range_valid(user_path + i, 1, 0))
@@ -357,10 +357,10 @@ static uint32_t sys_open(uint32_t user_path, uint32_t flags) {
     return copy_from_user_error(HAKU_ENAMETOOLONG);
 }
 
-/* Copy a user path into a 13-byte kernel buffer. Returns 1 on success,
- * otherwise a negative -HAKU_E* errno ready to return to the caller. */
-static int copy_user_path(uint32_t user_path, char out[13]) {
-    for (uint32_t i = 0; i < 13u; i++) {
+/* Copy a user path into a VFS_PATH_MAX kernel buffer. Returns 1 on
+ * success, otherwise a negative -HAKU_E* errno ready to return. */
+static int copy_user_path(uint32_t user_path, char out[VFS_PATH_MAX]) {
+    for (uint32_t i = 0; i < VFS_PATH_MAX; i++) {
         if (user_path > 0xFFFFFFFFu - i ||
             !paging_user_range_valid(user_path + i, 1, 0))
             return -(int32_t)HAKU_EFAULT;
@@ -423,7 +423,7 @@ static int32_t load_elf_file(uint32_t pid, const char *path,
 
 static uint32_t sys_execve(uint32_t user_path, uint32_t user_argv,
                            uint32_t user_envp, regs_t *frame) {
-    char path[13];
+    char path[VFS_PATH_MAX];
     loaded_elf_t replacement;
     exec_arguments_t arguments;
     int32_t result;
@@ -464,7 +464,7 @@ static uint32_t sys_execve(uint32_t user_path, uint32_t user_argv,
 }
 
 static uint32_t sys_spawn(uint32_t user_path) {
-    char path[13];
+    char path[VFS_PATH_MAX];
     loaded_elf_t program;
     exec_arguments_t arguments;
     int32_t result;
@@ -503,7 +503,7 @@ static regs_t *sys_waitpid(regs_t *frame, uint32_t pid, uint32_t user_status,
 
 /* POSIX returns 0 on success here: translate the VFS-internal 1. */
 static uint32_t sys_unlink(uint32_t user_path) {
-    char path[13];
+    char path[VFS_PATH_MAX];
     int32_t result;
     int copied = copy_user_path(user_path, path);
     if (copied != 1) return (uint32_t)copied;
@@ -512,8 +512,8 @@ static uint32_t sys_unlink(uint32_t user_path) {
 }
 
 static uint32_t sys_rename(uint32_t user_old, uint32_t user_new) {
-    char oldpath[13];
-    char newpath[13];
+    char oldpath[VFS_PATH_MAX];
+    char newpath[VFS_PATH_MAX];
     int32_t result;
     int copied_old = copy_user_path(user_old, oldpath);
     int copied_new = copy_user_path(user_new, newpath);
@@ -523,8 +523,26 @@ static uint32_t sys_rename(uint32_t user_old, uint32_t user_new) {
     return result == 1 ? 0u : (uint32_t)result;
 }
 
+static uint32_t sys_mkdir(uint32_t user_path) {
+    char path[VFS_PATH_MAX];
+    int32_t result;
+    int copied = copy_user_path(user_path, path);
+    if (copied != 1) return (uint32_t)copied;
+    result = vfs_mkdir(scheduler_current_pid(), path);
+    return result == 1 ? 0u : (uint32_t)result;
+}
+
+static uint32_t sys_rmdir(uint32_t user_path) {
+    char path[VFS_PATH_MAX];
+    int32_t result;
+    int copied = copy_user_path(user_path, path);
+    if (copied != 1) return (uint32_t)copied;
+    result = vfs_rmdir(scheduler_current_pid(), path);
+    return result == 1 ? 0u : (uint32_t)result;
+}
+
 static uint32_t sys_stat(uint32_t user_path, uint32_t user_buf) {
-    char path[13];
+    char path[VFS_PATH_MAX];
     vfs_stat_t st;
     int32_t result;
     int copied = copy_user_path(user_path, path);
@@ -655,6 +673,12 @@ regs_t *user_syscall(regs_t *r) {
         return r;
     case HAKU_SYS_RENAME:
         r->eax = sys_rename(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_MKDIR:
+        r->eax = sys_mkdir(r->ebx);
+        return r;
+    case HAKU_SYS_RMDIR:
+        r->eax = sys_rmdir(r->ebx);
         return r;
     case HAKU_SYS_DUP:
         r->eax = (uint32_t)vfs_dup(scheduler_current_pid(), r->ebx);

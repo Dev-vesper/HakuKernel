@@ -109,7 +109,8 @@ static uint32_t ofd_slot(const vfs_ofd_t *ofd) {
 int vfs_register_fs(const vfs_fs_ops_t *ops) {
     if (!ops || !ops->name || !ops->mount || !ops->open || !ops->close ||
         !ops->read || !ops->write || !ops->seek || !ops->unlink ||
-        !ops->rename || !ops->stat || !ops->fstat)
+        !ops->rename || !ops->mkdir || !ops->rmdir || !ops->stat ||
+        !ops->fstat)
         return 0;
     for (uint32_t i = 0; i < fs_count; i++) {
         if (fs_table[i] == ops || name_equal(fs_table[i]->name, ops->name))
@@ -381,6 +382,28 @@ int32_t vfs_rename(uint32_t pid, const char *oldpath, const char *newpath) {
     renamed = root_fs->rename(oldpath, newpath);
     cpu_irq_restore(irq_flags);
     return renamed;
+}
+
+int32_t vfs_mkdir(uint32_t pid, const char *path) {
+    uint32_t irq_flags;
+    int32_t created;
+    if (!pid_valid(pid) || !path) return -VFS_EINVAL;
+    if (!root_fs) return -VFS_EIO;
+    irq_flags = cpu_irq_save();
+    created = root_fs->mkdir(path);
+    cpu_irq_restore(irq_flags);
+    return created;
+}
+
+int32_t vfs_rmdir(uint32_t pid, const char *path) {
+    uint32_t irq_flags;
+    int32_t removed;
+    if (!pid_valid(pid) || !path) return -VFS_EINVAL;
+    if (!root_fs) return -VFS_EIO;
+    irq_flags = cpu_irq_save();
+    removed = root_fs->rmdir(path);
+    cpu_irq_restore(irq_flags);
+    return removed;
 }
 
 int32_t vfs_stat(uint32_t pid, const char *path, vfs_stat_t *out) {

@@ -198,21 +198,115 @@ def read_file_bytes(data, bpb, fat, entry):
     return bytes(out[:entry["size"]])
 
 
+def walk_all(fat, first, nclusters):
+    """Follow a whole chain to EOF; error only on damaged links/cycles."""
+    chain = []
+    seen = set()
+    current = first
+    while 2 <= current <= nclusters + 1:
+        if current in seen:
+            return chain, "cyclic chain at cluster %d" % current
+        seen.add(current)
+        chain.append(current)
+        if len(chain) > nclusters + 1:
+            return chain, "chain longer than volume"
+        value = fat12_get(fat, current)
+        if value == BAD:
+            return chain, "chain hits BAD cluster"
+        if value >= EOC_MIN:
+            return chain, None
+        current = value
+    if not chain:
+        return chain, "directory starts at cluster %d" % first
+    return chain, None
+
+
+def read_dir_entries(data, bpb, fat, first):
+    """Return (entries, chain, error) for the root region or one directory."""
+    entries = []
+    if first == 0:
+        base = bpb["root_start"] * SECTOR
+        for index in range(bpb["roots"]):
+            entry = data[base + index * 32: base + (index + 1) * 32]
+            if len(entry) < 32 or entry[0] == 0x00:
+                break
+            entries.append(entry)
+        return entries, [], None
+    chain, error = walk_all(fat, first, bpb["clusters"])
+    if error:
+        return entries, chain, error
+    for cluster in chain:
+        lba = bpb["data_start"] + (cluster - 2) * bpb["spc"]
+        block = data[lba * SECTOR:(lba + bpb["spc"]) * SECTOR]
+        for offset in range(0, len(block), 32):
+            entry = block[offset:offset + 32]
+            if len(entry) < 32 or entry[0] == 0x00:
+                return entries, chain, None
+            entries.append(entry)
+    return entries, chain, None
+
+
+def summarize_dir(data, bpb, fat, first, prefix, held, lines, problems,
+                  visited):
+    """Recursively census one directory's files and subdirectories."""
+    if first == 0:
+        problems.append(f"{prefix.rstrip('/')}: directory has no cluster")
+        return
+    entries, chain, error = read_dir_entries(data, bpb, fat, first)
+    for cluster in chain:
+        held.setdefault(cluster, prefix.rstrip("/"))
+    if error:
+        problems.append(f"{prefix.rstrip('/')}: {error}")
+        return
+    if first in visited:
+        problems.append(f"{prefix.rstrip('/')}: directory cycle")
+        return
+    visited.add(first)
+    for entry in entries:
+        if entry[0] == 0xE5:
+            continue
+        attr = entry[11]
+        if attr == 0x0F:
+            continue  # long-name fragment
+        if attr & 0x08 and not attr & 0x10:
+            continue  # volume label
+        raw = entry[0:11]
+        name = show_name(raw)
+        if attr & 0x10 and name in (".", ".."):
+            continue  # structural self/parent links
+        first_cluster = struct.unpack_from("<H", entry, 26)[0]
+        size = struct.unpack_from("<I", entry, 28)[0]
+        full = prefix + name
+        record = {"raw": raw, "attr": attr, "first": first_cluster,
+                  "size": size, "index": 0}
+        if attr & 0x10:
+            summarize_dir(data, bpb, fat, first_cluster, full + "/", held,
+                          lines, problems, visited)
+            lines.append((record, None, "DIR"))
+            continue
+        needed = 0 if size == 0 else (
+            (size + bpb["cluster_bytes"] - 1) // bpb["cluster_bytes"])
+        file_chain, file_error = walk_chain(fat, first_cluster, needed,
+                                            bpb["clusters"])
+        for cluster in file_chain:
+            held.setdefault(cluster, full)
+        lines.append((record, file_chain, file_error if file_error else "OK"))
+        if file_error:
+            problems.append(f"{full}: {file_error}")
+
+
 def summarize(data, bpb, fat, files, deleted):
-    """Census clusters; return (lines, problems)."""
+    """Census clusters (recursing into subdirectories); (lines, problems, held)."""
     lines = []
     held = {}
     problems = []
+    visited = set()
     for entry in files:
         name = show_name(entry["raw"])
         if entry["attr"] & 0x10:
-            # Subdirectories: listed, not descended into; still mark the
-            # reachable clusters held so they never count as orphans.
-            chain, _ = walk_chain(fat, entry["first"], 10 ** 9,
-                                  bpb["clusters"])
-            for cluster in chain:
-                held.setdefault(cluster, name)
-            lines.append((entry, chain or None, "DIR"))
+            summarize_dir(data, bpb, fat, entry["first"], name + "/", held,
+                          lines, problems, visited)
+            lines.append((entry, None, "DIR"))
             continue
         needed = 0 if entry["size"] == 0 else (
             (entry["size"] + bpb["cluster_bytes"] - 1)

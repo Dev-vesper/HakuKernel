@@ -420,6 +420,7 @@ def main():
             "USER-FD-INHERIT-OK", # spawn inherited fd 3; child exit closed it
             "USER-TIME-OK",  # gettimeofday reads ticks; nanosleep blocks until wake
             "USER-MEM-OK",   # brk grows a heap; mmap maps anonymous zeroed pages
+            "USER-DIR-OK",   # subdirectories, paths, and "."/".." resolution
             "EXECVE-OK pid=1", # exec replaced the image and preserved descriptors
             "USER-EXEC-TARGET-OK", # argv/envp stack and image replacement passed
             "USER-EXIT-OK status=0 pid=1",

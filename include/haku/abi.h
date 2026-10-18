@@ -16,6 +16,8 @@
 #define HAKU_SYS_LSEEK   19u
 #define HAKU_SYS_GETPID  20u
 #define HAKU_SYS_RENAME  38u
+#define HAKU_SYS_MKDIR   39u
+#define HAKU_SYS_RMDIR   40u
 #define HAKU_SYS_DUP     41u
 #define HAKU_SYS_BRK     45u
 #define HAKU_SYS_DUP2    63u
@@ -40,11 +42,14 @@
 #define HAKU_ENOMEM        12u
 #define HAKU_EFAULT        14u
 #define HAKU_EEXIST        17u
+#define HAKU_ENOTDIR       20u
+#define HAKU_EISDIR        21u
 #define HAKU_EINVAL        22u
 #define HAKU_EMFILE        24u
 #define HAKU_ENOSPC        28u
 #define HAKU_ENAMETOOLONG  36u
 #define HAKU_ENOSYS        38u
+#define HAKU_ENOTEMPTY     39u
 
 /* open(2) flags accepted by the current VFS implementation. */
 #define HAKU_O_RDONLY  0x0000u
@@ -61,8 +66,10 @@
 #define HAKU_STDERR_FILENO 2u
 
 #define HAKU_S_IFREG       0x8000u
+#define HAKU_S_IFDIR       0x4000u
 #define HAKU_STAT_SIZE     8u
 #define HAKU_STAT_MODE_REG 0x81A4u
+#define HAKU_STAT_MODE_DIR 0x41EDu
 
 /* Time conversion factors and the fixed-width user structs used by
  * gettimeofday(2) and nanosleep(2). Values are 32-bit on this ABI. */

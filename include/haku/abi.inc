@@ -11,6 +11,8 @@
 %define HAKU_SYS_LSEEK   19
 %define HAKU_SYS_GETPID  20
 %define HAKU_SYS_RENAME  38
+%define HAKU_SYS_MKDIR   39
+%define HAKU_SYS_RMDIR   40
 %define HAKU_SYS_DUP     41
 %define HAKU_SYS_BRK     45
 %define HAKU_SYS_DUP2    63
@@ -31,11 +33,14 @@
 %define HAKU_ENOMEM        12
 %define HAKU_EFAULT        14
 %define HAKU_EEXIST        17
+%define HAKU_ENOTDIR       20
+%define HAKU_EISDIR        21
 %define HAKU_EINVAL        22
 %define HAKU_EMFILE        24
 %define HAKU_ENOSPC        28
 %define HAKU_ENAMETOOLONG  36
 %define HAKU_ENOSYS        38
+%define HAKU_ENOTEMPTY     39
 
 %define HAKU_O_RDONLY  0x0000
 %define HAKU_O_WRONLY  0x0001
@@ -51,8 +56,10 @@
 %define HAKU_STDERR_FILENO 2
 
 %define HAKU_S_IFREG       0x8000
+%define HAKU_S_IFDIR       0x4000
 %define HAKU_STAT_SIZE     8
 %define HAKU_STAT_MODE_REG 0x81A4
+%define HAKU_STAT_MODE_DIR 0x41ED
 %define HAKU_USEC_PER_SEC  1000000
 %define HAKU_NSEC_PER_SEC  1000000000
 %define HAKU_TIMEVAL_SIZE  8
@@ -79,6 +86,8 @@
 %define SYS_LSEEK   HAKU_SYS_LSEEK
 %define SYS_GETPID  HAKU_SYS_GETPID
 %define SYS_RENAME  HAKU_SYS_RENAME
+%define SYS_MKDIR   HAKU_SYS_MKDIR
+%define SYS_RMDIR   HAKU_SYS_RMDIR
 %define SYS_DUP     HAKU_SYS_DUP
 %define SYS_BRK     HAKU_SYS_BRK
 %define SYS_DUP2    HAKU_SYS_DUP2

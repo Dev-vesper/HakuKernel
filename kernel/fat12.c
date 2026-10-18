@@ -111,6 +111,9 @@ const char *fat12_error_name(int result) {
     case FAT12_ERR_EXISTS: return "EXISTS";
     case FAT12_ERR_NO_SPACE: return "NO_SPACE";
     case FAT12_ERR_INVALID: return "INVALID";
+    case FAT12_ERR_IS_DIR: return "IS_DIR";
+    case FAT12_ERR_NOT_DIR: return "NOT_DIR";
+    case FAT12_ERR_NOT_EMPTY: return "NOT_EMPTY";
     default: return "UNKNOWN";
     }
 }
@@ -246,30 +249,318 @@ static int make_short_name(const char *name, uint8_t result[11]) {
     return base_len != 0;
 }
 
-static int find_root_entry(const uint8_t short_name[11], uint8_t result[32],
-                           uint32_t *sector_lba, uint32_t *sector_offset) {
-    uint32_t entries_read = 0;
-    for (uint32_t sector = 0; sector < volume.root_sectors; sector++) {
-        if (!read_volume_sector(volume.root_start + sector, sector_buffer))
-            return -1;
-        for (uint32_t offset = 0; offset < FAT12_SECTOR_SIZE;
-             offset += 32u) {
+static int read_fat_entry(uint16_t cluster, uint16_t *value);
+
+#define FAT12_ENTRIES_PER_SECTOR (FAT12_SECTOR_SIZE / 32u)
+#define FAT12_COMPONENT_MAX 13u
+
+/* Map a directory entry index to its sector LBA. dir_cluster == 0 is the
+ * fixed root region; otherwise the cluster chain is walked. Returns 1 with
+ * *lba filled, 0 past the end of the directory, or -1 on an I/O error. */
+static int dir_sector_lba(uint16_t dir_cluster, uint32_t index,
+                          uint32_t *lba) {
+    uint32_t cluster_index;
+    uint32_t sector_in_cluster;
+    uint16_t cluster;
+    uint32_t steps = 0;
+    if (dir_cluster == 0) {
+        if (index >= volume.root_sectors) return 0;
+        *lba = volume.root_start + index;
+        return 1;
+    }
+    cluster_index = index / volume.sectors_per_cluster;
+    sector_in_cluster = index % volume.sectors_per_cluster;
+    cluster = dir_cluster;
+    while (cluster_index > 0) {
+        uint16_t following;
+        if (cluster < 2u || cluster >= volume.cluster_count + 2u) return 0;
+        if (steps++ >= volume.cluster_count) return 0;
+        if (!read_fat_entry(cluster, &following)) return -1;
+        if (following >= FAT12_CLUSTER_EOC ||
+            following == FAT12_CLUSTER_BAD || following < 2u)
+            return 0;
+        cluster = following;
+        cluster_index--;
+    }
+    if (cluster < 2u || cluster >= volume.cluster_count + 2u) return 0;
+    *lba = volume.data_start +
+           (uint32_t)(cluster - 2u) * volume.sectors_per_cluster +
+           sector_in_cluster;
+    return 1;
+}
+
+/* Find an 8.3 entry (file or directory) in one directory. Returns 1 with
+ * result/sector_lba/sector_offset filled, 0 when absent, or -1 on I/O. */
+static int lookup_entry(uint16_t dir_cluster, const uint8_t short_name[11],
+                        uint8_t result[32], uint32_t *sector_lba,
+                        uint32_t *sector_offset) {
+    uint32_t index = 0;
+    for (;; index++) {
+        uint32_t lba;
+        int located = dir_sector_lba(dir_cluster, index, &lba);
+        if (located == 0) return 0;
+        if (located < 0) return -1;
+        if (dir_cluster == 0 &&
+            index * FAT12_ENTRIES_PER_SECTOR >= volume.root_entries)
+            return 0;
+        if (!read_volume_sector(lba, sector_buffer)) return -1;
+        for (uint32_t offset = 0; offset < FAT12_SECTOR_SIZE; offset += 32u) {
             const uint8_t *entry = &sector_buffer[offset];
-            if (entries_read++ >= volume.root_entries) return 0;
             if (entry[0] == 0) return 0;
             if (entry[0] == 0xE5u ||
                 (entry[11] & FAT12_ATTR_LONG_NAME) == FAT12_ATTR_LONG_NAME ||
-                (entry[11] & (FAT12_ATTR_DIRECTORY | FAT12_ATTR_VOLUME)))
+                (entry[11] & FAT12_ATTR_VOLUME))
                 continue;
             if (memcmp(entry, short_name, 11) == 0) {
                 memcpy(result, entry, 32);
-                if (sector_lba) *sector_lba = volume.root_start + sector;
+                if (sector_lba) *sector_lba = lba;
                 if (sector_offset) *sector_offset = offset;
                 return 1;
             }
         }
     }
+}
+
+/* Locate a free slot in one directory without writing anything: 1 with
+ * lba/off filled, 0 when the directory is full, negative -FAT12_ERR_IO on
+ * a sector failure. Shared by create, rename, and mkdir paths. */
+static int find_free_slot_in_dir(uint16_t dir_cluster, uint32_t *lba_out,
+                                 uint32_t *off_out) {
+    uint32_t index = 0;
+    for (;; index++) {
+        uint32_t lba;
+        int located = dir_sector_lba(dir_cluster, index, &lba);
+        if (located == 0) return 0;
+        if (located < 0) return -FAT12_ERR_IO;
+        if (dir_cluster == 0 &&
+            index * FAT12_ENTRIES_PER_SECTOR >= volume.root_entries)
+            return 0;
+        if (!read_volume_sector(lba, sector_buffer)) return -FAT12_ERR_IO;
+        for (uint32_t offset = 0; offset < FAT12_SECTOR_SIZE; offset += 32u) {
+            uint8_t first = sector_buffer[offset];
+            if (first != 0 && first != 0xE5u) continue;
+            *lba_out = lba;
+            *off_out = offset;
+            return 1;
+        }
+    }
+}
+
+/* Write a new entry into one directory. Returns 1 on success, 0 when the
+ * directory is full, -1 on I/O failure. */
+static int create_entry_in_dir(uint16_t dir_cluster,
+                               const uint8_t short_name[11], uint8_t attr,
+                               uint16_t first_cluster) {
+    uint8_t entry[32];
+    uint32_t lba = 0;
+    uint32_t off = 0;
+    int slot = find_free_slot_in_dir(dir_cluster, &lba, &off);
+    if (slot < 0) return slot;
+    if (slot != 1) return 0;
+    if (!read_volume_sector(lba, sector_buffer)) return -1;
+    memset(entry, 0, sizeof(entry));
+    memcpy(entry, short_name, 11);
+    entry[11] = attr;
+    entry[26] = (uint8_t)first_cluster;
+    entry[27] = (uint8_t)(first_cluster >> 8);
+    memcpy(sector_buffer + off, entry, sizeof(entry));
+    return ata_write_sectors(lba, 1, sector_buffer) ? 1 : -1;
+}
+
+/* Parent cluster recorded in a directory's ".." entry (root -> root). */
+static uint16_t dir_parent_of(uint16_t dir_cluster) {
+    static const uint8_t dotdot[11] = {'.', '.', ' ', ' ', ' ', ' ',
+                                       ' ', ' ', ' ', ' ', ' '};
+    uint32_t lba;
+    if (dir_cluster == 0) return 0;
+    if (dir_sector_lba(dir_cluster, 0, &lba) != 1) return 0;
+    if (!read_volume_sector(lba, sector_buffer)) return 0;
+    for (uint32_t offset = 0; offset + 32u <= FAT12_SECTOR_SIZE;
+         offset += 32u) {
+        const uint8_t *entry = &sector_buffer[offset];
+        if (entry[0] == 0) break;
+        if (entry[0] == 0xE5u) continue;
+        if (memcmp(entry, dotdot, 11) == 0) return read_u16(entry + 26);
+    }
     return 0;
+}
+
+/* 1 when the directory holds nothing but "." and "..", 0 when it holds a
+ * live entry, -1 on I/O failure. */
+static int dir_is_empty(uint16_t dir_cluster) {
+    uint32_t index = 0;
+    for (;; index++) {
+        uint32_t lba;
+        int located = dir_sector_lba(dir_cluster, index, &lba);
+        if (located == 0) return 1;
+        if (located < 0) return -1;
+        if (!read_volume_sector(lba, sector_buffer)) return -1;
+        for (uint32_t offset = 0; offset < FAT12_SECTOR_SIZE; offset += 32u) {
+            const uint8_t *entry = &sector_buffer[offset];
+            if (entry[0] == 0) return 1;
+            if (entry[0] == 0xE5u ||
+                (entry[11] & FAT12_ATTR_LONG_NAME) == FAT12_ATTR_LONG_NAME ||
+                (entry[11] & FAT12_ATTR_VOLUME))
+                continue;
+            if (entry[0] == '.' && (entry[1] == ' ' || entry[1] == '.'))
+                continue;
+            return 0;
+        }
+    }
+}
+
+/* Pull the next '/'-separated component from *cursor into comp
+ * (NUL-terminated). Returns 1 with a component, 0 at the end of the path,
+ * or -1 when a component is empty or longer than an 8.3 name. */
+static int path_next_component(const char **cursor, char comp[14]) {
+    const char *p = *cursor;
+    uint32_t length = 0;
+    while (*p == '/') p++;
+    if (*p == 0) {
+        *cursor = p;
+        return 0;
+    }
+    while (*p && *p != '/') {
+        if (length >= FAT12_COMPONENT_MAX) return -1;
+        comp[length++] = *p++;
+    }
+    comp[length] = 0;
+    while (*p == '/') p++;
+    *cursor = p;
+    return 1;
+}
+
+static int component_is_dot(const char *comp) {
+    return comp[0] == '.' && comp[1] == 0;
+}
+
+static int component_is_dotdot(const char *comp) {
+    return comp[0] == '.' && comp[1] == '.' && comp[2] == 0;
+}
+
+/* Resolve every directory component of path except the final one, then
+ * convert the final component to an 8.3 name. Returns 1 with *parent
+ * (0 == root) and name filled, or a negative -FAT12_ERR_*. */
+static int path_parent(const char *path, uint16_t *parent, uint8_t name[11]) {
+    const char *cursor = path;
+    uint16_t current = 0;
+    for (;;) {
+        char comp[14];
+        char look[14];
+        const char *after;
+        int more;
+        int read = path_next_component(&cursor, comp);
+        if (read <= 0) return -FAT12_ERR_INVALID;
+        after = cursor;
+        more = path_next_component(&cursor, look);
+        cursor = after;
+        if (more < 0) return -FAT12_ERR_INVALID;
+        if (more == 0) {
+            if (component_is_dot(comp) || component_is_dotdot(comp))
+                return -FAT12_ERR_INVALID;
+            if (!make_short_name(comp, name)) return -FAT12_ERR_INVALID;
+            *parent = current;
+            return 1;
+        }
+        if (component_is_dot(comp)) continue;
+        if (component_is_dotdot(comp)) {
+            current = dir_parent_of(current);
+            continue;
+        }
+        {
+            uint8_t short_name[11];
+            uint8_t entry[32];
+            int found;
+            if (!make_short_name(comp, short_name))
+                return -FAT12_ERR_INVALID;
+            found = lookup_entry(current, short_name, entry, 0, 0);
+            if (found < 0) return -FAT12_ERR_IO;
+            if (found != 1) return -FAT12_ERR_NOT_FOUND;
+            if (!(entry[11] & FAT12_ATTR_DIRECTORY))
+                return -FAT12_ERR_NOT_DIR;
+            current = read_u16(entry + 26);
+        }
+    }
+}
+
+/* Resolve a whole path to its final entry. Returns 1 with:
+ *   *is_dir     1 when the target is a directory
+ *   *cluster    first cluster of the target (0 for root)
+ *   *have_entry 1 when a directory slot was found (lba/off/entry/name valid)
+ *   *lba, *off  sector location of the slot
+ *   name        8.3 name of the final entry
+ *   entry_out   32-byte directory entry
+ * The root directory and "."/".." targets yield is_dir=1 with
+ * have_entry=0. Returns a negative -FAT12_ERR_* on failure. */
+static int path_resolve(const char *path, int *is_dir, uint16_t *cluster,
+                        int *have_entry, uint32_t *lba, uint32_t *off,
+                        uint8_t name[11], uint8_t entry_out[32]) {
+    const char *cursor = path;
+    uint16_t current = 0;
+    if (!path || path[0] == 0) return -FAT12_ERR_NOT_FOUND;
+    for (;;) {
+        char comp[14];
+        char look[14];
+        const char *after;
+        int more;
+        int read = path_next_component(&cursor, comp);
+        if (read < 0) return -FAT12_ERR_INVALID;
+        if (read == 0) {
+            *is_dir = 1;
+            *cluster = current;
+            *have_entry = 0;
+            return 1;
+        }
+        after = cursor;
+        more = path_next_component(&cursor, look);
+        cursor = after;
+        if (more < 0) return -FAT12_ERR_INVALID;
+        if (component_is_dot(comp)) {
+            if (!more) {
+                *is_dir = 1;
+                *cluster = current;
+                *have_entry = 0;
+                return 1;
+            }
+            continue;
+        }
+        if (component_is_dotdot(comp)) {
+            current = dir_parent_of(current);
+            if (!more) {
+                *is_dir = 1;
+                *cluster = current;
+                *have_entry = 0;
+                return 1;
+            }
+            continue;
+        }
+        {
+            uint8_t short_name[11];
+            uint8_t entry[32];
+            uint32_t entry_lba = 0;
+            uint32_t entry_off = 0;
+            int found;
+            if (!make_short_name(comp, short_name))
+                return -FAT12_ERR_INVALID;
+            found = lookup_entry(current, short_name, entry, &entry_lba,
+                                 &entry_off);
+            if (found < 0) return -FAT12_ERR_IO;
+            if (found != 1) return -FAT12_ERR_NOT_FOUND;
+            if (!more) {
+                *is_dir = (entry[11] & FAT12_ATTR_DIRECTORY) != 0;
+                *cluster = read_u16(entry + 26);
+                *have_entry = 1;
+                *lba = entry_lba;
+                *off = entry_off;
+                memcpy(name, short_name, 11);
+                memcpy(entry_out, entry, 32);
+                return 1;
+            }
+            if (!(entry[11] & FAT12_ATTR_DIRECTORY))
+                return -FAT12_ERR_NOT_DIR;
+            current = read_u16(entry + 26);
+        }
+    }
 }
 
 int fat12_debug_first_cluster(const char *name, uint16_t *first_out) {
@@ -279,7 +570,7 @@ int fat12_debug_first_cluster(const char *name, uint16_t *first_out) {
     if (!volume.mounted || !first_out ||
         !make_short_name(name, short_name))
         return -FAT12_ERR_INVALID;
-    found = find_root_entry(short_name, entry, 0, 0);
+    found = lookup_entry(0, short_name, entry, 0, 0);
     if (found < 0) return -FAT12_ERR_IO;
     if (found != 1) return -FAT12_ERR_NOT_FOUND;
     *first_out = read_u16(entry + 26);
@@ -368,7 +659,7 @@ static int write_fat_entry(uint16_t cluster, uint16_t value) {
  * verifying the slot still belongs to this file. A removed entry (0xE5),
  * an empty slot, or a slot reused by another name refuses the write, so a
  * detached handle can never corrupt a stranger's metadata. */
-static int write_root_entry(const fat12_file_t *file) {
+static int write_entry_at(const fat12_file_t *file) {
     uint32_t offset = file->dir_off;
     if (offset > FAT12_SECTOR_SIZE - 32u) return 0;
     if (!read_volume_sector(file->dir_lba, sector_buffer)) return 0;
@@ -404,27 +695,6 @@ int fat12_read_file(const char *name, void *buffer, uint32_t capacity,
     }
     *file_size = count;
     return fat12_file_close(&file);
-}
-
-static int create_root_entry(const uint8_t short_name[11]) {
-    uint32_t entries_read = 0;
-    for (uint32_t sector = 0; sector < volume.root_sectors; sector++) {
-        if (!read_volume_sector(volume.root_start + sector, sector_buffer))
-            return -1;
-        for (uint32_t offset = 0; offset < FAT12_SECTOR_SIZE; offset += 32u) {
-            uint8_t entry[32];
-            uint8_t first = sector_buffer[offset];
-            if (entries_read++ >= volume.root_entries) return 0;
-            if (first != 0 && first != 0xE5u) continue;
-            memset(entry, 0, sizeof(entry));
-            memcpy(entry, short_name, 11);
-            entry[11] = FAT12_ATTR_ARCHIVE;
-            memcpy(sector_buffer + offset, entry, sizeof(entry));
-            return ata_write_sectors(volume.root_start + sector, 1,
-                                     sector_buffer) ? 1 : -1;
-        }
-    }
-    return 0;
 }
 
 /* Sync first_cluster/size from the handle's own directory slot.
@@ -533,30 +803,39 @@ static int track_slot_available(void) {
 int fat12_file_open(const char *name, uint8_t flags, fat12_file_t *file) {
     uint8_t short_name[11];
     uint8_t entry[32];
+    uint16_t parent = 0;
     uint32_t dir_lba = 0;
     uint32_t dir_off = 0;
+    int resolved;
     int found;
-    if (!volume.mounted || !file || !make_short_name(name, short_name) ||
+    if (!volume.mounted || !file ||
         !(flags & (FAT12_OPEN_READ | FAT12_OPEN_WRITE)) ||
         ((flags & FAT12_OPEN_TRUNC) && !(flags & FAT12_OPEN_WRITE)))
         return -FAT12_ERR_INVALID;
+    /* Resolve the containing directory and the final 8.3 name first: a
+     * missing or non-directory component is reported before any mutation. */
+    resolved = path_parent(name, &parent, short_name);
+    if (resolved != 1) return resolved;
     memset(file, 0, sizeof(*file));
     /* Handle-slot check before any disk mutation: no caller can interleave
      * (VFS guards backend calls with IRQs off; boot runs pre-sti), so the
      * slot claimed here is still free at track_open below. */
     if (!track_slot_available()) return -FAT12_ERR_NO_SPACE;
-    found = find_root_entry(short_name, entry, &dir_lba, &dir_off);
+    found = lookup_entry(parent, short_name, entry, &dir_lba, &dir_off);
     if (found < 0) return -FAT12_ERR_IO;
     if (!found) {
         int created;
         if (!(flags & FAT12_OPEN_CREATE)) return -FAT12_ERR_NOT_FOUND;
-        created = create_root_entry(short_name);
+        created = create_entry_in_dir(parent, short_name, FAT12_ATTR_ARCHIVE,
+                                      0);
         if (created < 0) return -FAT12_ERR_IO;
         if (!created) return -FAT12_ERR_NO_SPACE;
-        found = find_root_entry(short_name, entry, &dir_lba, &dir_off);
+        found = lookup_entry(parent, short_name, entry, &dir_lba, &dir_off);
         if (found != 1) return -FAT12_ERR_IO;
-    } else if ((flags & FAT12_OPEN_CREATE) && (flags & FAT12_OPEN_EXCL)) {
-        return -FAT12_ERR_EXISTS;
+    } else {
+        if (entry[11] & FAT12_ATTR_DIRECTORY) return -FAT12_ERR_IS_DIR;
+        if ((flags & FAT12_OPEN_CREATE) && (flags & FAT12_OPEN_EXCL))
+            return -FAT12_ERR_EXISTS;
     }
     memcpy(file->short_name, short_name, sizeof(short_name));
     file->dir_lba = dir_lba;
@@ -573,13 +852,13 @@ int fat12_file_open(const char *name, uint8_t flags, fat12_file_t *file) {
              * A later create/truncate heals the file for reuse. */
             file->first_cluster = 0;
             file->size = 0;
-            write_root_entry(file);
+            write_entry_at(file);
             file->opened = 0;
             return -FAT12_ERR_IO;
         }
         file->first_cluster = 0;
         file->size = 0;
-        if (!write_root_entry(file)) {
+        if (!write_entry_at(file)) {
             file->opened = 0;
             return -FAT12_ERR_IO;
         }
@@ -691,8 +970,8 @@ static int write_file_bytes(fat12_file_t *file, uint32_t position,
  * for transient faults. Returns 1 on success, 0 when the metadata did
  * not reach the disk (callers must then roll back, see below). */
 static int persist_file(fat12_file_t *file) {
-    if (write_root_entry(file)) return 1;
-    return write_root_entry(file);
+    if (write_entry_at(file)) return 1;
+    return write_entry_at(file);
 }
 
 /* Cut the in-memory chain down to the clusters covering keep_size and
@@ -843,39 +1122,21 @@ int fat12_file_seek(fat12_file_t *file, int32_t offset, uint32_t whence,
     return 1;
 }
 
-/* Locate a free root-directory slot without writing anything: 1 with
- * lba/off filled, 0 when the directory is full, negative -FAT12_ERR_IO
- * on a sector failure. Shared by create and rename paths. */
-static int find_free_slot(uint32_t *lba_out, uint32_t *off_out) {
-    uint32_t entries_read = 0;
-    for (uint32_t sector = 0; sector < volume.root_sectors; sector++) {
-        if (!read_volume_sector(volume.root_start + sector, sector_buffer))
-            return -FAT12_ERR_IO;
-        for (uint32_t offset = 0; offset < FAT12_SECTOR_SIZE; offset += 32u) {
-            uint8_t first = sector_buffer[offset];
-            if (entries_read++ >= volume.root_entries) return 0;
-            if (first != 0 && first != 0xE5u) continue;
-            *lba_out = volume.root_start + sector;
-            *off_out = offset;
-            return 1;
-        }
-    }
-    return 0;
-}
-
 int fat12_file_unlink(const char *name) {
-    uint8_t short_name[11];
-    uint8_t entry[32];
+    int is_dir = 0;
+    int have_entry = 0;
+    uint16_t cluster = 0;
     uint32_t lba = 0;
     uint32_t off = 0;
-    uint16_t first;
-    int found;
-    if (!volume.mounted || !make_short_name(name, short_name))
-        return -FAT12_ERR_INVALID;
-    found = find_root_entry(short_name, entry, &lba, &off);
-    if (found < 0) return -FAT12_ERR_IO;
-    if (found != 1) return -FAT12_ERR_NOT_FOUND;
-    first = read_u16(entry + 26);
+    uint8_t short_name[11];
+    uint8_t entry[32];
+    int resolved;
+    if (!volume.mounted) return -FAT12_ERR_INVALID;
+    resolved = path_resolve(name, &is_dir, &cluster, &have_entry, &lba, &off,
+                            short_name, entry);
+    if (resolved != 1) return resolved;
+    if (is_dir) return -FAT12_ERR_IS_DIR;
+    if (!have_entry) return -FAT12_ERR_NOT_FOUND;
     /* Remove the name first: from here on no new open can reach the file,
      * while recorded handles keep working from their cached state. */
     if (!read_volume_sector(lba, sector_buffer)) return -FAT12_ERR_IO;
@@ -883,7 +1144,7 @@ int fat12_file_unlink(const char *name) {
     if (!ata_write_sectors(lba, 1, sector_buffer)) return -FAT12_ERR_IO;
     flag_unlinked_at(lba, off);
     if (live_at(lba, off)) return 1; /* deferred: last close frees */
-    if (!free_cluster_chain(first)) return -FAT12_ERR_IO;
+    if (!free_cluster_chain(cluster)) return -FAT12_ERR_IO;
     return 1;
 }
 
@@ -892,29 +1153,39 @@ int fat12_file_rename(const char *oldname, const char *newname) {
     uint8_t dst_name[11];
     uint8_t entry[32];
     uint8_t probe[32];
+    uint16_t dst_parent = 0;
+    int is_dir = 0;
+    int have_entry = 0;
+    uint16_t src_cluster = 0;
     uint32_t src_lba = 0;
     uint32_t src_off = 0;
     uint32_t dst_lba = 0;
     uint32_t dst_off = 0;
     int slot;
     int found;
-    if (!volume.mounted || !make_short_name(oldname, src_name) ||
-        !make_short_name(newname, dst_name))
-        return -FAT12_ERR_INVALID;
-    found = find_root_entry(src_name, entry, &src_lba, &src_off);
+    int resolved;
+    if (!volume.mounted) return -FAT12_ERR_INVALID;
+    resolved = path_resolve(oldname, &is_dir, &src_cluster, &have_entry,
+                            &src_lba, &src_off, src_name, entry);
+    if (resolved != 1) return resolved;
+    if (!have_entry) return -FAT12_ERR_NOT_FOUND;
+    resolved = path_parent(newname, &dst_parent, dst_name);
+    if (resolved != 1) return resolved;
+    found = lookup_entry(dst_parent, dst_name, probe, &dst_lba, &dst_off);
     if (found < 0) return -FAT12_ERR_IO;
-    if (found != 1) return -FAT12_ERR_NOT_FOUND;
-    if (memcmp(src_name, dst_name, 11) == 0) return 1; /* no-op */
-    found = find_root_entry(dst_name, probe, 0, 0);
-    if (found < 0) return -FAT12_ERR_IO;
-    if (found == 1) return -FAT12_ERR_EXISTS;
-    slot = find_free_slot(&dst_lba, &dst_off);
+    if (found == 1) {
+        /* Same slot means the same name in the same directory: no-op. */
+        if (dst_lba == src_lba && dst_off == src_off) return 1;
+        return -FAT12_ERR_EXISTS;
+    }
+    slot = find_free_slot_in_dir(dst_parent, &dst_lba, &dst_off);
     if (slot < 0) return -FAT12_ERR_IO;
     if (slot != 1) return -FAT12_ERR_NO_SPACE;
     /* Publish the new name before deleting the old one: a crash can at
      * worst duplicate the name, never lose the file. Best effort from
      * here on; failures are reported but the file always survives under
-     * at least one name. */
+     * at least one name. Moving a directory across parents leaves its ".."
+     * entry pointing at the old parent (documented limitation). */
     if (!read_volume_sector(dst_lba, sector_buffer)) return -FAT12_ERR_IO;
     memcpy(sector_buffer + dst_off, entry, 32);
     memcpy(sector_buffer + dst_off, dst_name, 11);
@@ -930,15 +1201,95 @@ int fat12_file_rename(const char *oldname, const char *newname) {
 }
 
 int fat12_file_stat(const char *name, fat12_stat_t *out) {
+    int is_dir = 0;
+    int have_entry = 0;
+    uint16_t cluster = 0;
+    uint32_t lba = 0;
+    uint32_t off = 0;
     uint8_t short_name[11];
     uint8_t entry[32];
+    int resolved;
+    if (!volume.mounted || !out) return -FAT12_ERR_INVALID;
+    resolved = path_resolve(name, &is_dir, &cluster, &have_entry, &lba, &off,
+                            short_name, entry);
+    if (resolved != 1) return resolved;
+    out->is_dir = is_dir;
+    out->size = have_entry ? read_u32(entry + 28) : 0u;
+    return 1;
+}
+
+int fat12_dir_create(const char *name) {
+    uint8_t short_name[11];
+    uint8_t entry[32];
+    uint16_t parent = 0;
+    uint16_t cluster = 0;
+    uint32_t dir_lba;
+    int resolved;
     int found;
-    if (!volume.mounted || !out || !make_short_name(name, short_name))
-        return -FAT12_ERR_INVALID;
-    found = find_root_entry(short_name, entry, 0, 0);
+    int allocated;
+    int created;
+    if (!volume.mounted) return -FAT12_ERR_INVALID;
+    resolved = path_parent(name, &parent, short_name);
+    if (resolved != 1) return resolved;
+    found = lookup_entry(parent, short_name, entry, 0, 0);
     if (found < 0) return -FAT12_ERR_IO;
-    if (found != 1) return -FAT12_ERR_NOT_FOUND;
-    out->size = read_u32(entry + 28);
+    if (found == 1) return -FAT12_ERR_EXISTS;
+    allocated = allocate_cluster(&cluster);
+    if (allocated != 1) return allocated;
+    /* Zeroed cluster becomes the directory: its first sector carries real
+     * "." and ".." entries so "..", and the parent needed to walk back up,
+     * always resolve. */
+    memset(sector_buffer, 0, FAT12_SECTOR_SIZE);
+    memset(sector_buffer, ' ', 11);
+    sector_buffer[0] = '.';
+    sector_buffer[11] = FAT12_ATTR_DIRECTORY;
+    sector_buffer[26] = (uint8_t)cluster;
+    sector_buffer[27] = (uint8_t)(cluster >> 8);
+    memset(sector_buffer + 32, ' ', 11);
+    sector_buffer[32] = '.';
+    sector_buffer[33] = '.';
+    sector_buffer[32 + 11] = FAT12_ATTR_DIRECTORY;
+    sector_buffer[32 + 26] = (uint8_t)parent;
+    sector_buffer[32 + 27] = (uint8_t)(parent >> 8);
+    dir_lba = volume.data_start +
+              (uint32_t)(cluster - 2u) * volume.sectors_per_cluster;
+    if (!ata_write_sectors(dir_lba, 1, sector_buffer)) {
+        free_cluster_chain(cluster);
+        return -FAT12_ERR_IO;
+    }
+    created = create_entry_in_dir(parent, short_name, FAT12_ATTR_DIRECTORY,
+                                  cluster);
+    if (created != 1) {
+        free_cluster_chain(cluster);
+        if (created < 0) return -FAT12_ERR_IO;
+        return -FAT12_ERR_NO_SPACE;
+    }
+    return 1;
+}
+
+int fat12_dir_remove(const char *name) {
+    int is_dir = 0;
+    int have_entry = 0;
+    uint16_t cluster = 0;
+    uint32_t lba = 0;
+    uint32_t off = 0;
+    uint8_t short_name[11];
+    uint8_t entry[32];
+    int resolved;
+    int empty;
+    if (!volume.mounted) return -FAT12_ERR_INVALID;
+    resolved = path_resolve(name, &is_dir, &cluster, &have_entry, &lba, &off,
+                            short_name, entry);
+    if (resolved != 1) return resolved;
+    if (!is_dir) return -FAT12_ERR_NOT_DIR;
+    if (!have_entry || cluster == 0) return -FAT12_ERR_INVALID;
+    empty = dir_is_empty(cluster);
+    if (empty < 0) return -FAT12_ERR_IO;
+    if (empty != 1) return -FAT12_ERR_NOT_EMPTY;
+    if (!read_volume_sector(lba, sector_buffer)) return -FAT12_ERR_IO;
+    sector_buffer[off] = 0xE5u;
+    if (!ata_write_sectors(lba, 1, sector_buffer)) return -FAT12_ERR_IO;
+    if (!free_cluster_chain(cluster)) return -FAT12_ERR_IO;
     return 1;
 }
 
@@ -949,5 +1300,6 @@ int fat12_file_fstat(fat12_file_t *file, fat12_stat_t *out) {
     refreshed = refresh_file(file);
     if (refreshed < 0) return refreshed;
     out->size = file->size;
+    out->is_dir = 0;
     return 1;
 }

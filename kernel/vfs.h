@@ -20,9 +20,16 @@
 #define VFS_EINVAL HAKU_EINVAL
 #define VFS_EMFILE HAKU_EMFILE
 #define VFS_ENOSPC HAKU_ENOSPC
+#define VFS_ENOTDIR HAKU_ENOTDIR
+#define VFS_EISDIR  HAKU_EISDIR
+#define VFS_ENOTEMPTY HAKU_ENOTEMPTY
 
-/* File types for vfs_stat_t.mode (only regular files exist so far). */
+/* File types for vfs_stat_t.mode. */
 #define VFS_S_IFREG HAKU_S_IFREG
+#define VFS_S_IFDIR HAKU_S_IFDIR
+
+/* Longest path (including NUL) the VFS and its backends accept. */
+#define VFS_PATH_MAX 64u
 
 /* Minimal metadata: byte size plus mode. Backends fill size; VFS callers
  * must treat every other attribute as unsupported. */
@@ -49,6 +56,8 @@ typedef struct vfs_fs_ops {
                     uint32_t *out_pos);
     int32_t (*unlink)(const char *path);
     int32_t (*rename)(const char *oldpath, const char *newpath);
+    int32_t (*mkdir)(const char *path);
+    int32_t (*rmdir)(const char *path);
     int32_t (*stat)(const char *path, vfs_stat_t *out);
     int32_t (*fstat)(void *handle, vfs_stat_t *out);
 } vfs_fs_ops_t;
@@ -105,6 +114,8 @@ int32_t vfs_dup2(uint32_t pid, uint32_t oldfd, uint32_t newfd);
  * the new entry, so they keep working too. All return 1 or -VFS_E*. */
 int32_t vfs_unlink(uint32_t pid, const char *path);
 int32_t vfs_rename(uint32_t pid, const char *oldpath, const char *newpath);
+int32_t vfs_mkdir(uint32_t pid, const char *path);
+int32_t vfs_rmdir(uint32_t pid, const char *path);
 int32_t vfs_stat(uint32_t pid, const char *path, vfs_stat_t *out);
 int32_t vfs_fstat(uint32_t pid, uint32_t fd, vfs_stat_t *out);
 void vfs_close_all(uint32_t pid);

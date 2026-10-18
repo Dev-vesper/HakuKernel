@@ -16,8 +16,9 @@ compatibility is not a short-term goal.
 - [x] `exit`, `read`, `write`, `open`, `close`, `lseek`, and `getpid` syscalls
   with user-pointer validation and `-errno` error returns.
 - [x] ATA primary-master LBA28 PIO polling driver.
-- [x] Writable FAT12 for 8.3 files in the root directory: create, read, write,
-  truncate, and append, with a VFS and per-process file descriptors.
+- [x] Writable FAT12 for 8.3 files and subdirectories (paths with `.`/`..`):
+  create, read, write, truncate, append, mkdir/rmdir, with a VFS and
+  per-process file descriptors.
 - [x] QEMU headless integration tests covering multi-sector I/O, seeking,
   append, descriptor access checks, spawn/waitpid exit status, exec
   argument/environment stacks, and persisted disk data.
@@ -67,9 +68,16 @@ unexpectedly lost image data across restarts.
   repoints live descriptors; rename-to-existing gives `EEXIST`, same-name
   is a no-op; proven end to end from ring 3 as `USER-FILE-OPS-OK`, and
   the post-run image check confirms zero orphaned clusters).
-- [ ] Add subdirectories and basic paths, including rules for `.` and `..`.
+- [x] Add subdirectories and basic paths, including rules for `.` and `..`
+  (syscalls `mkdir`/`rmdir` 39/40; `/`-separated 8.3 paths resolved with
+  real `.`/`..` entries, parent climbing clamped at the root; open/stat/
+  unlink/rename are path-aware; `stat` reports `S_IFDIR`; directories are
+  single-cluster and do not grow yet; proven from ring 3 as `USER-DIR-OK`
+  and the host-side inspector now recurses into subdirectories).
 - [ ] Implement and test relevant POSIX errors such as `EEXIST`, `ENOENT`,
-  `ENOSPC`, `ENOTDIR`, `EISDIR`, and `EROFS`.
+  `ENOSPC`, `ENOTDIR`, `EISDIR`, and `EROFS` (`EEXIST`/`ENOENT`/`ENOSPC`/
+  `ENOTDIR`/`EISDIR`/`ENOTEMPTY` are covered; `EROFS` still needs a
+  read-only mount).
 - [ ] Introduce appropriate disk and file locks instead of disabling
   interrupts for the duration of all I/O; add a sector cache if needed.
 - [ ] Decide separately whether to support long filenames, partition tables,
@@ -96,7 +104,9 @@ tested, and common FAT tools can still read the disk image.
   the parent's descriptors, and exit releases them).
 - [x] Add `dup`/`dup2` with a shared, refcounted open-file-description
   (`USER-DUP-OK`: shared offset, surviving duplicate, EBADF cases).
-- [x] Add limited `brk`/`mmap`.
+- [x] Add limited `brk`/`mmap` (per-process heap break plus an anonymous
+  private `mmap` using the i386 old_mmap argument block; both map zero-filled
+  user pages from reserved regions; `USER-MEM-OK`).
 - [x] Add time syscalls such as `gettimeofday`/`nanosleep` (`gettimeofday`
   reads the PIT tick counter; `nanosleep` parks the task until its wake tick
   in the timer IRQ instead of busy-waiting; `USER-TIME-OK`).

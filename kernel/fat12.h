@@ -20,10 +20,11 @@ typedef struct {
     int unlinked;
 } fat12_file_t;
 
-/* Minimal file metadata for stat/fstat (backend maps size to vfs_stat_t;
- * every entry here is a regular file, there are no directories). */
+/* Minimal file metadata for stat/fstat (backend maps size/is_dir to
+ * vfs_stat_t; entries are regular files or directories). */
 typedef struct {
     uint32_t size;
+    int is_dir;
 } fat12_stat_t;
 
 #define FAT12_OPEN_READ   0x01u
@@ -38,6 +39,9 @@ typedef struct {
 #define FAT12_ERR_EXISTS    3
 #define FAT12_ERR_NO_SPACE  4
 #define FAT12_ERR_INVALID   5
+#define FAT12_ERR_IS_DIR    6
+#define FAT12_ERR_NOT_DIR   7
+#define FAT12_ERR_NOT_EMPTY 8
 
 /* Return convention for every fat12_* call below: 1 on success, or a
  * negative -FAT12_ERR_* code naming the exact failure (disk I/O error,
@@ -79,5 +83,10 @@ int fat12_file_unlink(const char *name);
 int fat12_file_rename(const char *oldname, const char *newname);
 int fat12_file_stat(const char *name, fat12_stat_t *out);
 int fat12_file_fstat(fat12_file_t *file, fat12_stat_t *out);
+/* Directory operations: create a single-cluster directory (with real "."
+ * and ".." entries) or remove an existing empty one. Same 1 /
+ * -FAT12_ERR_* convention; a non-empty directory reports NOT_EMPTY. */
+int fat12_dir_create(const char *name);
+int fat12_dir_remove(const char *name);
 
 #endif

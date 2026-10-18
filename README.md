@@ -28,7 +28,8 @@ python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 ```
 
 `python build.py headless` verifies ATA detection, FAT12 mounting and
-multi-cluster file reads, ring-3 process entry, per-process kernel stacks,
+multi-cluster file reads, subdirectory/path resolution (`USER-DIR-OK`),
+ring-3 process entry, per-process kernel stacks,
 syscall handling, `spawn`/`waitpid` and exit-status reporting, `execve` image
 replacement, process exit/reaping, and timer IRQs through the serial log.
 
@@ -77,6 +78,8 @@ Memory map:
 | `0x90000` | bootstrap kernel stack top (grows down) |
 | below `0x800000` | allocated per-process 8 KiB kernel stacks |
 | `0x40000000` | user program code/data virtual base (per-process mapping) |
+| `0x50000000–0x54000000` | user `brk` heap region (lazily mapped) |
+| `0x60000000–0x70000000` | anonymous `mmap` region (lazily mapped) |
 | `0xBFFFE000–0xC0000000` | two user stack pages |
 | `0xB8000` | VGA text buffer |
 
@@ -142,7 +145,8 @@ terminators and must fit the two-page initial stack. Larger inputs return
 the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `read` (3), `write` (4), `open` (5), `close` (6), `waitpid` (7),
 `unlink` (10), `execve` (11), `lseek` (19), `getpid` (20), `rename` (38),
-`dup` (41), `dup2` (63), `gettimeofday` (78), `stat` (106), `fstat` (108),
+`mkdir` (39), `rmdir` (40), `dup` (41), `brk` (45), `dup2` (63),
+`gettimeofday` (78), `mmap` (90), `stat` (106), `fstat` (108),
 and `nanosleep` (162), with arguments in
 `ebx`, `ecx`, and `edx` and syscall number/result in `eax`.
 The custom `spawn` syscall uses `0x1000`.
@@ -150,9 +154,22 @@ The public ABI definitions are in `include/haku/abi.h` for C and
 `include/haku/abi.inc` for NASM; the build checks that their numeric
 constants stay synchronized. They define syscall numbers, errno values, open
 flags, and the `stat` buffer layout. `haku_stat_t` contains 32-bit `size` and
-`mode` fields; `stat` and `fstat` currently report regular files with mode
-`0644`. `haku_timeval_t` (`tv_sec`, `tv_usec`) and `haku_timespec_t`
-(`tv_sec`, `tv_nsec`) are the 8-byte user time structures.
+`mode` fields; `stat` and `fstat` report regular files with mode `0644`
+(`S_IFREG`) and directories with mode `0755` (`S_IFDIR`).
+`haku_timeval_t` (`tv_sec`, `tv_usec`) and `haku_timespec_t`
+(`tv_sec`, `tv_nsec`) are the 8-byte user time structures. `haku_mmap_arg_t`
+is the 24-byte i386 `old_mmap` argument block.
+
+`brk` grows a per-process heap starting at a reserved virtual base
+(`0x50000000`): the break is page-rounded and pages are mapped zero-filled as
+it rises; a below-base break gives `EINVAL` and one past the heap limit gives
+`ENOMEM`. `mmap` takes a pointer to an `old_mmap` argument block in `ebx` and
+supports only anonymous private mappings (`MAP_PRIVATE | MAP_ANONYMOUS`) with
+a zero address hint, no execute bit, and offset 0; it places mappings in a
+second reserved region (`0x60000000`) and returns the address. Pages are
+always mapped read/write, so the requested protection is validated but not
+enforced. Both regions are reclaimed with the rest of the address space at
+exit or `execve`.
 
 ### User-mode system calls
 
@@ -161,15 +178,20 @@ supports stdout/stderr to VGA and serial as well as writable regular files.
 The standard descriptors `0`/`1`/`2` are real per-process descriptors backed
 by a registered console device rather than special cases in the syscall
 layer: they resolve through the same VFS descriptor table as file handles.
-`open`, `close`, `lseek`, `unlink`, `rename`, `stat`, `fstat`, and per-process
-file descriptors are backed by the VFS/FAT12 layer. `stat`/`fstat` report
-byte size and mode (`S_IFREG | 0644`) through an 8-byte user buffer. Reads
+`open`, `close`, `lseek`, `unlink`, `rename`, `mkdir`, `rmdir`, `stat`,
+`fstat`, and per-process file descriptors are backed by the VFS/FAT12 layer.
+Paths are `/`-separated 8.3 names resolved from the root; `.` keeps the
+current directory and `..` climbs to the parent (clamped at the root). `stat`
+and `fstat` report byte size and mode (`S_IFREG | 0644` for files,
+`S_IFDIR | 0755` for directories) through an 8-byte user buffer. Reads
 and writes are bounded to 4096 bytes, and errors return
 negative errno values (a future libc can translate these to `errno`).
 Every FAT12 failure class keeps one distinct errno end to end: missing
 files give `ENOENT`, bad flags/whence/pointers give `EINVAL`, existing
 files give `EEXIST`, bad descriptors give `EBADF`, a full volume gives
-`ENOSPC`, and disk I/O failures give `EIO`. After the user process exits,
+`ENOSPC`, a non-directory path component gives `ENOTDIR`, opening or
+unlinking a directory gives `EISDIR`, removing a non-empty directory gives
+`ENOTEMPTY`, and disk I/O failures give `EIO`. After the user process exits,
 the idle task runs an error self-test (`FS-ERRORS-OK`) including a
 root-fill probe that must fail with `ENOSPC` (`FS-ENOSPC-OK`). The same
 pass also covers empty files, exact-sector and boundary-spanning I/O
@@ -249,12 +271,16 @@ operation.
 `kernel/ata.c` detects the primary-master ATA device with IDENTIFY and reads
 and writes LBA28 sectors using bounded polling PIO. `kernel/fat12.c` mounts a
 FAT12 superfloppy and supports creating, reading, writing, truncating and
-seeking 8.3-named files in its root directory, with cluster allocation,
-release, mirrored FAT updates and volume/chain bounds checks.
+seeking 8.3-named files anywhere in the tree, plus `mkdir`/`rmdir` of
+single-cluster subdirectories with real `.`/`..` entries. Paths are
+`/`-separated and resolved from the root; `.` and `..` are handled during
+resolution. Cluster allocation, release, mirrored FAT updates and
+volume/chain bounds checks are shared by files and directories.
 `kernel/vfs.c` supplies per-process descriptors and the user `open`, `close`,
 `read`, `write`, and `lseek` interface through a filesystem-independent
-operations vector (`vfs_fs_ops`: mount/open/close/read/write/seek, each
-returning 1 or a `-VFS_E*` errno). VFS never names a concrete filesystem;
+operations vector (`vfs_fs_ops`: mount/open/close/read/write/seek/unlink/
+rename/mkdir/rmdir/stat/fstat, each returning 1 or a `-VFS_E*` errno). VFS
+never names a concrete filesystem;
 `kernel/fat12_vfs.c` implements the vector for FAT12 (flag translation,
 per-open handle allocation, errno mapping) and registers it at boot, after
 which one backend is mounted as the root filesystem. Disk I/O is serialized
@@ -264,11 +290,14 @@ simultaneously open regular files per process (descriptors 3-7; `0`/`1`/`2`
 are the console) and the `O_RDONLY`, `O_WRONLY`, `O_RDWR`, `O_CREAT`,
 `O_EXCL`, `O_TRUNC`, and `O_APPEND` flags.
 
-The filesystem remains intentionally small: no partition tables, subfolders,
-long filenames, permissions, mount points, journaling, FAT16,
-or FAT32. This is a minimal single-volume VFS, not full POSIX filesystem
-conformance. The QEMU headless test creates `P1.TXT` and verifies
-multi-sector writes, reads, seeks, close, and reopen.
+The filesystem remains intentionally small: no partition tables, long
+filenames, permissions, mount points, journaling, FAT16, or FAT32.
+Directories are one cluster (16 entries) and do not grow; moving a directory
+across parents with `rename` leaves its `..` entry pointing at the old
+parent, so directories should be renamed in place. This is a minimal
+single-volume VFS, not full POSIX filesystem conformance. The QEMU headless
+test creates `P1.TXT`, exercises `DIR1/T.TXT` with `./DIR1/../DIR1` paths,
+and verifies multi-sector writes, reads, seeks, close, and reopen.
 
 `tools/mkfat12.py` puts `HAKU.ELF`, the exec target `NEXT.ELF`, and the
 spawn/wait child `CHILD.ELF` on a generated 1.44 MB FAT12 image. QEMU
@@ -324,7 +353,7 @@ Haku/
   kernel/exec_target.asm second ELF32 image for execve tests
   kernel/child.asm     ELF32 child for spawn/waitpid tests
   kernel/ata.h/.c      primary-master ATA LBA28 polling PIO driver
-  kernel/fat12.h/.c    writable FAT12 root-directory file operations
+  kernel/fat12.h/.c    writable FAT12 files, subdirectories, and paths
   kernel/fat12_vfs.h/.c FAT12 backend: vfs_fs_ops vector + errno translation
   kernel/vfs.h/.c      fs-independent descriptors, registry, root mount
   kernel/elf.h/.c      validated ELF32 PT_LOAD loader and fresh user address spaces

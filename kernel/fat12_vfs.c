@@ -10,6 +10,9 @@ int32_t fat12_map_errno(int fat_result) {
     if (fat_result == -FAT12_ERR_EXISTS) return -VFS_EEXIST;
     if (fat_result == -FAT12_ERR_NO_SPACE) return -VFS_ENOSPC;
     if (fat_result == -FAT12_ERR_INVALID) return -VFS_EINVAL;
+    if (fat_result == -FAT12_ERR_IS_DIR) return -VFS_EISDIR;
+    if (fat_result == -FAT12_ERR_NOT_DIR) return -VFS_ENOTDIR;
+    if (fat_result == -FAT12_ERR_NOT_EMPTY) return -VFS_ENOTEMPTY;
     return -VFS_EIO;
 }
 
@@ -111,6 +114,22 @@ static int32_t fat12_vfs_rename(const char *oldpath, const char *newpath) {
     return fat12_map_errno(renamed);
 }
 
+static int32_t fat12_vfs_mkdir(const char *path) {
+    int created;
+    if (!path) return -VFS_EINVAL;
+    created = fat12_dir_create(path);
+    if (created == 1) return 1;
+    return fat12_map_errno(created);
+}
+
+static int32_t fat12_vfs_rmdir(const char *path) {
+    int removed;
+    if (!path) return -VFS_EINVAL;
+    removed = fat12_dir_remove(path);
+    if (removed == 1) return 1;
+    return fat12_map_errno(removed);
+}
+
 static int32_t fat12_vfs_stat(const char *path, vfs_stat_t *out) {
     fat12_stat_t st;
     int stated;
@@ -118,7 +137,7 @@ static int32_t fat12_vfs_stat(const char *path, vfs_stat_t *out) {
     stated = fat12_file_stat(path, &st);
     if (stated != 1) return fat12_map_errno(stated);
     out->size = st.size;
-    out->mode = HAKU_STAT_MODE_REG;
+    out->mode = st.is_dir ? HAKU_STAT_MODE_DIR : HAKU_STAT_MODE_REG;
     return 1;
 }
 
@@ -129,7 +148,7 @@ static int32_t fat12_vfs_fstat(void *handle, vfs_stat_t *out) {
     stated = fat12_file_fstat((fat12_file_t *)handle, &st);
     if (stated != 1) return fat12_map_errno(stated);
     out->size = st.size;
-    out->mode = HAKU_STAT_MODE_REG;
+    out->mode = st.is_dir ? HAKU_STAT_MODE_DIR : HAKU_STAT_MODE_REG;
     return 1;
 }
 
@@ -143,6 +162,8 @@ const vfs_fs_ops_t fat12_fs_ops = {
     fat12_vfs_seek,
     fat12_vfs_unlink,
     fat12_vfs_rename,
+    fat12_vfs_mkdir,
+    fat12_vfs_rmdir,
     fat12_vfs_stat,
     fat12_vfs_fstat,
 };
