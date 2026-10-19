@@ -37,6 +37,15 @@
 #define PAGING_ENTRIES    1024u
 #define PAGING_USER_LIMIT  0xC0000000u
 
+/* Supervisor-only direct map of all tracked physical memory. It starts
+ * above the user limit and is copied into every user directory, so kernel
+ * code can touch any frame the allocator hands out with PHYS_TO_VIRT. */
+#define PAGING_DIRECT_MAP_BASE 0xF0000000u
+#define PAGING_DIRECT_MAP_MB   128u
+#define PAGING_DIRECT_MAP_TABLES (PAGING_DIRECT_MAP_MB / 4u)
+#define PAGING_PHYS_LIMIT (PAGING_DIRECT_MAP_MB * 1024u * 1024u)
+#define PHYS_TO_VIRT(phys) ((void *)(PAGING_DIRECT_MAP_BASE + (uint32_t)(phys)))
+
 typedef struct {
     uint32_t directory_phys;
 } address_space_t;
@@ -47,9 +56,11 @@ int paging_is_enabled(void);   /* CR0.PG bit test */
 uint32_t paging_get_cr3(void); /* raw CR3 (== PAGING_DIR_PHYS after enable) */
 uint32_t paging_get_cr2(void); /* fault address (for the #PF handler) */
 void paging_flush_all(void);   /* reload CR3: full TLB flush (Linux flush_tlb_all) */
+void paging_invlpg(uint32_t virtual_addr);
 int paging_create_user_space(address_space_t *space);
 int paging_map_user_page(address_space_t *space, uint32_t virtual_addr,
                          uint32_t physical_addr, int writable);
+int paging_unmap_user_page(address_space_t *space, uint32_t virtual_addr);
 void paging_activate_user_space(const address_space_t *space);
 void paging_activate_kernel_space(void);
 void paging_destroy_user_space(address_space_t *space);

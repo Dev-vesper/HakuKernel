@@ -64,7 +64,7 @@ void kernel_main(void) {
         }
     }
     klog_prefix();
-    klog_write("PAGING-OK: 8MB identity map, cr3=");
+    klog_write("PAGING-OK: 8MB identity + 128MB direct map, cr3=");
     klog_hex(paging_get_cr3());
     klog_write(", CR0.PG on\n");
 
@@ -76,8 +76,9 @@ void kernel_main(void) {
         }
     }
 
-    /* E820-backed frame inventory. Allocation is limited to the identity-
-     * mapped 8 MiB until temporary mappings support higher physical frames. */
+    /* E820-backed frame inventory. Every tracked frame below 128 MiB is
+     * reachable through the supervisor direct map, not just the identity
+     * window. */
     frame_init();
     if (!frame_self_test()) {
         for (;;) {

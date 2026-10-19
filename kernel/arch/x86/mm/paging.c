@@ -2,9 +2,11 @@
  *
  * Linux (arch/x86/kernel/head_32.S, __startup_32) builds swapper_pg_dir
  * with PG0 identity entries, loads CR3, then sets CR0.PG. We do the same,
- * except our tables live at fixed physical 0x9000/0xA000/0xB000
+ * except our initial tables live at fixed physical 0x9000/0xA000/0xB000
  * (identity mapped, so virtual == physical and plain C pointers work
- * before and after the switch).
+ * before and after the switch). After the switch a static supervisor
+ * direct map at 0xF0000000 makes every tracked frame addressable without
+ * temporary mappings.
  */
 #include "paging.h"
 #include "frame.h"
@@ -13,14 +15,19 @@
 #define TAB  ((uint32_t *)PAGING_TABLE_PHYS)
 #define TAB1 ((uint32_t *)PAGING_TABLE1_PHYS)
 
-static uint32_t alloc_page_table(void) {
+/* Storage for the direct-map page tables. The PDEs need page-aligned
+ * table addresses, but the kernel image is linked with 16-byte section
+ * alignment; reserve one extra page and round the base up at runtime.
+ * .bss is zeroed by the loader and lies in the identity window, so
+ * paging_init can fill the tables before the MMU is enabled. */
+#define DIRECT_TABLE_WORDS (PAGING_DIRECT_MAP_TABLES * PAGING_ENTRIES)
+static uint32_t direct_table_storage[DIRECT_TABLE_WORDS + PAGING_ENTRIES];
+static uint32_t *direct_tables;
+
+static int alloc_page_table(void) {
     void *frame = frame_alloc();
     if (!frame) return 0;
-    if ((uint32_t)frame >= PAGING_IDMAP_MB * 1024u * 1024u) {
-        frame_free(frame);
-        return 0;
-    }
-    memset(frame, 0, 4096);
+    memset(PHYS_TO_VIRT(frame), 0, 4096);
     return (uint32_t)frame;
 }
 
@@ -36,10 +43,25 @@ void paging_init(void) {
     DIR[1] = (PAGING_TABLE1_PHYS & 0xFFFFF000u) | PAGE_PRESENT | PAGE_RW;
     /* 2 x 1024 x 4 KiB = first 8 MiB identity mapped: kernel (0x10000),
      * VGA (0xB8000), tables themselves, the 0x90000 stack, ISA hole, and
-     * room for frames the frame allocator hands out (starts at 4 MiB). */
+     * room for early low allocations. */
     for (uint32_t i = 0; i < PAGING_ENTRIES; i++) {
         TAB[i] = (i * 0x1000u) | PAGE_PRESENT | PAGE_RW;
         TAB1[i] = ((i + 1024u) * 0x1000u) | PAGE_PRESENT | PAGE_RW;
+    }
+    /* Supervisor direct map of every frame the allocator tracks, at
+     * 0xF0000000..0xF8000000. User directories copy these PDEs so the
+     * kernel can dereference any physical frame while a user space is
+     * active. */
+    direct_tables = (uint32_t *)(((uint32_t)direct_table_storage +
+                                 0xFFFu) & 0xFFFFF000u);
+    for (uint32_t t = 0; t < PAGING_DIRECT_MAP_TABLES; t++) {
+        uint32_t *table = direct_tables + t * PAGING_ENTRIES;
+        for (uint32_t i = 0; i < PAGING_ENTRIES; i++) {
+            uint32_t phys = (t * PAGING_ENTRIES + i) * 0x1000u;
+            table[i] = phys | PAGE_PRESENT | PAGE_RW;
+        }
+        DIR[(PAGING_DIRECT_MAP_BASE >> 22) + t] =
+            ((uint32_t)table & 0xFFFFF000u) | PAGE_PRESENT | PAGE_RW;
     }
 }
 
@@ -92,15 +114,28 @@ void paging_flush_all(void) {
     }
 }
 
+void paging_invlpg(uint32_t virtual_addr) {
+    __asm {
+        mov eax, virtual_addr
+        invlpg [eax]
+    }
+}
+
 int paging_create_user_space(address_space_t *space) {
     uint32_t *directory;
     uint32_t directory_phys;
     if (!space) return 0;
     directory_phys = alloc_page_table();
     if (!directory_phys) return 0;
-    directory = (uint32_t *)directory_phys;
+    directory = (uint32_t *)PHYS_TO_VIRT(directory_phys);
     directory[0] = DIR[0];
     directory[1] = DIR[1];
+    /* Share the supervisor direct map so high physical frames remain
+     * reachable from syscalls and task switches. */
+    for (uint32_t i = 0; i < PAGING_DIRECT_MAP_TABLES; i++) {
+        uint32_t index = (PAGING_DIRECT_MAP_BASE >> 22) + i;
+        directory[index] = DIR[index];
+    }
     space->directory_phys = directory_phys;
     return 1;
 }
@@ -111,18 +146,20 @@ int paging_map_user_page(address_space_t *space, uint32_t virtual_addr,
     uint32_t directory_index;
     uint32_t table_index;
     uint32_t table_phys;
+    uint32_t *table;
     uint32_t flags = PAGE_PRESENT | PAGE_USER;
+    int current;
 
     if (!space || !space->directory_phys ||
         (virtual_addr & 0xFFFu) != 0 ||
         (physical_addr & 0xFFFu) != 0 ||
         virtual_addr < 0x40000000u ||
         virtual_addr >= PAGING_USER_LIMIT ||
-        physical_addr >= PAGING_IDMAP_MB * 1024u * 1024u)
+        physical_addr >= PAGING_PHYS_LIMIT)
         return 0;
     if (writable) flags |= PAGE_RW;
 
-    directory = (uint32_t *)space->directory_phys;
+    directory = (uint32_t *)PHYS_TO_VIRT(space->directory_phys);
     directory_index = virtual_addr >> 22;
     table_index = (virtual_addr >> 12) & 0x3FFu;
     if (!(directory[directory_index] & PAGE_PRESENT)) {
@@ -133,12 +170,55 @@ int paging_map_user_page(address_space_t *space, uint32_t virtual_addr,
     } else {
         if (!(directory[directory_index] & PAGE_USER)) return 0;
         table_phys = directory[directory_index] & 0xFFFFF000u;
-        if (table_phys >= PAGING_IDMAP_MB * 1024u * 1024u) return 0;
+        if (table_phys >= PAGING_PHYS_LIMIT) return 0;
     }
 
-    if (((uint32_t *)table_phys)[table_index] & PAGE_PRESENT) return 0;
-    ((uint32_t *)table_phys)[table_index] =
-        (physical_addr & 0xFFFFF000u) | flags;
+    table = (uint32_t *)PHYS_TO_VIRT(table_phys);
+    if (table[table_index] & PAGE_PRESENT) return 0;
+    table[table_index] = (physical_addr & 0xFFFFF000u) | flags;
+
+    current = (paging_get_cr3() & 0xFFFFF000u) == space->directory_phys;
+    if (current) paging_invlpg(virtual_addr);
+    return 1;
+}
+
+int paging_unmap_user_page(address_space_t *space, uint32_t virtual_addr) {
+    uint32_t *directory;
+    uint32_t *table;
+    uint32_t directory_index;
+    uint32_t table_index;
+    uint32_t table_phys;
+    uint32_t pte;
+    int current;
+
+    if (!space || !space->directory_phys ||
+        (virtual_addr & 0xFFFu) != 0 ||
+        virtual_addr < 0x40000000u ||
+        virtual_addr >= PAGING_USER_LIMIT)
+        return 0;
+
+    directory = (uint32_t *)PHYS_TO_VIRT(space->directory_phys);
+    directory_index = virtual_addr >> 22;
+    if (!(directory[directory_index] & PAGE_PRESENT)) return 0;
+    table_phys = directory[directory_index] & 0xFFFFF000u;
+    if (table_phys >= PAGING_PHYS_LIMIT) return 0;
+    table = (uint32_t *)PHYS_TO_VIRT(table_phys);
+    table_index = (virtual_addr >> 12) & 0x3FFu;
+    pte = table[table_index];
+    if (!(pte & PAGE_PRESENT)) return 0;
+
+    table[table_index] = 0;
+    current = (paging_get_cr3() & 0xFFFFF000u) == space->directory_phys;
+    if (current) paging_invlpg(virtual_addr);
+    frame_free((void *)(pte & 0xFFFFF000u));
+
+    /* Drop a now-empty page table so release returns the whole 4 KiB. */
+    for (uint32_t i = 0; i < PAGING_ENTRIES; i++) {
+        if (table[i] & PAGE_PRESENT) return 1;
+    }
+    directory[directory_index] = 0;
+    if (current) paging_flush_all();
+    frame_free((void *)table_phys);
     return 1;
 }
 
@@ -164,15 +244,15 @@ void paging_destroy_user_space(address_space_t *space) {
         space->directory_phys == PAGING_DIR_PHYS)
         return;
 
-    directory = (uint32_t *)space->directory_phys;
+    directory = (uint32_t *)PHYS_TO_VIRT(space->directory_phys);
     for (uint32_t di = 256; di < (PAGING_USER_LIMIT >> 22); di++) {
         uint32_t pde = directory[di];
         if (!(pde & PAGE_PRESENT)) continue;
         {
             uint32_t table_phys = pde & 0xFFFFF000u;
             uint32_t *table;
-            if (table_phys >= PAGING_IDMAP_MB * 1024u * 1024u) continue;
-            table = (uint32_t *)table_phys;
+            if (table_phys >= PAGING_PHYS_LIMIT) continue;
+            table = (uint32_t *)PHYS_TO_VIRT(table_phys);
             for (uint32_t ti = 0; ti < PAGING_ENTRIES; ti++) {
                 if (table[ti] & PAGE_PRESENT)
                     frame_free((void *)(table[ti] & 0xFFFFF000u));
@@ -198,8 +278,8 @@ int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
         return 0;
     last_addr = virtual_addr + length - 1u;
     if (last_addr >= PAGING_USER_LIMIT) return 0;
-    if (directory_phys >= PAGING_IDMAP_MB * 1024u * 1024u) return 0;
-    directory = (uint32_t *)directory_phys;
+    if (directory_phys >= PAGING_PHYS_LIMIT) return 0;
+    directory = (uint32_t *)PHYS_TO_VIRT(directory_phys);
 
     page_addr = virtual_addr & 0xFFFFF000u;
     for (;;) {
@@ -213,9 +293,9 @@ int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
         if (write_access && !(pde & PAGE_RW)) return 0;
 
         table_phys = pde & 0xFFFFF000u;
-        if (table_phys >= PAGING_IDMAP_MB * 1024u * 1024u)
+        if (table_phys >= PAGING_PHYS_LIMIT)
             return 0;
-        pte = ((uint32_t *)table_phys)[(page_addr >> 12) & 0x3FFu];
+        pte = ((uint32_t *)PHYS_TO_VIRT(table_phys))[(page_addr >> 12) & 0x3FFu];
         if ((pte & (PAGE_PRESENT | PAGE_USER)) !=
             (PAGE_PRESENT | PAGE_USER))
             return 0;
@@ -244,8 +324,8 @@ int paging_copy_to_user_space(const address_space_t *space,
     if (!length) return 1;
 
     directory_phys = space->directory_phys;
-    if (directory_phys >= PAGING_IDMAP_MB * 1024u * 1024u) return 0;
-    directory = (uint32_t *)directory_phys;
+    if (directory_phys >= PAGING_PHYS_LIMIT) return 0;
+    directory = (uint32_t *)PHYS_TO_VIRT(directory_phys);
     end = virtual_addr + length;
 
     while (virtual_addr < end) {
@@ -259,13 +339,15 @@ int paging_copy_to_user_space(const address_space_t *space,
             (PAGE_PRESENT | PAGE_USER | PAGE_RW))
             return 0;
         table_phys = pde & 0xFFFFF000u;
-        if (table_phys >= PAGING_IDMAP_MB * 1024u * 1024u) return 0;
-        pte = ((uint32_t *)table_phys)[(virtual_addr >> 12) & 0x3FFu];
+        if (table_phys >= PAGING_PHYS_LIMIT) return 0;
+        pte = ((uint32_t *)PHYS_TO_VIRT(table_phys))[
+            (virtual_addr >> 12) & 0x3FFu];
         if ((pte & (PAGE_PRESENT | PAGE_USER | PAGE_RW)) !=
             (PAGE_PRESENT | PAGE_USER | PAGE_RW))
             return 0;
         if (amount > end - virtual_addr) amount = end - virtual_addr;
-        memcpy((void *)((pte & 0xFFFFF000u) + page_offset),
+        memcpy((void *)((uint32_t)PHYS_TO_VIRT(pte & 0xFFFFF000u) +
+                        page_offset),
                input + copied, amount);
         virtual_addr += amount;
         copied += amount;

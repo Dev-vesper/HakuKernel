@@ -74,9 +74,10 @@ Memory map:
 | `0x10000–0x80000` | kernel load window (up to 448 KiB, linked `/BASE:0x10000 /ALIGN:16`) |
 | `0x7000–0x7240` | E820 map from stage2 (INT 15h, count at `0x6FFC`) |
 | `0x9000–0xC000` | page directory + initial tables (8 MiB supervisor identity map) |
+| `0xF0000000–0xF8000000` | supervisor direct map of physical `0–128 MiB` (page tables live in kernel `.bss`) |
 | `0x100000–0x400000` | kernel heap (kmalloc/kfree, 16 B aligned) |
 | `0x90000` | bootstrap kernel stack top (grows down) |
-| below `0x800000` | allocated per-process 8 KiB kernel stacks |
+| low E820 frames (often 4–8 MiB) | per-process 8 KiB kernel stacks, accessed through the direct map |
 | `0x40000000` | user program code/data virtual base (per-process mapping) |
 | `0x50000000–0x54000000` | user `brk` heap region (lazily mapped) |
 | `0x60000000–0x70000000` | anonymous `mmap` region (lazily mapped) |
@@ -102,9 +103,12 @@ type-1 usable ranges are admitted; invalid entries and overlapping reserved
 ranges are excluded. The allocator explicitly reserves low boot/firmware
 memory, the kernel's 448 KiB load window, page tables, the boot stack, the ISA
 hole, and the 1–4 MiB heap. `frame_usable_count()` reports E820-usable pages
-tracked up to 128 MiB, while allocations are currently restricted to the
-identity-mapped first 8 MiB. Freeing validates alignment, usability, and
-allocation state so reserved pages cannot accidentally be released.
+tracked up to 128 MiB, and every tracked frame is allocatable: a permanent
+supervisor direct map at `0xF0000000` addresses physical `0–128 MiB`, and its
+PDEs are copied into each user page directory. The self-test chain-allocates
+past the old 8 MiB identity boundary and writes/reads a high frame through
+`PHYS_TO_VIRT`. Freeing validates alignment, usability, and allocation state
+so reserved pages cannot accidentally be released.
 
 ### Processes and preemptive scheduling
 
@@ -119,7 +123,8 @@ files, each sharing the parent's open file description). `waitpid` accepts a
 specific child PID or `-1` (any child)
 and currently supports only options `0`. `execve` replaces a process image
 from the root filesystem.
-Each process has its own address space and an 8 KiB ring-0 stack;
+Each process has its own address space and an 8 KiB ring-0 stack; the stack
+is allocated as physical frames and addressed through the kernel direct map.
 `gdt_set_kernel_stack` updates `TSS.esp0` at every task switch so the next
 ring-3 interrupt or syscall enters on the correct stack. The 100 Hz PIT
 scheduler saves and restores complete interrupt frames through `iret`.
@@ -130,8 +135,8 @@ context.
 
 `kernel/arch/x86/kernel/gdt.c` installs flat ring-0/ring-3 code and data descriptors plus a
 32-bit TSS. `kernel/arch/x86/mm/paging.c` gives each process supervisor-only kernel
-identity mappings and maps its user program and two-page user stack with
-user permissions.
+identity and direct-map entries and maps its user program and two-page user
+stack with user permissions.
 
 `kernel/arch/x86/user/user.asm` is built as an ELF32 image and entered via `iret` at CPL 3.
 It tests `spawn` (`0x1000`, Haku-specific) and `waitpid` (7), as well as
@@ -146,7 +151,7 @@ the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `read` (3), `write` (4), `open` (5), `close` (6), `waitpid` (7),
 `unlink` (10), `execve` (11), `lseek` (19), `getpid` (20), `rename` (38),
 `mkdir` (39), `rmdir` (40), `dup` (41), `brk` (45), `dup2` (63),
-`gettimeofday` (78), `mmap` (90), `stat` (106), `fstat` (108),
+`gettimeofday` (78), `mmap` (90), `munmap` (91), `stat` (106), `fstat` (108),
 and `nanosleep` (162), with arguments in
 `ebx`, `ecx`, and `edx` and syscall number/result in `eax`.
 The custom `spawn` syscall uses `0x1000`.
@@ -160,16 +165,19 @@ flags, and the `stat` buffer layout. `haku_stat_t` contains 32-bit `size` and
 (`tv_sec`, `tv_nsec`) are the 8-byte user time structures. `haku_mmap_arg_t`
 is the 24-byte i386 `old_mmap` argument block.
 
-`brk` grows a per-process heap starting at a reserved virtual base
+`brk` grows or shrinks a per-process heap starting at a reserved virtual base
 (`0x50000000`): the break is page-rounded and pages are mapped zero-filled as
-it rises; a below-base break gives `EINVAL` and one past the heap limit gives
-`ENOMEM`. `mmap` takes a pointer to an `old_mmap` argument block in `ebx` and
-supports only anonymous private mappings (`MAP_PRIVATE | MAP_ANONYMOUS`) with
-a zero address hint, no execute bit, and offset 0; it places mappings in a
-second reserved region (`0x60000000`) and returns the address. Pages are
-always mapped read/write, so the requested protection is validated but not
-enforced. Both regions are reclaimed with the rest of the address space at
-exit or `execve`.
+it rises; lowering it unmaps the released pages and returns their frames; a
+below-base break gives `EINVAL` and one past the heap limit gives `ENOMEM`.
+`mmap` takes a pointer to an `old_mmap` argument block in `ebx` and supports
+only anonymous private mappings (`MAP_PRIVATE | MAP_ANONYMOUS`) with a zero
+address hint, no execute bit, and offset 0; it places mappings in a second
+reserved region (`0x60000000`) using first-fit over a per-process table, so
+earlier releases are reused. `munmap` (91) releases a range that lies inside
+one tracked anonymous mapping, trims or splits the region, and frees the pages
+(and any now-empty page tables). Pages are always mapped read/write, so the
+requested protection is validated but not enforced. Both regions are reclaimed
+with the rest of the address space at exit or `execve`.
 
 ### User-mode system calls
 
@@ -380,7 +388,7 @@ segments. Each segment is mapped according to its ELF permissions; the loader
 zeroes `p_memsz - p_filesz` for BSS and creates a two-page user stack.
 
 Each loaded image receives a fresh page directory containing supervisor-only
-kernel identity mappings plus only that image's user pages. The scheduler
+kernel identity/direct mappings plus only that image's user pages. The scheduler
 activates each process's CR3 on dispatch and returns to the kernel page
 directory for its idle context. Exited process mappings and page tables are
 released after switching away from their kernel stacks. Dynamic linking,
@@ -419,7 +427,7 @@ Haku/
                         GDT/TSS load, ring-3 transition + syscalls
                         cpu/gdt/idt/pic/pit/kbd: port I/O, descriptor tables,
                         PIC/PIT, and the PS/2 keyboard driver
-      mm/               paging.c/.h: i386 page tables (8 MiB identity map + user)
+      mm/               paging.c/.h: i386 page tables (identity + 128 MiB direct map + user)
                         frame.c/.h: E820-backed physical page inventory
       elf/              elf.c/.h: validated ELF32 PT_LOAD loader + user spaces
       user/             user.asm, child.asm, exec_target.asm: ELF32 test
@@ -434,7 +442,7 @@ Haku/
     kernel/             kernel_main.c: kernel startup
                         scheduler.c/.h: preemptive process scheduler
                         sync.c/.h: spinlocks and IRQ-save locks + locking rules
-                        usermode.c/.h: user mappings, syscall ABI, heap/mmap
+                        usermode.c/.h: user mappings, syscall ABI, brk/mmap/munmap
                         klog.c/.h: timestamped console logging
                         heap.c/.h: kernel kmalloc/kfree allocator
   include/haku/         abi.h + abi.inc: shared user/kernel ABI constants

@@ -24,6 +24,7 @@
 #define HAKU_SYS_GETTIMEOFDAY 78u
 /* i386 old_mmap: a single pointer to haku_mmap_arg_t in ebx. */
 #define HAKU_SYS_MMAP    90u
+#define HAKU_SYS_MUNMAP  91u
 #define HAKU_SYS_STAT    106u
 #define HAKU_SYS_FSTAT   108u
 #define HAKU_SYS_NANOSLEEP    162u

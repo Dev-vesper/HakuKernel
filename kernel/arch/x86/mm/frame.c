@@ -1,8 +1,8 @@
 /* Haku frame allocator: E820-backed physical-page inventory.
  *
- * The bitmap tracks all usable RAM below 128 MiB. Allocation is currently
- * limited to the identity-mapped first 8 MiB; higher frames become usable
- * by the allocator once the kernel has temporary physical mappings.
+ * The bitmap tracks all usable RAM below 128 MiB and every tracked frame
+ * is reachable through the supervisor direct map, so allocation is not
+ * limited to the first 8 MiB identity window.
  */
 #include "frame.h"
 #include "console.h"
@@ -25,7 +25,7 @@ static spinlock_t frame_lock = SPINLOCK_INIT;
 #define ISA_HOLE_END      0x00100000u
 
 #define FRAME_PHYS_LIMIT (FRAME_ENTRIES * FRAME_SIZE)
-#define FRAME_ALLOC_ENTRIES ((PAGING_IDMAP_MB * 1024u * 1024u) / FRAME_SIZE)
+#define FRAME_HIGH_WATERMARK (8u * 1024u * 1024u)
 
 typedef struct {
     uint32_t base_low;
@@ -209,7 +209,7 @@ void *frame_alloc(void) {
     irqflags_t flags;
     if (!frame_bitmap || !frame_usable) return 0;
     flags = spin_lock_irqsave(&frame_lock);
-    for (uint32_t frame = 0; frame < FRAME_ALLOC_ENTRIES; frame++) {
+    for (uint32_t frame = 0; frame < FRAME_ENTRIES; frame++) {
         if (bitmap_test(frame_usable, frame) &&
             !bitmap_test(frame_bitmap, frame)) {
             bitmap_set(frame_bitmap, frame);
@@ -227,7 +227,7 @@ void frame_free(void *phys) {
     irqflags_t flags;
     if (!frame_bitmap || !frame_usable ||
         (address & (FRAME_SIZE - 1u)) != 0 ||
-        address >= FRAME_ALLOC_ENTRIES * FRAME_SIZE)
+        address >= FRAME_PHYS_LIMIT)
         return;
     frame = address / FRAME_SIZE;
     flags = spin_lock_irqsave(&frame_lock);
@@ -243,11 +243,11 @@ void *frame_alloc_pages(uint32_t n) {
     void *result = 0;
     irqflags_t flags;
     if (!frame_bitmap || !frame_usable || n == 0 ||
-        n > FRAME_ALLOC_ENTRIES)
+        n > FRAME_ENTRIES)
         return 0;
 
     flags = spin_lock_irqsave(&frame_lock);
-    for (uint32_t frame = 0; frame < FRAME_ALLOC_ENTRIES; frame++) {
+    for (uint32_t frame = 0; frame < FRAME_ENTRIES; frame++) {
         if (bitmap_test(frame_usable, frame) &&
             !bitmap_test(frame_bitmap, frame)) {
             if (run == 0) start = frame;
@@ -273,7 +273,7 @@ void frame_free_pages(void *phys, uint32_t n) {
     irqflags_t flags;
     if (!frame_bitmap || !frame_usable || n == 0 ||
         (address & (FRAME_SIZE - 1u)) != 0 ||
-        address >= FRAME_ALLOC_ENTRIES * FRAME_SIZE)
+        address >= FRAME_PHYS_LIMIT)
         return;
     start = address / FRAME_SIZE;
     if (n > FRAME_ENTRIES - start) return;
@@ -309,7 +309,7 @@ uint32_t frame_free_count(void) {
     irqflags_t flags;
     if (!frame_bitmap || !frame_usable) return 0;
     flags = spin_lock_irqsave(&frame_lock);
-    for (uint32_t frame = 0; frame < FRAME_ALLOC_ENTRIES; frame++)
+    for (uint32_t frame = 0; frame < FRAME_ENTRIES; frame++)
         if (bitmap_test(frame_usable, frame) &&
             !bitmap_test(frame_bitmap, frame))
             count++;
@@ -319,6 +319,7 @@ uint32_t frame_free_count(void) {
 
 int frame_self_test(void) {
     int pass = 1;
+    uint32_t high_frame = 0;
     uint32_t initial_free = frame_free_count();
     if (frame_usable_count() == 0 || initial_free == 0) {
         pass = 0;
@@ -327,14 +328,14 @@ int frame_self_test(void) {
     void *a = frame_alloc();
     void *b = frame_alloc();
     if (!a || !b || a == b ||
-        (uint32_t)a >= PAGING_IDMAP_MB * 1024u * 1024u ||
-        (uint32_t)b >= PAGING_IDMAP_MB * 1024u * 1024u) {
+        (uint32_t)a >= FRAME_PHYS_LIMIT ||
+        (uint32_t)b >= FRAME_PHYS_LIMIT) {
         pass = 0;
         goto done;
     }
-    *(volatile uint32_t *)a = 0x11111111u;
-    *(volatile uint32_t *)b = 0x22222222u;
-    if (*(volatile uint32_t *)a != 0x11111111u) pass = 0;
+    *(volatile uint32_t *)PHYS_TO_VIRT(a) = 0x11111111u;
+    *(volatile uint32_t *)PHYS_TO_VIRT(b) = 0x22222222u;
+    if (*(volatile uint32_t *)PHYS_TO_VIRT(a) != 0x11111111u) pass = 0;
 
     frame_free(a);
     frame_free(b);
@@ -353,16 +354,50 @@ int frame_self_test(void) {
             goto done;
         }
         {
-            uint32_t value = *(volatile uint32_t *)c;
+            uint32_t value = *(volatile uint32_t *)PHYS_TO_VIRT(c);
             if (value != 0x11111111u && value != 0x22222222u) pass = 0;
         }
         frame_free(c);
     }
 
+    /* Walk the free list until a frame above the old 8 MiB identity
+     * window appears, proving high physical memory is allocatable and
+     * reachable through the direct map. The link lives in each frame, so
+     * the test stays O(1) in stack space. */
+    {
+        void *chain = 0;
+        void *high = 0;
+        uint32_t allocated = 0;
+        while (allocated < FRAME_ENTRIES) {
+            void *page = frame_alloc();
+            uint32_t link;
+            if (!page) break;
+            link = (uint32_t)chain;
+            *(volatile uint32_t *)PHYS_TO_VIRT(page) = link;
+            chain = page;
+            allocated++;
+            if ((uint32_t)page >= FRAME_HIGH_WATERMARK) {
+                high = page;
+                high_frame = (uint32_t)page;
+                *(volatile uint32_t *)PHYS_TO_VIRT(page) = 0x33333333u;
+                if (*(volatile uint32_t *)PHYS_TO_VIRT(page) != 0x33333333u)
+                    pass = 0;
+                *(volatile uint32_t *)PHYS_TO_VIRT(page) = link;
+                break;
+            }
+        }
+        if (!high) pass = 0;
+        while (chain) {
+            void *next = (void *)*(volatile uint32_t *)PHYS_TO_VIRT(chain);
+            frame_free(chain);
+            chain = next;
+        }
+        if (frame_free_count() != initial_free) pass = 0;
+    }
+
     {
         void *pages = frame_alloc_pages(4);
-        if (!pages ||
-            (uint32_t)pages >= PAGING_IDMAP_MB * 1024u * 1024u) {
+        if (!pages || (uint32_t)pages >= FRAME_PHYS_LIMIT) {
             pass = 0;
             goto done;
         }
@@ -377,7 +412,9 @@ done:
         klog_dec(frame_free_count());
         klog_write(" usable=");
         klog_dec(frame_usable_count());
-        klog_write(" alloc-limit=8MB\n");
+        klog_write(" alloc-limit=128MB high=");
+        klog_hex(high_frame);
+        klog_write("\n");
     } else {
         klog_prefix();
         klog_write("FRAME-FAIL: self-test FAIL\n");

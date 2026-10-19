@@ -53,10 +53,7 @@ static void gdt_set(uint32_t index, uint32_t base, uint32_t limit,
 
 int gdt_init(void) {
     void *stack = frame_alloc();
-    if (!stack || (uint32_t)stack >= PAGING_IDMAP_MB * 1024u * 1024u) {
-        if (stack) frame_free(stack);
-        return 0;
-    }
+    if (!stack) return 0;
 
     memset(gdt, 0, sizeof(gdt));
     memset(&tss, 0, sizeof(tss));
@@ -66,7 +63,7 @@ int gdt_init(void) {
     gdt_set(4, 0, 0xFFFFFu, 0xF2u, 0xCFu); /* ring-3 data */
 
     tss.ss0 = KERNEL_DS;
-    tss.esp0 = (uint32_t)stack + FRAME_SIZE;
+    tss.esp0 = (uint32_t)PHYS_TO_VIRT(stack) + FRAME_SIZE;
     tss.iomap_base = sizeof(tss);
     gdt_set(5, (uint32_t)&tss, sizeof(tss) - 1u, 0x89u, 0x00u);
 

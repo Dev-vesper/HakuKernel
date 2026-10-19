@@ -133,8 +133,13 @@ address-space or descriptor sharing.
   wait queues use a task-slot bitmap and a distinct `TASK_BLOCKED` state;
   blocking console reads park until IRQ1 wakes them, proven by
   `SCHED-WAITQ-OK`, while `nanosleep`/`waitpid` keep their existing states).
-- [ ] Extend allocation beyond the current identity-mapped range and add
-  user virtual-memory allocation and release.
+- [x] Extend allocation beyond the current identity-mapped range and add
+  user virtual-memory allocation and release (the frame allocator uses every
+  tracked E820 frame below 128 MiB through a supervisor direct map at
+  `0xF0000000`; its self-test allocates and touches a frame above 8 MiB.
+  `brk` now shrinks and unmaps released heap pages, and `munmap` (91) trims,
+  splits, and frees anonymous mappings so later `mmap` calls reuse the
+  address space; `USER-MEM-OK` covers shrink, release, and reuse).
 - [ ] Improve page protections and test read-only, unmapped, and
   use-after-free access.
 - [ ] Track memory and resource usage per process.

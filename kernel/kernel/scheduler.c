@@ -11,6 +11,7 @@
 #include "vfs.h"
 
 #define TASK_KERNEL_STACK_PAGES 2u
+#define TASK_MAX_MMAP_REGIONS 8u
 
 typedef enum {
     TASK_UNUSED,
@@ -36,7 +37,11 @@ typedef struct {
     uint32_t wake_tick;
     uint32_t heap_brk;    /* current program break (0 = not yet used) */
     uint32_t heap_top;    /* highest heap page ever mapped (grow only) */
-    uint32_t mmap_next;   /* next anonymous mmap address (0 = not yet used) */
+    uint32_t mmap_region_count;
+    struct {
+        uint32_t base;
+        uint32_t size;
+    } mmap_regions[TASK_MAX_MMAP_REGIONS];
 } task_t;
 
 #define SCHEDULER_IDLE_INDEX ((int)SCHEDULER_MAX_PROCESSES)
@@ -94,8 +99,7 @@ static int initialize_stack(task_t *task, int user_mode) {
 
     task->kernel_stack = (uint32_t)frame_alloc_pages(TASK_KERNEL_STACK_PAGES);
     if (!task->kernel_stack ||
-        task->kernel_stack + stack_bytes >
-            PAGING_IDMAP_MB * 1024u * 1024u) {
+        task->kernel_stack + stack_bytes > PAGING_PHYS_LIMIT) {
         if (task->kernel_stack)
             frame_free_pages((void *)task->kernel_stack,
                              TASK_KERNEL_STACK_PAGES);
@@ -103,7 +107,9 @@ static int initialize_stack(task_t *task, int user_mode) {
         return 0;
     }
 
-    stack_top = task->kernel_stack + stack_bytes;
+    /* The frame lives on the direct-mapped view; the physical address is
+     * what release_task_resources() gives back to the allocator. */
+    stack_top = (uint32_t)PHYS_TO_VIRT(task->kernel_stack) + stack_bytes;
     frame = (regs_t *)(stack_top - sizeof(regs_t));
     memset(frame, 0, sizeof(*frame));
     frame->gs = user_mode ? USER_DS : KERNEL_DS;
@@ -151,7 +157,7 @@ static void activate_task(int selected_index) {
         task = &tasks[selected_index];
         paging_activate_user_space(&task->program.address_space);
     }
-    gdt_set_kernel_stack(task->kernel_stack +
+    gdt_set_kernel_stack((uint32_t)PHYS_TO_VIRT(task->kernel_stack) +
                          TASK_KERNEL_STACK_PAGES * FRAME_SIZE);
 }
 
@@ -365,10 +371,11 @@ int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
     previous = task->program;
     task->program = *replacement;
     replacement->address_space.directory_phys = 0;
-    /* A fresh image starts with a fresh, lazily-mapped heap. */
+    /* A fresh image starts with a fresh, lazily-mapped heap and no
+     * anonymous mappings. */
     task->heap_brk = 0;
     task->heap_top = 0;
-    task->mmap_next = 0;
+    task->mmap_region_count = 0;
 
     frame->gs = USER_DS;
     frame->fs = USER_DS;
@@ -625,27 +632,37 @@ regs_t *scheduler_sleep_ticks(uint32_t ticks, regs_t *frame) {
 }
 
 /* Map [start, end) as zero-filled, user-writable pages in the given
- * address space (page-aligned range). Caller holds no locks; a partial
- * failure leaves the pages already mapped, which the address-space
- * teardown reclaims when the process exits. */
+ * address space (page-aligned range). On failure the pages mapped by this
+ * call are unmapped again, so the caller can report -ENOMEM without
+ * leaking address space or frames. */
 static int map_user_zero_pages(address_space_t *space, uint32_t start,
                                uint32_t end) {
+    uint32_t mapped = start;
     for (uint32_t address = start; address < end; address += USER_PAGE_SIZE) {
         void *page = frame_alloc();
-        if (!page) return 0;
-        memset(page, 0, USER_PAGE_SIZE);
-        if (!paging_map_user_page(space, address, (uint32_t)page, 1)) {
+        uint32_t physical;
+        if (!page) break;
+        physical = (uint32_t)page;
+        memset(PHYS_TO_VIRT(physical), 0, USER_PAGE_SIZE);
+        if (!paging_map_user_page(space, address, physical, 1)) {
             frame_free(page);
-            return 0;
+            break;
         }
+        mapped = address + USER_PAGE_SIZE;
     }
-    return 1;
+    if (mapped == end) return 1;
+    while (mapped > start) {
+        mapped -= USER_PAGE_SIZE;
+        paging_unmap_user_page(space, mapped);
+    }
+    return 0;
 }
 
-/* brk(2) with a fixed heap region: grow the per-process break, mapping
- * zero-filled pages as it rises. The break is page-rounded and never
- * returns below USER_HEAP_BASE. A zero request just queries the current
- * break; an invalid size returns -EINVAL/-ENOMEM. */
+/* brk(2) with a fixed heap region: grow or shrink the per-process break,
+ * mapping zero-filled pages as it rises and releasing them as it falls.
+ * The break is page-rounded and never returns below USER_HEAP_BASE. A zero
+ * request just queries the current break; an invalid size returns
+ * -EINVAL/-ENOMEM. */
 uint32_t scheduler_brk(uint32_t requested) {
     task_t *task;
     address_space_t *space;
@@ -669,14 +686,48 @@ uint32_t scheduler_brk(uint32_t requested) {
         if (!map_user_zero_pages(space, task->heap_top, rounded))
             return 0u - HAKU_ENOMEM;
         task->heap_top = rounded;
+    } else if (rounded < task->heap_top) {
+        for (uint32_t address = rounded; address < task->heap_top;
+             address += USER_PAGE_SIZE)
+            paging_unmap_user_page(space, address);
+        task->heap_top = rounded;
     }
     task->heap_brk = rounded;
     return rounded;
 }
 
-/* Limited mmap(2): anonymous private pages from a per-process bump
- * region, always zero-filled and writable. Returns the mapped base
- * address or -errno. */
+/* First fit for a page-aligned anonymous mapping, scanning the sorted
+ * region list so released address space is reused. Returns 0 when the
+ * mapping does not fit. */
+static uint32_t mmap_find_gap(const task_t *task, uint32_t size) {
+    uint32_t candidate = USER_MMAP_BASE;
+    for (uint32_t i = 0; i < task->mmap_region_count; i++) {
+        uint32_t base = task->mmap_regions[i].base;
+        uint32_t end = base + task->mmap_regions[i].size;
+        if (candidate + size <= base) return candidate;
+        if (candidate < end) candidate = end;
+    }
+    if (candidate > USER_MMAP_LIMIT ||
+        size > USER_MMAP_LIMIT - candidate)
+        return 0;
+    return candidate;
+}
+
+static void mmap_insert_region(task_t *task, uint32_t base, uint32_t size) {
+    uint32_t index = 0;
+    while (index < task->mmap_region_count &&
+           task->mmap_regions[index].base < base)
+        index++;
+    for (uint32_t i = task->mmap_region_count; i > index; i--)
+        task->mmap_regions[i] = task->mmap_regions[i - 1u];
+    task->mmap_regions[index].base = base;
+    task->mmap_regions[index].size = size;
+    task->mmap_region_count++;
+}
+
+/* Limited mmap(2): anonymous private pages from the per-process mmap
+ * region, always zero-filled and writable. Returns the mapped base address
+ * or -errno. */
 uint32_t scheduler_mmap(uint32_t length) {
     task_t *task;
     address_space_t *space;
@@ -690,13 +741,81 @@ uint32_t scheduler_mmap(uint32_t length) {
     task = &tasks[current_task];
     space = &task->program.address_space;
     if (!space->directory_phys) return 0u - HAKU_EINVAL;
-    if (task->mmap_next == 0) task->mmap_next = USER_MMAP_BASE;
+    if (task->mmap_region_count >= TASK_MAX_MMAP_REGIONS)
+        return 0u - HAKU_ENOMEM;
 
     rounded = (length + USER_PAGE_SIZE - 1u) & 0xFFFFF000u;
-    base = task->mmap_next;
-    if (base > USER_MMAP_LIMIT - rounded) return 0u - HAKU_ENOMEM;
+    base = mmap_find_gap(task, rounded);
+    if (!base) return 0u - HAKU_ENOMEM;
     if (!map_user_zero_pages(space, base, base + rounded))
         return 0u - HAKU_ENOMEM;
-    task->mmap_next = base + rounded;
+    mmap_insert_region(task, base, rounded);
     return base;
+}
+
+/* munmap(2) for anonymous mappings: the range must lie inside exactly one
+ * tracked region. Partial unmap trims the region or splits it, and the
+ * released pages (plus empty page tables) return to the frame allocator.
+ * Returns 0 or -errno. */
+uint32_t scheduler_munmap(uint32_t address, uint32_t length) {
+    task_t *task;
+    address_space_t *space;
+    uint32_t start;
+    uint32_t end;
+    uint32_t index = TASK_MAX_MMAP_REGIONS;
+    uint32_t base = 0;
+    uint32_t size = 0;
+    int split;
+
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0u - HAKU_EINVAL;
+    if (length == 0 || address > 0xFFFFFFFFu - length)
+        return 0u - HAKU_EINVAL;
+    task = &tasks[current_task];
+    space = &task->program.address_space;
+    if (!space->directory_phys) return 0u - HAKU_EINVAL;
+
+    start = address & 0xFFFFF000u;
+    end = address + length;
+    if ((end & 0xFFFu) != 0) {
+        if (end > 0xFFFFF000u) return 0u - HAKU_EINVAL;
+        end = (end + USER_PAGE_SIZE - 1u) & 0xFFFFF000u;
+    }
+    if (end <= start || start < USER_MMAP_BASE || end > USER_MMAP_LIMIT)
+        return 0u - HAKU_EINVAL;
+
+    for (uint32_t i = 0; i < task->mmap_region_count; i++) {
+        base = task->mmap_regions[i].base;
+        size = task->mmap_regions[i].size;
+        if (start >= base && end <= base + size) {
+            index = i;
+            break;
+        }
+    }
+    if (index == TASK_MAX_MMAP_REGIONS) return 0u - HAKU_EINVAL;
+
+    /* A middle cut becomes two regions: check for a free slot before any
+     * page is released so a failure cannot leave the table inconsistent. */
+    split = start > base && end < base + size;
+    if (split && task->mmap_region_count >= TASK_MAX_MMAP_REGIONS)
+        return 0u - HAKU_EINVAL;
+
+    for (uint32_t page = start; page < end; page += USER_PAGE_SIZE)
+        paging_unmap_user_page(space, page);
+
+    if (start == base && end == base + size) {
+        for (uint32_t i = index; i + 1u < task->mmap_region_count; i++)
+            task->mmap_regions[i] = task->mmap_regions[i + 1u];
+        task->mmap_region_count--;
+    } else if (start == base) {
+        task->mmap_regions[index].base = end;
+        task->mmap_regions[index].size = base + size - end;
+    } else if (end == base + size) {
+        task->mmap_regions[index].size = start - base;
+    } else {
+        uint32_t old_end = base + size;
+        task->mmap_regions[index].size = start - base;
+        mmap_insert_region(task, end, old_end - end);
+    }
+    return 0;
 }

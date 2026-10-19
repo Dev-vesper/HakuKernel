@@ -1,8 +1,9 @@
 /* Haku E820-backed physical frame allocator.
  *
  * Two bitmaps describe up to 128 MiB of physical memory: one marks frames
- * usable according to E820, the other tracks allocation. The current direct
- * mapping only permits allocations from the first 8 MiB.
+ * usable according to E820, the other tracks allocation. Every tracked
+ * frame is reachable through the supervisor direct map, so allocation is
+ * not limited to the low identity window.
  */
 #ifndef HAKU_FRAME_H
 #define HAKU_FRAME_H
@@ -29,7 +30,7 @@ void *frame_alloc_pages(uint32_t n);
 void frame_free_pages(void *phys, uint32_t n);
 uint32_t frame_total_count(void);  /* tracked physical frames (up to 128 MiB) */
 uint32_t frame_usable_count(void); /* usable frames reported by E820 */
-uint32_t frame_free_count(void);   /* free frames currently allocatable (< 8 MiB) */
+uint32_t frame_free_count(void);   /* free frames currently allocatable */
 int frame_self_test(void);
 
 #endif

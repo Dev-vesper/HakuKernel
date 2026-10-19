@@ -84,14 +84,14 @@ static int valid_segment(const elf32_phdr_t *phdr, uint32_t image_size,
 
 static int page_is_mapped(const address_space_t *space, uint32_t address,
                           uint32_t *physical) {
-    uint32_t *directory = (uint32_t *)space->directory_phys;
+    uint32_t *directory = (uint32_t *)PHYS_TO_VIRT(space->directory_phys);
     uint32_t pde = directory[address >> 22];
     uint32_t table_phys;
     uint32_t pte;
     if (!(pde & PAGE_PRESENT)) return 0;
     table_phys = pde & 0xFFFFF000u;
-    if (table_phys >= PAGING_IDMAP_MB * 1024u * 1024u) return 0;
-    pte = ((uint32_t *)table_phys)[(address >> 12) & 0x3FFu];
+    if (table_phys >= PAGING_PHYS_LIMIT) return 0;
+    pte = ((uint32_t *)PHYS_TO_VIRT(table_phys))[(address >> 12) & 0x3FFu];
     if (!(pte & PAGE_PRESENT)) return 0;
     *physical = pte & 0xFFFFF000u;
     return 1;
@@ -102,7 +102,7 @@ static int map_zeroed_pages(address_space_t *space, uint32_t start,
     for (uint32_t address = start; address < end; address += USER_PAGE_SIZE) {
         void *page = frame_alloc();
         if (!page) return 0;
-        memset(page, 0, USER_PAGE_SIZE);
+        memset(PHYS_TO_VIRT(page), 0, USER_PAGE_SIZE);
         if (!paging_map_user_page(space, address, (uint32_t)page, writable)) {
             frame_free(page);
             return 0;
@@ -122,8 +122,8 @@ static int copy_segment(const uint8_t *image, const elf32_phdr_t *phdr,
         if (amount > phdr->filesz - copied)
             amount = phdr->filesz - copied;
         if (!page_is_mapped(space, address, &physical)) return 0;
-        memcpy((void *)(physical + page_offset), image + phdr->offset + copied,
-               amount);
+        memcpy((void *)((uint32_t)PHYS_TO_VIRT(physical) + page_offset),
+               image + phdr->offset + copied, amount);
         copied += amount;
     }
     return 1;

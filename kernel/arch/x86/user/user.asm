@@ -1348,7 +1348,99 @@ _user_program_start:
     int 0x80
     cmp eax, -14
     jne .fail
-    mov esi, 95
+    mov esi, 115                ; shrink the break and release the top page
+    mov eax, SYS_BRK
+    mov ebx, [USER_DATA_BASE + (brk_base - data_start)]
+    add ebx, 0x1000
+    int 0x80
+    mov edx, [USER_DATA_BASE + (brk_base - data_start)]
+    add edx, 0x1000
+    cmp eax, edx
+    jne .fail
+    mov esi, 116
+    mov eax, SYS_BRK
+    xor ebx, ebx                ; query confirms the lower break
+    int 0x80
+    mov edx, [USER_DATA_BASE + (brk_base - data_start)]
+    add edx, 0x1000
+    cmp eax, edx
+    jne .fail
+    mov esi, 117
+    mov edi, [USER_DATA_BASE + (brk_base - data_start)]
+    cmp dword [edi], 0xDEADBEEF ; the surviving page is untouched
+    jne .fail
+    mov esi, 118                ; regrow: the released page returns zeroed
+    mov eax, SYS_BRK
+    mov ebx, [USER_DATA_BASE + (brk_base - data_start)]
+    add ebx, 0x2000
+    int 0x80
+    mov edx, [USER_DATA_BASE + (brk_base - data_start)]
+    add edx, 0x2000
+    cmp eax, edx
+    jne .fail
+    mov esi, 119
+    mov edi, [USER_DATA_BASE + (brk_base - data_start)]
+    add edi, 0x1000
+    cmp dword [edi], 0
+    jne .fail
+    mov esi, 120                ; munmap releases the first anonymous page
+    mov eax, SYS_MUNMAP
+    mov ebx, [USER_DATA_BASE + (mmap_first - data_start)]
+    mov ecx, 0x1000
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 121                ; the next mmap reuses the freed address
+    mov eax, SYS_MMAP
+    mov ebx, USER_DATA_BASE + (mmap_arg - data_start)
+    int 0x80
+    cmp eax, [USER_DATA_BASE + (mmap_first - data_start)]
+    jne .fail
+    mov esi, 122
+    mov edi, eax
+    cmp dword [edi], 0          ; and maps a fresh zero page
+    jne .fail
+    mov esi, 123                ; a zero length is invalid
+    mov eax, SYS_MUNMAP
+    mov ebx, [USER_DATA_BASE + (mmap_first - data_start)]
+    xor ecx, ecx
+    int 0x80
+    cmp eax, -22
+    jne .fail
+    mov esi, 124                ; so is an address outside the mmap region
+    mov eax, SYS_MUNMAP
+    mov ebx, 0x50000000
+    mov ecx, 0x1000
+    int 0x80
+    cmp eax, -22
+    jne .fail
+    mov esi, 125                ; map three pages, cut out the middle
+    mov eax, SYS_MMAP
+    mov ebx, USER_DATA_BASE + (mmap_three_pages - data_start)
+    int 0x80
+    mov edx, [USER_DATA_BASE + (mmap_first - data_start)]
+    add edx, 0x2000
+    cmp eax, edx
+    jne .fail
+    mov esi, 126
+    lea ebx, [edx + 0x1000]
+    mov ecx, 0x1000
+    mov eax, SYS_MUNMAP
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 127                ; the hole is picked up by the next mmap
+    mov eax, SYS_MMAP
+    mov ebx, USER_DATA_BASE + (mmap_arg - data_start)
+    int 0x80
+    mov edx, [USER_DATA_BASE + (mmap_first - data_start)]
+    add edx, 0x3000
+    cmp eax, edx
+    jne .fail
+    mov esi, 128
+    cmp dword [eax], 0
+    jne .fail
+    mov esi, 129
     mov eax, SYS_WRITE
     mov ebx, 1
     mov ecx, USER_DATA_BASE + (mem_message - data_start)
@@ -1701,8 +1793,10 @@ mmap_bad_len:
     dd 0, 0, HAKU_PROT_READ | HAKU_PROT_WRITE, HAKU_MAP_PRIVATE | HAKU_MAP_ANONYMOUS, -1, 0
 mmap_bad_flags:
     dd 0, 0x1000, HAKU_PROT_READ | HAKU_PROT_WRITE, HAKU_MAP_PRIVATE, -1, 0
+mmap_three_pages:
+    dd 0, 0x3000, HAKU_PROT_READ | HAKU_PROT_WRITE, HAKU_MAP_PRIVATE | HAKU_MAP_ANONYMOUS, -1, 0
 mem_message:
-    db "USER-MEM-OK brk grows a heap and mmap maps anonymous pages", 10
+    db "USER-MEM-OK brk grows/shrinks and mmap allocates/releases", 10
 mem_message_end:
 dir_path:
     db "DIR1", 0

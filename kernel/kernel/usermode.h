@@ -13,7 +13,8 @@
 
 /* Reserved user virtual regions for the program break (brk) and anonymous
  * mmap, placed between the program image and the stack. They are mapped
- * lazily, one zero-filled page at a time. */
+ * lazily, one zero-filled page at a time, and released by brk shrink,
+ * munmap, exit, or execve. */
 #define USER_HEAP_BASE  0x50000000u
 #define USER_HEAP_LIMIT 0x54000000u
 #define USER_MMAP_BASE  0x60000000u

@@ -704,6 +704,9 @@ regs_t *user_syscall(regs_t *r) {
     case HAKU_SYS_MMAP:
         r->eax = sys_mmap(r->ebx);
         return r;
+    case HAKU_SYS_MUNMAP:
+        r->eax = scheduler_munmap(r->ebx, r->ecx);
+        return r;
     case HAKU_SYS_STAT:
         r->eax = sys_stat(r->ebx, r->ecx);
         return r;
