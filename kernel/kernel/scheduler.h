@@ -2,6 +2,7 @@
 #define HAKU_SCHEDULER_H
 
 #include "elf.h"
+#include "haku/abi.h"
 #include "idt.h"
 
 #define SCHEDULER_MAX_PROCESSES 4u
@@ -42,5 +43,7 @@ uint32_t scheduler_brk(uint32_t requested);
 uint32_t scheduler_mmap(uint32_t length);
 uint32_t scheduler_munmap(uint32_t address, uint32_t length);
 uint32_t scheduler_current_pid(void);
+void scheduler_note_syscall(void);
+int scheduler_get_usage(haku_usage_t *usage);
 
 #endif

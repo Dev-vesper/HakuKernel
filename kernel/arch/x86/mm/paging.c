@@ -137,6 +137,9 @@ int paging_create_user_space(address_space_t *space) {
         directory[index] = DIR[index];
     }
     space->directory_phys = directory_phys;
+    space->mapped_pages = 0;
+    space->page_tables = 0;
+    space->peak_mapped_pages = 0;
     return 1;
 }
 
@@ -167,6 +170,7 @@ int paging_map_user_page(address_space_t *space, uint32_t virtual_addr,
         if (!table_phys) return 0;
         directory[directory_index] = table_phys | PAGE_PRESENT |
                                      PAGE_RW | PAGE_USER;
+        space->page_tables++;
     } else {
         if (!(directory[directory_index] & PAGE_USER)) return 0;
         table_phys = directory[directory_index] & 0xFFFFF000u;
@@ -176,6 +180,9 @@ int paging_map_user_page(address_space_t *space, uint32_t virtual_addr,
     table = (uint32_t *)PHYS_TO_VIRT(table_phys);
     if (table[table_index] & PAGE_PRESENT) return 0;
     table[table_index] = (physical_addr & 0xFFFFF000u) | flags;
+    space->mapped_pages++;
+    if (space->mapped_pages > space->peak_mapped_pages)
+        space->peak_mapped_pages = space->mapped_pages;
 
     current = (paging_get_cr3() & 0xFFFFF000u) == space->directory_phys;
     if (current) paging_invlpg(virtual_addr);
@@ -208,6 +215,7 @@ int paging_unmap_user_page(address_space_t *space, uint32_t virtual_addr) {
     if (!(pte & PAGE_PRESENT)) return 0;
 
     table[table_index] = 0;
+    if (space->mapped_pages) space->mapped_pages--;
     current = (paging_get_cr3() & 0xFFFFF000u) == space->directory_phys;
     if (current) paging_invlpg(virtual_addr);
     frame_free((void *)(pte & 0xFFFFF000u));
@@ -217,6 +225,7 @@ int paging_unmap_user_page(address_space_t *space, uint32_t virtual_addr) {
         if (table[i] & PAGE_PRESENT) return 1;
     }
     directory[directory_index] = 0;
+    if (space->page_tables) space->page_tables--;
     if (current) paging_flush_all();
     frame_free((void *)table_phys);
     return 1;
@@ -262,6 +271,9 @@ void paging_destroy_user_space(address_space_t *space) {
     }
     frame_free((void *)space->directory_phys);
     space->directory_phys = 0;
+    space->mapped_pages = 0;
+    space->page_tables = 0;
+    space->peak_mapped_pages = 0;
 }
 
 int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,

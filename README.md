@@ -154,7 +154,7 @@ the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `gettimeofday` (78), `mmap` (90), `munmap` (91), `stat` (106), `fstat` (108),
 and `nanosleep` (162), with arguments in
 `ebx`, `ecx`, and `edx` and syscall number/result in `eax`.
-The custom `spawn` syscall uses `0x1000`.
+The Haku-specific `spawn` and `getusage` syscalls use `0x1000` and `0x1001`.
 The public ABI definitions are in `include/haku/abi.h` for C and
 `include/haku/abi.inc` for NASM; the build checks that their numeric
 constants stay synchronized. They define syscall numbers, errno values, open
@@ -178,6 +178,30 @@ one tracked anonymous mapping, trims or splits the region, and frees the pages
 (and any now-empty page tables). Pages are always mapped read/write, so the
 requested protection is validated but not enforced. Both regions are reclaimed
 with the rest of the address space at exit or `execve`.
+
+### Per-process memory and resource accounting
+
+`paging_map_user_page` and `paging_unmap_user_page` maintain per-address-space
+counters for present user pages, non-directory user page tables, and a
+mapped-page high-water mark. ELF loading, `brk`, `mmap`, and `munmap` all go
+through those helpers, so the counters follow every mapping change without a
+table walk. The scheduler attributes each 100 Hz timer tick to the interrupted
+context by its CS privilege level, counts syscalls at the `int 0x80` entry,
+and records a voluntary switch when a task blocks, sleeps, or waits and an
+involuntary switch when the timer moves a runnable task aside. `execve`
+preserves the process's peak and resource totals while replacing the current
+image's memory counters with those of the new address space.
+
+`getusage` (0x1001, Haku-specific) copies a 64-byte `haku_usage_t` to a
+validated user buffer. It reports current and peak mapped pages, page-table
+and kernel-stack pages, current `brk` and anonymous `mmap` bytes, and derived
+resident/kernel/total byte counts, along with the pid, user/kernel timer
+ticks, syscall count, and voluntary/involuntary context switches.
+`resident_bytes` covers mapped user pages; `kernel_bytes` covers the user page
+tables, the page directory, and the 8 KiB kernel stack; `total_bytes` is their
+sum. A NULL or unmapped buffer returns `EFAULT`. Accounting is per process,
+not per thread (the kernel has no threads), there is no demand paging, and
+ticks have 10 ms granularity.
 
 ### User-mode system calls
 
@@ -290,7 +314,8 @@ against the interrupt/wakeup race. Ring-3 page faults are contained and
 reported rather than halting the kernel. These syscalls are an initial
 POSIX-inspired kernel interface, not full POSIX conformance. Run
 `python build.py headless` to test read/write/open/close/lseek/getpid/exit,
-gettimeofday/nanosleep, bad pointers, descriptor errors, input copying,
+gettimeofday/nanosleep, brk/mmap/munmap, per-process `getusage` memory and
+resource accounting, bad pointers, descriptor errors, input copying,
 disk-backed create/write/read across a sector boundary, and continued
 timer operation. The blocking read is also observed to park the process
 (`SCHED-WAITQ-OK`) before the injected key arrives.
@@ -440,9 +465,10 @@ Haku/
       vfs/              vfs.c/.h: fs-independent descriptors, registry, root mount
       test/             fs_test.c/.h: kernel-side filesystem self-tests
     kernel/             kernel_main.c: kernel startup
-                        scheduler.c/.h: preemptive process scheduler
+                        scheduler.c/.h: scheduler + per-process usage counters
                         sync.c/.h: spinlocks and IRQ-save locks + locking rules
                         usermode.c/.h: user mappings, syscall ABI, brk/mmap/munmap
+                        getusage
                         klog.c/.h: timestamped console logging
                         heap.c/.h: kernel kmalloc/kfree allocator
   include/haku/         abi.h + abi.inc: shared user/kernel ABI constants

@@ -23,6 +23,7 @@
 %define HAKU_SYS_FSTAT   108
 %define HAKU_SYS_NANOSLEEP    162
 %define HAKU_SYS_SPAWN   0x1000
+%define HAKU_SYS_GETUSAGE 0x1001
 
 %define HAKU_E2BIG         7
 %define HAKU_ENOENT        2
@@ -75,6 +76,7 @@
 %define HAKU_MAP_FIXED     0x10
 %define HAKU_MAP_ANONYMOUS 0x20
 %define HAKU_MMAP_ARG_SIZE 24
+%define HAKU_USAGE_SIZE 64
 
 ; Names kept for the existing assembly integration programs.
 %define SYS_EXIT    HAKU_SYS_EXIT
@@ -100,5 +102,6 @@
 %define SYS_GETTIMEOFDAY HAKU_SYS_GETTIMEOFDAY
 %define SYS_NANOSLEEP    HAKU_SYS_NANOSLEEP
 %define SYS_SPAWN   HAKU_SYS_SPAWN
+%define SYS_GETUSAGE HAKU_SYS_GETUSAGE
 %define STAT_SIZE   HAKU_STAT_SIZE
 %define STAT_MODE   HAKU_STAT_MODE_REG

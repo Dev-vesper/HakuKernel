@@ -29,8 +29,10 @@
 #define HAKU_SYS_FSTAT   108u
 #define HAKU_SYS_NANOSLEEP    162u
 
-/* Haku-specific syscall for starting a child ELF from a pathname. */
-#define HAKU_SYS_SPAWN 0x1000u
+/* Haku-specific syscalls for starting a child ELF from a pathname and for
+ * reading the calling process's memory/resource usage. */
+#define HAKU_SYS_SPAWN   0x1000u
+#define HAKU_SYS_GETUSAGE 0x1001u
 
 /* Raw syscall errors are returned as -errno. */
 #define HAKU_E2BIG         7u
@@ -122,6 +124,32 @@ typedef struct {
     haku_u32 offset;
 } haku_mmap_arg_t;
 
+/* getusage(0x1001) snapshot of the calling process. Ticks are 100 Hz timer
+ * ticks; pages are 4 KiB user pages, page tables, and kernel-stack pages.
+ * resident_bytes covers mapped user pages only, kernel_bytes covers the
+ * user page tables plus the directory and kernel stack, and total_bytes is
+ * their sum. peak_* are process-lifetime high-water marks. */
+#define HAKU_USAGE_SIZE 64u
+
+typedef struct {
+    haku_u32 pid;                 /*  0 */
+    haku_u32 user_ticks;          /*  4 */
+    haku_u32 kernel_ticks;        /*  8 */
+    haku_u32 syscalls;            /* 12 */
+    haku_u32 voluntary_switches;  /* 16 */
+    haku_u32 involuntary_switches; /* 20 */
+    haku_u32 mapped_pages;        /* 24 */
+    haku_u32 peak_pages;          /* 28 */
+    haku_u32 page_tables;         /* 32 */
+    haku_u32 kernel_stack_pages;  /* 36 */
+    haku_u32 heap_bytes;          /* 40 */
+    haku_u32 mmap_bytes;          /* 44 */
+    haku_u32 resident_bytes;      /* 48 */
+    haku_u32 kernel_bytes;        /* 52 */
+    haku_u32 total_bytes;         /* 56 */
+    haku_u32 peak_bytes;          /* 60 */
+} haku_usage_t;
+
 typedef char haku_u32_must_be_32_bits[(sizeof(haku_u32) == 4u) ? 1 : -1];
 typedef char haku_stat_must_be_8_bytes[
     (sizeof(haku_stat_t) == HAKU_STAT_SIZE) ? 1 : -1];
@@ -131,5 +159,7 @@ typedef char haku_timespec_must_be_8_bytes[
     (sizeof(haku_timespec_t) == HAKU_TIMESPEC_SIZE) ? 1 : -1];
 typedef char haku_mmap_arg_must_be_24_bytes[
     (sizeof(haku_mmap_arg_t) == HAKU_MMAP_ARG_SIZE) ? 1 : -1];
+typedef char haku_usage_must_be_64_bytes[
+    (sizeof(haku_usage_t) == HAKU_USAGE_SIZE) ? 1 : -1];
 
 #endif

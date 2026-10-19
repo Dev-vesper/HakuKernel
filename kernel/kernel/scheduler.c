@@ -38,6 +38,11 @@ typedef struct {
     uint32_t heap_brk;    /* current program break (0 = not yet used) */
     uint32_t heap_top;    /* highest heap page ever mapped (grow only) */
     uint32_t mmap_region_count;
+    uint32_t user_ticks;          /* timer ticks spent in ring 3 */
+    uint32_t kernel_ticks;        /* timer ticks spent in ring 0 */
+    uint32_t syscall_count;
+    uint32_t voluntary_switches;  /* blocked, slept, or waited */
+    uint32_t involuntary_switches;/* preempted while runnable */
     struct {
         uint32_t base;
         uint32_t size;
@@ -149,6 +154,19 @@ static int find_next_task(void) {
 
 static void activate_task(int selected_index) {
     task_t *task;
+    /* Count the switch out of the previous task here, where it actually
+     * happens: a runnable task preempted by the timer is involuntary,
+     * while blocking/sleeping/waiting tasks yielded voluntarily. Exiting
+     * (zombie) tasks are not context switches. */
+    if (current_task >= 0 && current_task < SCHEDULER_IDLE_INDEX) {
+        task_t *previous = &tasks[current_task];
+        if (previous->state == TASK_RUNNABLE)
+            previous->involuntary_switches++;
+        else if (previous->state == TASK_BLOCKED ||
+                 previous->state == TASK_WAITING ||
+                 previous->state == TASK_SLEEPING)
+            previous->voluntary_switches++;
+    }
     current_task = selected_index;
     if (selected_index == SCHEDULER_IDLE_INDEX) {
         task = &idle_task;
@@ -257,6 +275,15 @@ regs_t *scheduler_preempt(regs_t *frame) {
 
     if (!scheduler_started || !frame)
         return frame;
+    /* Attribute this timer tick to the interrupted task. The frame's CS
+     * tells us whether it was running in ring 3 or in a syscall/IRQ. */
+    if (current_task >= 0 && current_task < SCHEDULER_IDLE_INDEX) {
+        task_t *current = &tasks[current_task];
+        if ((frame->cs & 3u) == 3u)
+            current->user_ticks++;
+        else
+            current->kernel_ticks++;
+    }
     if (!timer_marker_written) {
         klog_prefix();
         klog_write("sched: SCHED-TIMER-OK: timer interrupts reach scheduler\n");
@@ -358,6 +385,7 @@ regs_t *scheduler_exit_current(regs_t *frame) {
 int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
     task_t *task;
     loaded_elf_t previous;
+    uint32_t inherited_peak;
     irqflags_t flags;
     if (!scheduler_started || !replacement || !frame ||
         !replacement->address_space.directory_phys ||
@@ -369,7 +397,12 @@ int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
     flags = irq_lock();
     task = &tasks[current_task];
     previous = task->program;
+    inherited_peak = previous.address_space.peak_mapped_pages;
     task->program = *replacement;
+    /* The process keeps its lifetime peak across an image replacement;
+     * the new image's current page counts start from its own mappings. */
+    if (task->program.address_space.peak_mapped_pages < inherited_peak)
+        task->program.address_space.peak_mapped_pages = inherited_peak;
     replacement->address_space.directory_phys = 0;
     /* A fresh image starts with a fresh, lazily-mapped heap and no
      * anonymous mappings. */
@@ -411,6 +444,48 @@ uint32_t scheduler_current_pid(void) {
     if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
         return 0;
     return tasks[current_task].pid;
+}
+
+void scheduler_note_syscall(void) {
+    if (current_task >= 0 && current_task < SCHEDULER_IDLE_INDEX)
+        tasks[current_task].syscall_count++;
+}
+
+/* Fill a getusage(0x1001) snapshot for the calling process. Memory counts
+ * come from the address space's incremental accounting; resource counts are
+ * updated by the timer IRQ, syscall entry, and blocking paths. */
+int scheduler_get_usage(haku_usage_t *usage) {
+    task_t *task;
+    address_space_t *space;
+    uint32_t kernel_pages;
+    if (!usage || current_task < 0 ||
+        current_task >= SCHEDULER_IDLE_INDEX)
+        return -(int32_t)HAKU_EINVAL;
+
+    task = &tasks[current_task];
+    space = &task->program.address_space;
+    memset(usage, 0, sizeof(*usage));
+    usage->pid = task->pid;
+    usage->user_ticks = task->user_ticks;
+    usage->kernel_ticks = task->kernel_ticks;
+    usage->syscalls = task->syscall_count;
+    usage->voluntary_switches = task->voluntary_switches;
+    usage->involuntary_switches = task->involuntary_switches;
+    usage->mapped_pages = space->mapped_pages;
+    usage->peak_pages = space->peak_mapped_pages;
+    usage->page_tables = space->page_tables;
+    usage->kernel_stack_pages = TASK_KERNEL_STACK_PAGES;
+    if (task->heap_brk > USER_HEAP_BASE)
+        usage->heap_bytes = task->heap_brk - USER_HEAP_BASE;
+    for (uint32_t i = 0; i < task->mmap_region_count; i++)
+        usage->mmap_bytes += task->mmap_regions[i].size;
+
+    usage->resident_bytes = usage->mapped_pages * FRAME_SIZE;
+    kernel_pages = usage->page_tables + 1u + usage->kernel_stack_pages;
+    usage->kernel_bytes = kernel_pages * FRAME_SIZE;
+    usage->total_bytes = usage->resident_bytes + usage->kernel_bytes;
+    usage->peak_bytes = usage->peak_pages * FRAME_SIZE;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */

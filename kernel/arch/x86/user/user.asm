@@ -1591,6 +1591,167 @@ _user_program_start:
     cmp eax, edx
     jne .fail
 
+    ; Per-process memory and resource accounting.
+    mov esi, 130
+    mov eax, SYS_GETUSAGE
+    mov ebx, USER_DATA_BASE + (usage_buf - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov edi, USER_DATA_BASE + (usage_buf - data_start)
+    mov esi, 131
+    mov eax, SYS_GETPID
+    int 0x80
+    cmp eax, [edi]                  ; the snapshot is for this process
+    jne .fail
+    mov esi, 132
+    cmp dword [edi + 36], 2         ; two kernel-stack pages per task
+    jne .fail
+    mov esi, 133
+    cmp dword [edi + 24], 0         ; resident user pages were counted
+    je .fail
+    mov esi, 134
+    mov eax, [edi + 28]
+    cmp eax, [edi + 24]             ; peak >= current
+    jb .fail
+    mov esi, 135
+    mov eax, [edi + 24]
+    shl eax, 12
+    cmp eax, [edi + 48]             ; resident = pages * 4 KiB
+    jne .fail
+    mov esi, 136
+    mov eax, [edi + 32]
+    add eax, 3                      ; tables + directory + 2 stacks
+    shl eax, 12
+    cmp eax, [edi + 52]
+    jne .fail
+    mov esi, 137
+    mov eax, [edi + 48]
+    add eax, [edi + 52]
+    cmp eax, [edi + 56]
+    jne .fail
+    mov esi, 138
+    mov eax, [edi + 28]
+    shl eax, 12
+    cmp eax, [edi + 60]
+    jne .fail
+    mov esi, 139
+    cmp dword [edi + 44], 0x5000    ; five live anonymous pages
+    jne .fail
+    mov esi, 140
+    cmp dword [edi + 40], 0x2000    ; two heap pages from the earlier tests
+    jne .fail
+    mov esi, 141
+    cmp dword [edi + 16], 0         ; read/nanosleep switched voluntarily
+    je .fail
+    mov esi, 142
+    mov eax, [edi + 4]
+    mov [USER_DATA_BASE + (usage_ticks - data_start)], eax
+    mov eax, [edi + 12]
+    mov [USER_DATA_BASE + (usage_syscalls - data_start)], eax
+    mov eax, [edi + 24]
+    mov [USER_DATA_BASE + (usage_pages - data_start)], eax
+    mov eax, [edi + 28]
+    mov [USER_DATA_BASE + (usage_peak - data_start)], eax
+    mov eax, SYS_BRK
+    mov ebx, [USER_DATA_BASE + (brk_base - data_start)]
+    add ebx, 0x4000
+    int 0x80
+    mov edx, [USER_DATA_BASE + (brk_base - data_start)]
+    add edx, 0x4000
+    cmp eax, edx
+    jne .fail
+    mov esi, 143
+    mov eax, SYS_GETUSAGE
+    mov ebx, USER_DATA_BASE + (usage_buf - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov edi, USER_DATA_BASE + (usage_buf - data_start)
+    mov esi, 144
+    mov eax, [edi + 24]
+    sub eax, [USER_DATA_BASE + (usage_pages - data_start)]
+    cmp eax, 2                      ; two new heap pages
+    jne .fail
+    mov esi, 145
+    cmp dword [edi + 40], 0x4000    ; heap grew by two pages
+    jne .fail
+    mov esi, 146
+    mov eax, [edi + 12]
+    cmp eax, [USER_DATA_BASE + (usage_syscalls - data_start)]
+    jbe .fail                       ; syscall counter advanced
+    mov esi, 147
+    mov eax, [edi + 28]
+    mov edx, [USER_DATA_BASE + (usage_peak - data_start)]
+    add edx, 2
+    cmp eax, edx                    ; peak kept the new high-water mark
+    jb .fail
+    mov esi, 148
+    mov ecx, 20000000
+.usage_spin:
+    dec ecx
+    jnz .usage_spin
+    mov eax, SYS_GETUSAGE
+    mov ebx, USER_DATA_BASE + (usage_buf - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov edi, USER_DATA_BASE + (usage_buf - data_start)
+    mov esi, 149
+    mov eax, [edi + 4]
+    cmp eax, [USER_DATA_BASE + (usage_ticks - data_start)]
+    jbe .fail                       ; ring-3 busy loop accrued user ticks
+    mov esi, 150
+    mov eax, SYS_BRK
+    mov ebx, [USER_DATA_BASE + (brk_base - data_start)]
+    add ebx, 0x2000
+    int 0x80
+    mov edx, [USER_DATA_BASE + (brk_base - data_start)]
+    add edx, 0x2000
+    cmp eax, edx
+    jne .fail
+    mov esi, 151
+    mov eax, SYS_MUNMAP
+    mov ebx, [USER_DATA_BASE + (mmap_first - data_start)]
+    add ebx, 0x4000
+    mov ecx, 0x1000
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov esi, 152
+    mov eax, SYS_GETUSAGE
+    mov ebx, USER_DATA_BASE + (usage_buf - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov edi, USER_DATA_BASE + (usage_buf - data_start)
+    mov esi, 153
+    cmp dword [edi + 44], 0x4000    ; one mmap page was released
+    jne .fail
+    mov esi, 154
+    cmp dword [edi + 40], 0x2000    ; break is back at two pages
+    jne .fail
+    mov esi, 155
+    mov eax, SYS_GETUSAGE
+    xor ebx, ebx                    ; NULL usage buffer
+    int 0x80
+    cmp eax, -14
+    jne .fail
+    mov esi, 156
+    mov eax, SYS_GETUSAGE
+    mov ebx, 0x1000                 ; unmapped usage buffer
+    int 0x80
+    cmp eax, -14
+    jne .fail
+    mov esi, 157
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (usage_message - data_start)
+    mov edx, usage_message_end - usage_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
     ; Failed exec attempts must leave this process image intact.
     mov esi, 61
     mov eax, SYS_EXECVE
@@ -1820,6 +1981,19 @@ dir_readback:
 dir_message:
     db "USER-DIR-OK subdirectories, paths, and . / .. resolution", 10
 dir_message_end:
+usage_buf:
+    times HAKU_USAGE_SIZE db 0
+usage_ticks:
+    dd 0
+usage_syscalls:
+    dd 0
+usage_pages:
+    dd 0
+usage_peak:
+    dd 0
+usage_message:
+    db "USER-USAGE-OK per-process memory and resource accounting", 10
+usage_message_end:
 stat_buf:
     times 8 db 0
 exec_path:

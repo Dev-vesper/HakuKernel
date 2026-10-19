@@ -580,6 +580,18 @@ static uint32_t sys_fstat(uint32_t fd, uint32_t user_buf) {
     return 0;
 }
 
+/* Copy the calling process's usage snapshot to a validated user buffer. */
+static uint32_t sys_getusage(uint32_t user_usage) {
+    haku_usage_t usage;
+    if (!paging_user_range_valid(user_usage, sizeof(usage), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    if (scheduler_get_usage(&usage) != 0)
+        return copy_from_user_error(HAKU_EINVAL);
+    if (!copy_to_user(user_usage, &usage, sizeof(usage)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0;
+}
+
 /* Seconds and microseconds since boot, derived from the 100 Hz tick
  * counter. A NULL tv is allowed (the caller just wants success); the
  * timezone argument is not modelled and is ignored. */
@@ -646,6 +658,7 @@ static uint32_t sys_mmap(uint32_t user_arg) {
 }
 
 regs_t *user_syscall(regs_t *r) {
+    scheduler_note_syscall();
     switch (r->eax) {
     case HAKU_SYS_EXIT:
         cpu_cli();
@@ -718,6 +731,9 @@ regs_t *user_syscall(regs_t *r) {
         return r;
     case HAKU_SYS_GETTIMEOFDAY:
         r->eax = sys_gettimeofday(r->ebx);
+        return r;
+    case HAKU_SYS_GETUSAGE:
+        r->eax = sys_getusage(r->ebx);
         return r;
     case HAKU_SYS_NANOSLEEP:
         return sys_nanosleep(r, r->ebx, r->ecx);

@@ -440,6 +440,7 @@ def main():
             "USER-TIME-OK",  # gettimeofday reads ticks; nanosleep blocks until wake
             "USER-MEM-OK",   # brk grows/shrinks; mmap/munmap allocate and release pages
             "USER-DIR-OK",   # subdirectories, paths, and "."/".." resolution
+            "USER-USAGE-OK", # getusage reports per-process memory and CPU counters
             "EXECVE-OK pid=1", # exec replaced the image and preserved descriptors
             "USER-EXEC-TARGET-OK", # argv/envp stack and image replacement passed
             "USER-EXIT-OK status=0 pid=1",

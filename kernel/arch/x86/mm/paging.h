@@ -46,8 +46,15 @@
 #define PAGING_PHYS_LIMIT (PAGING_DIRECT_MAP_MB * 1024u * 1024u)
 #define PHYS_TO_VIRT(phys) ((void *)(PAGING_DIRECT_MAP_BASE + (uint32_t)(phys)))
 
+/* Per-space accounting maintained by the mapping helpers. mapped_pages
+ * counts present user PTEs (code, data, stack, heap, and mmap), page_tables
+ * counts the non-directory user page tables, and peak_mapped_pages is the
+ * high-water mark used for per-process memory reporting. */
 typedef struct {
     uint32_t directory_phys;
+    uint32_t mapped_pages;
+    uint32_t page_tables;
+    uint32_t peak_mapped_pages;
 } address_space_t;
 
 void paging_init(void);        /* zero tables, install PDE0 + 1024 identity PTEs */

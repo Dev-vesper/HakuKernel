@@ -142,7 +142,11 @@ address-space or descriptor sharing.
   address space; `USER-MEM-OK` covers shrink, release, and reuse).
 - [ ] Improve page protections and test read-only, unmapped, and
   use-after-free access.
-- [ ] Track memory and resource usage per process.
+- [x] Track memory and resource usage per process (paging maintains
+  mapped-page, page-table, and peak counters per address space; the scheduler
+  attributes timer ticks by CPL and counts syscalls plus voluntary and
+  involuntary switches; `getusage` (0x1001) returns a 64-byte snapshot;
+  `USER-USAGE-OK` covers growth, release, tick, syscall, and peak deltas).
 
 **Acceptance criteria:** A process blocked on I/O does not prevent other
 processes from making progress; allocator stress tests complete without frame
