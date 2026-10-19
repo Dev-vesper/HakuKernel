@@ -6,6 +6,28 @@
 
 #define SCHEDULER_MAX_PROCESSES 4u
 
+/* Event wait queue. A task that cannot make progress parks itself on a
+ * queue and is woken by whoever satisfies the event (an IRQ handler or
+ * another task); a parked task is off the run queue and does not spin.
+ * The queue is a bitmap over the scheduler's task slots, so it needs no
+ * memory and cannot fail. sleep/cancel must be called with interrupts
+ * disabled (the scheduler's task-state rule); wake is IRQ-safe. */
+typedef struct {
+    volatile uint32_t waiters;
+} wait_queue_t;
+
+#define WAIT_QUEUE_INIT { 0u }
+
+/* Mark the current task blocked on the queue. The caller must immediately
+ * execute sti;hlt so either the waking IRQ returns straight back or the
+ * timer IRQ switches away. Returns 1 when a task was parked. */
+int wait_queue_sleep(wait_queue_t *queue);
+/* Leave the queue and make the current task runnable again. */
+void wait_queue_cancel(wait_queue_t *queue);
+/* Wake every parked task; each re-checks its condition after resuming.
+ * The bitmap entry is dropped even for tasks that are no longer blocked. */
+int wait_queue_wake_all(wait_queue_t *queue);
+
 int scheduler_init(loaded_elf_t *initial_program);
 int scheduler_user_tasks_done(void);
 void scheduler_start(void);

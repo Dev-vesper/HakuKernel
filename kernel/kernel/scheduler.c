@@ -16,6 +16,7 @@ typedef enum {
     TASK_UNUSED,
     TASK_STARTING,
     TASK_RUNNABLE,
+    TASK_BLOCKED,
     TASK_WAITING,
     TASK_SLEEPING,
     TASK_ZOMBIE,
@@ -44,12 +45,14 @@ static task_t idle_task;
 static int current_task = -1;
 static int scheduler_started;
 static int timer_marker_written;
+static int waitq_marker_written;
 
 int scheduler_user_tasks_done(void) {
     if (!scheduler_started) return 0;
     for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
         if (tasks[i].state == TASK_STARTING ||
             tasks[i].state == TASK_RUNNABLE ||
+            tasks[i].state == TASK_BLOCKED ||
             tasks[i].state == TASK_WAITING ||
             tasks[i].state == TASK_SLEEPING)
             return 0;
@@ -191,6 +194,7 @@ int scheduler_init(loaded_elf_t *initial_program) {
     current_task = -1;
     scheduler_started = 0;
     timer_marker_written = 0;
+    waitq_marker_written = 0;
 
     tasks[0].pid = 1;
     tasks[0].parent_pid = 0;
@@ -263,6 +267,20 @@ regs_t *scheduler_preempt(regs_t *frame) {
     }
 
     next = find_next_task();
+    /* Observable proof that a blocked task is off the run queue: when a
+     * task parks on a wait queue and nothing else is runnable, the idle
+     * context is selected instead of scheduling that task again. */
+    if (!waitq_marker_written && next == SCHEDULER_IDLE_INDEX) {
+        for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+            if (tasks[i].state != TASK_BLOCKED) continue;
+            klog_prefix();
+            klog_write("sched: SCHED-WAITQ-OK: pid=");
+            klog_dec(tasks[i].pid);
+            klog_write(" parked on a wait queue, idle scheduled\n");
+            waitq_marker_written = 1;
+            break;
+        }
+    }
     if (next == current_task)
         return frame;
 
@@ -386,6 +404,58 @@ uint32_t scheduler_current_pid(void) {
     if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
         return 0;
     return tasks[current_task].pid;
+}
+
+/* ------------------------------------------------------------------ */
+/* Wait queues.                                                       */
+/*                                                                    */
+/* Parking a task is just a state transition: it keeps its kernel     */
+/* stack, and when the event fires the scheduler resumes it right      */
+/* after the hlt that follows wait_queue_sleep. No frame is crafted    */
+/* here; either the waking IRQ returns straight to the halted task or  */
+/* the timer IRQ saves that interrupted frame for the next activation. */
+/* ------------------------------------------------------------------ */
+static int current_slot(void) {
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return -1;
+    return current_task;
+}
+
+int wait_queue_sleep(wait_queue_t *queue) {
+    int slot;
+    if (!queue) return 0;
+    slot = current_slot();
+    if (slot < 0) return 0;
+    queue->waiters |= 1u << (uint32_t)slot;
+    tasks[slot].state = TASK_BLOCKED;
+    return 1;
+}
+
+void wait_queue_cancel(wait_queue_t *queue) {
+    int slot;
+    if (!queue) return;
+    slot = current_slot();
+    if (slot < 0) return;
+    queue->waiters &= ~(1u << (uint32_t)slot);
+    if (tasks[slot].state == TASK_BLOCKED)
+        tasks[slot].state = TASK_RUNNABLE;
+}
+
+int wait_queue_wake_all(wait_queue_t *queue) {
+    uint32_t mask;
+    int woken = 0;
+    if (!queue || !queue->waiters) return 0;
+    /* Drop the whole bitmap first: a waiter that already cancelled must
+     * not be woken again by a stale bit. */
+    mask = queue->waiters;
+    queue->waiters = 0;
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        if (!(mask & (1u << i))) continue;
+        if (tasks[i].state != TASK_BLOCKED) continue;
+        tasks[i].state = TASK_RUNNABLE;
+        woken++;
+    }
+    return woken;
 }
 
 int32_t scheduler_spawn(loaded_elf_t *program) {

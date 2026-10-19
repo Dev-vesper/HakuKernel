@@ -96,9 +96,21 @@ int usermode_init(void) {
      * the root filesystem. Everything below (syscalls, self-tests) only
      * speaks the vfs_* interface from here on. */
     vfs_init();
-    if (!vfs_register_device(&console_device)) return 0;
-    if (!vfs_register_fs(&fat12_fs_ops)) return 0;
-    if (vfs_mount_root("fat12") != 1) return 0;
+    if (!vfs_register_device(&console_device)) {
+        klog_prefix();
+        klog_write("VFS-DEVICE-FAIL: console device registration\n");
+        return 0;
+    }
+    if (!vfs_register_fs(&fat12_fs_ops)) {
+        klog_prefix();
+        klog_write("VFS-FS-FAIL: FAT12 filesystem registration\n");
+        return 0;
+    }
+    if (vfs_mount_root("fat12") != 1) {
+        klog_prefix();
+        klog_write("VFS-MOUNT-FAIL: FAT12 root mount\n");
+        return 0;
+    }
     image = (uint8_t *)kmalloc(USER_ELF_MAX_SIZE);
     if (!image) {
         klog_prefix();

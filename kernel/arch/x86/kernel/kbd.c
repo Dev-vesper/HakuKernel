@@ -9,6 +9,7 @@
 #include "idt.h"
 #include "kbd.h"
 #include "pic.h"
+#include "scheduler.h"
 #include "sync.h"
 
 #define KBD_DATA_PORT   0x60
@@ -23,6 +24,11 @@ static volatile uint32_t kbd_tail = 0;
 /* Modifier state. */
 static volatile int shift_down = 0;
 static volatile int caps_lock = 0;
+
+/* Console readers park here while the ring buffer is empty. The producer
+ * (IRQ1) wakes them; a line-oriented caller simply re-parks after each
+ * byte until it sees a newline. */
+static wait_queue_t kbd_waiters = WAIT_QUEUE_INIT;
 
 /* ------------------------------------------------------------------ */
 /* Set-1 scancode -> ASCII tables (US layout, indices 0x00..0x3F).     */
@@ -73,14 +79,19 @@ int kbd_has_char(void) {
 
 char kbd_getchar(void) {
     for (;;) {
-        int c;
         irqflags_t flags = irq_lock();
-        c = kbd_poll();
+        int c = kbd_poll();
         if (c >= 0) {
+            wait_queue_cancel(&kbd_waiters);
             irq_unlock(flags);
             return (char)c;
         }
-        /* STI's interrupt shadow makes the check-and-sleep race-free. */
+        /* No byte queued: leave the run queue instead of spinning. IRQs
+         * are still masked here, so no key can arrive between the empty
+         * poll and the sleep; sti's interrupt shadow then makes the
+         * sti/hlt pair atomic, so either IRQ1 wakes us immediately or the
+         * timer parks the task and runs another one. */
+        wait_queue_sleep(&kbd_waiters);
         __asm {
             sti
             hlt
@@ -120,7 +131,11 @@ static void kbd_irq(regs_t *r) {
     else
         ch = scancode_map[idx];
 
-    if (ch) kbd_push((uint8_t)ch);
+    if (ch) {
+        kbd_push((uint8_t)ch);
+        /* Wake console readers parked on the input wait queue. */
+        wait_queue_wake_all(&kbd_waiters);
+    }
 }
 
 /* ------------------------------------------------------------------ */

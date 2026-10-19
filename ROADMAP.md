@@ -128,8 +128,11 @@ address-space or descriptor sharing.
   task-context lock around descriptor/OFD changes and backend calls, the
   frame/heap allocators and console use IRQ-save locks, ATA and the keyboard
   ring buffer are serialized per the README "Locking" rules).
-- [ ] Separate wait queues and sleep/wakeup from busy-waiting so blocking I/O
-  sleeps the current process instead of spinning.
+- [x] Separate wait queues and sleep/wakeup from busy-waiting so blocking I/O
+  sleeps the current process instead of spinning (`kernel/kernel/scheduler.h`
+  wait queues use a task-slot bitmap and a distinct `TASK_BLOCKED` state;
+  blocking console reads park until IRQ1 wakes them, proven by
+  `SCHED-WAITQ-OK`, while `nanosleep`/`waitpid` keep their existing states).
 - [ ] Extend allocation beyond the current identity-mapped range and add
   user virtual-memory allocation and release.
 - [ ] Improve page protections and test read-only, unmapped, and

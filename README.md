@@ -216,6 +216,21 @@ request gives `EFAULT`. There are no signals, so a sleep is never
 interrupted. The number of sleeping tasks is not counted against idle, so a
 sleeping process keeps the idle loop in the scheduler.
 
+Blocking events use wait queues (`kernel/kernel/scheduler.h`). A queue is a
+bitmap over scheduler task slots, so it needs no allocation and cannot fail.
+`wait_queue_sleep` marks the caller `TASK_BLOCKED` with interrupts still
+disabled; the caller then executes `sti; hlt`, so either the event IRQ returns
+straight to the halted task or the timer IRQ saves that frame and switches to
+another task. A blocked task is off the run queue, so when nothing else is
+runnable the scheduler selects the idle context instead of rescheduling it.
+`wait_queue_wake_all` is called from IRQ context and marks every parked task
+runnable; waiters re-check their condition after resuming. Console reads are
+the first user of this: IRQ1 wakes them, and `SCHED-WAITQ-OK` proves that a
+read waiting for a key left the run queue and let idle run. `nanosleep` and
+`waitpid` keep their existing `TASK_SLEEPING`/`TASK_WAITING` states; the
+blocked state is deliberately separate so a child exiting cannot wake a task
+that is waiting for console input.
+
 Writes are not atomic: there is no journal, so a failing multi-sector
 write leaves exactly its durable prefix (a short count means those bytes
 are on disk and the size covers them), while a total failure restores
@@ -268,8 +283,9 @@ reported rather than halting the kernel. These syscalls are an initial
 POSIX-inspired kernel interface, not full POSIX conformance. Run
 `python build.py headless` to test read/write/open/close/lseek/getpid/exit,
 gettimeofday/nanosleep, bad pointers, descriptor errors, input copying,
-disk-backed create/write/read across a sector boundary, and continued timer
-operation.
+disk-backed create/write/read across a sector boundary, and continued
+timer operation. The blocking read is also observed to park the process
+(`SCHED-WAITQ-OK`) before the injected key arrives.
 
 ### ATA PIO and FAT12
 
@@ -346,7 +362,8 @@ The locking rules per subsystem:
   hold `vfs_lock`.
 - **Drivers**: `kernel/drivers/ata.c` uses a task-context spinlock around the polling
   transfers; `kernel/arch/x86/kernel/kbd.c` uses an IRQ-save pair around the
-  ring-buffer poll (single-producer IRQ1, single-consumer task);
+  ring-buffer poll (single-producer IRQ1, single-consumer task) and parks
+  console readers on an IRQ-safe wait queue that IRQ1 wakes;
   `kernel/drivers/console.c` protects VGA/UART state with IRQ-save spinlocks
   because `klog` may run from interrupt context.
 
@@ -381,7 +398,10 @@ relocation math on our side, zero MSVC quirks to chase. The reported
 `ENTRY=` address and exact padded kernel sector count are passed to stage 2.
 The stage-2 CHS loop reads track-bounded chunks into the 448 KiB load window,
 leaving 64 KiB below it for the bootstrap stack; `mkimg.py` enforces both
-the memory and floppy-image limits.
+the memory and floppy-image limits. A chunk is also clamped so an INT 13h
+transfer never crosses a 64 KiB DMA boundary; when that clamp shortens a
+read, the loop advances the sector within the current track instead of
+skipping to the next head, which keeps a large kernel image contiguous.
 
 The A20 routine mirrors Linux `arch/x86/boot/a20.c` (test → BIOS →
 test → keyboard controller → long test → fast gate, with the KBC drain

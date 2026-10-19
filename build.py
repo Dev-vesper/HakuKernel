@@ -425,6 +425,7 @@ def main():
             "SCHED-READY tasks=1 kernel-stack=per-task",
             "SCHED-START pid=1",
             "SCHED-TIMER-OK",
+            "SCHED-WAITQ-OK", # blocked read left the run queue; idle ran instead
             "USERMODE-OK",   # ELF32 user image executed POSIX-style syscalls
             "USER-SYSCALL-CHECKS-OK", # EFAULT/EBADF/EINVAL/ENOSYS + flag/fd/whence paths passed
             "USER-READ-OK",  # blocking read copied keyboard input to user memory

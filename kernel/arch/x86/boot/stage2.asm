@@ -113,6 +113,13 @@ stage2:
     shl ax, 5                    ; 512 bytes = 32 paragraphs
     add [kernel_dest_segment], ax
 
+    ; A DMA-boundary clamp can shorten a read to less than the rest of the
+    ; track, so advance within the track before moving to the next one.
+    mov al, [kernel_chunk]
+    add [kernel_sector], al
+    cmp byte [kernel_sector], SECTORS_PER_TRACK + 1
+    jb .kernel_read_loop
+
     mov byte [kernel_sector], 1
     cmp byte [kernel_head], HEADS - 1
     jb .kernel_next_head
