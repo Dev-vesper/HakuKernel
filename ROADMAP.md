@@ -9,19 +9,27 @@ compatibility is not a short-term goal.
 
 - [x] BIOS boot into 32-bit protected mode, with a bootloader that can load a
   kernel larger than the original boot-sector limit.
-- [x] E820-backed physical memory inventory, paging, and separate user address
-  spaces.
+- [x] E820-backed physical memory inventory, two-level paging with a 128 MiB
+  supervisor direct map, and separate user address spaces.
 - [x] Static ELF32 programs running at ring 3, per-process kernel stacks, and
   PIT-driven preemptive scheduling.
 - [x] `exit`, `read`, `write`, `open`, `close`, `lseek`, and `getpid` syscalls
   with user-pointer validation and `-errno` error returns.
+- [x] Process lifecycle syscalls: `spawn`, `waitpid`, `execve`, `dup`/`dup2`,
+  and per-process descriptors with inheritance and close-on-exit.
+- [x] User virtual memory: a `brk` heap that grows and shrinks, anonymous
+  private `mmap`, and `munmap` that trims, splits, and releases mappings for
+  later reuse.
+- [x] Time and accounting: `gettimeofday`, `nanosleep`, and the Haku-specific
+  `getusage` snapshot of per-process memory and CPU usage.
 - [x] ATA primary-master LBA28 PIO polling driver.
 - [x] Writable FAT12 for 8.3 files and subdirectories (paths with `.`/`..`):
   create, read, write, truncate, append, mkdir/rmdir, with a VFS and
   per-process file descriptors.
 - [x] QEMU headless integration tests covering multi-sector I/O, seeking,
   append, descriptor access checks, spawn/waitpid exit status, exec
-  argument/environment stacks, and persisted disk data.
+  argument/environment stacks, per-process usage accounting, and persisted
+  disk data.
 
 ## Proposed Milestones
 
@@ -107,7 +115,9 @@ tested, and common FAT tools can still read the disk image.
   (`USER-DUP-OK`: shared offset, surviving duplicate, EBADF cases).
 - [x] Add limited `brk`/`mmap` (per-process heap break plus an anonymous
   private `mmap` using the i386 old_mmap argument block; both map zero-filled
-  user pages from reserved regions; `USER-MEM-OK`).
+  user pages from reserved regions; `brk` also shrinks and releases pages, and
+  `munmap` (91) trims, splits, and frees mappings so later `mmap` calls reuse
+  the address space; `USER-MEM-OK`).
 - [x] Add time syscalls such as `gettimeofday`/`nanosleep` (`gettimeofday`
   reads the PIT tick counter; `nanosleep` parks the task until its wake tick
   in the timer IRQ instead of busy-waiting; `USER-TIME-OK`).
