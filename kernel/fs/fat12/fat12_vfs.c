@@ -130,14 +130,30 @@ static int32_t fat12_vfs_rmdir(const char *path) {
     return fat12_map_errno(removed);
 }
 
+static void fat12_stat_to_vfs(const fat12_stat_t *st, vfs_stat_t *out) {
+    out->st_dev = 1u;
+    out->st_ino = st->ino;
+    out->st_mode = st->is_dir ? HAKU_STAT_MODE_DIR : HAKU_STAT_MODE_REG;
+    out->st_nlink = 1u;
+    out->st_uid = 0u;
+    out->st_gid = 0u;
+    out->st_rdev = 0u;
+    out->st_size = st->size;
+    out->st_blksize = HAKU_STAT_BLKSIZE;
+    out->st_blocks = (haku_u64)(st->size / 512u) +
+                     (haku_u64)((st->size % 512u) ? 1u : 0u);
+    out->st_atime = 0u;
+    out->st_mtime = 0u;
+    out->st_ctime = 0u;
+}
+
 static int32_t fat12_vfs_stat(const char *path, vfs_stat_t *out) {
     fat12_stat_t st;
     int stated;
     if (!path || !out) return -VFS_EINVAL;
     stated = fat12_file_stat(path, &st);
     if (stated != 1) return fat12_map_errno(stated);
-    out->size = st.size;
-    out->mode = st.is_dir ? HAKU_STAT_MODE_DIR : HAKU_STAT_MODE_REG;
+    fat12_stat_to_vfs(&st, out);
     return 1;
 }
 
@@ -147,8 +163,7 @@ static int32_t fat12_vfs_fstat(void *handle, vfs_stat_t *out) {
     if (!handle || !out) return -VFS_EINVAL;
     stated = fat12_file_fstat((fat12_file_t *)handle, &st);
     if (stated != 1) return fat12_map_errno(stated);
-    out->size = st.size;
-    out->mode = st.is_dir ? HAKU_STAT_MODE_DIR : HAKU_STAT_MODE_REG;
+    fat12_stat_to_vfs(&st, out);
     return 1;
 }
 

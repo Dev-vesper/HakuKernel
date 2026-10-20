@@ -1233,6 +1233,7 @@ int fat12_file_stat(const char *name, fat12_stat_t *out) {
     if (resolved != 1) return resolved;
     out->is_dir = is_dir;
     out->size = have_entry ? read_u32(entry + 28) : 0u;
+    out->ino = have_entry ? (lba * 512u + off) : (uint32_t)cluster;
     return 1;
 }
 
@@ -1318,6 +1319,7 @@ int fat12_file_fstat(fat12_file_t *file, fat12_stat_t *out) {
     refreshed = refresh_file(file);
     if (refreshed < 0) return refreshed;
     out->size = file->size;
+    out->ino = file->dir_lba * 512u + file->dir_off;
     out->is_dir = 0;
     return 1;
 }

@@ -509,9 +509,13 @@ _user_program_start:
     int 0x80
     test eax, eax
     jne .fail
-    cmp dword [USER_DATA_BASE + (stat_buf - data_start)], 10
+    cmp dword [USER_DATA_BASE + (stat_buf - data_start) + 20], 10
     jne .fail
-    cmp dword [USER_DATA_BASE + (stat_buf - data_start) + 4], STAT_MODE
+    cmp word [USER_DATA_BASE + (stat_buf - data_start) + 8], STAT_MODE
+    jne .fail
+    cmp word [USER_DATA_BASE + (stat_buf - data_start) + 10], 1
+    jne .fail
+    cmp dword [USER_DATA_BASE + (stat_buf - data_start) + 24], 512
     jne .fail
     mov eax, SYS_OPEN
     mov ebx, [USER_DATA_BASE + (ops_unlink - data_start)]
@@ -527,13 +531,60 @@ _user_program_start:
     int 0x80
     test eax, eax
     jne .fail
-    cmp dword [USER_DATA_BASE + (stat_buf - data_start)], 10
+    cmp dword [USER_DATA_BASE + (stat_buf - data_start) + 20], 10
     jne .fail
+    cmp word [USER_DATA_BASE + (stat_buf - data_start) + 8], STAT_MODE
+    jne .fail
+
+    ; Linux-compatible stat64 path: fstatat64(300) with AT_FDCWD fills the
+    ; 96-byte i386 "struct stat64" layout (mode at 16, size at 44).
+    mov eax, SYS_FSTATAT64
+    mov ebx, -100                ; AT_FDCWD
+    mov ecx, [USER_DATA_BASE + (ops_unlink - data_start)]
+    mov edx, USER_DATA_BASE + (stat64_buf - data_start)
+    xor esi, esi                 ; flags
+    int 0x80
+    test eax, eax
+    jnz .stat64_failed
+    cmp dword [USER_DATA_BASE + (stat64_buf - data_start) + 16], STAT_MODE
+    jne .stat64_failed
+    cmp dword [USER_DATA_BASE + (stat64_buf - data_start) + 44], 10
+    jne .stat64_failed
+    jmp .stat64_done
+.stat64_failed:
+    mov esi, 160
+    jmp .fail
+.stat64_done:
+
     mov eax, SYS_CLOSE
     mov ebx, edi
     int 0x80
     test eax, eax
     jne .fail
+
+    ; statx(383): the modern metadata call musl uses for stat() on i386.
+    ; The mask is the 4th argument (esi) and the buffer the 5th (edi), so
+    ; this runs after the descriptor in edi is no longer needed.
+    mov eax, SYS_STATX
+    mov ebx, -100                ; AT_FDCWD
+    mov ecx, [USER_DATA_BASE + (ops_unlink - data_start)]
+    mov edx, 0x800               ; AT_NO_AUTOMOUNT
+    mov esi, 0x7FF               ; STATX_BASIC_STATS
+    mov edi, USER_DATA_BASE + (statx_buf - data_start)
+    int 0x80
+    test eax, eax
+    jnz .statx_failed
+    cmp dword [USER_DATA_BASE + (statx_buf - data_start)], 0x7FF
+    jne .statx_failed
+    cmp word [USER_DATA_BASE + (statx_buf - data_start) + 28], STAT_MODE
+    jne .statx_failed
+    cmp dword [USER_DATA_BASE + (statx_buf - data_start) + 40], 10
+    jne .statx_failed
+    jmp .statx_done
+.statx_failed:
+    mov esi, 161
+    jmp .fail
+.statx_done:
 
     ; unlink: the name and its stat entry die together
     mov esi, 37
@@ -622,7 +673,7 @@ _user_program_start:
     int 0x80
     test eax, eax
     jne .fail
-    cmp dword [USER_DATA_BASE + (stat_buf - data_start)], 10
+    cmp dword [USER_DATA_BASE + (stat_buf - data_start) + 20], 10
     jne .fail
     mov eax, SYS_CLOSE
     mov ebx, edi
@@ -684,7 +735,7 @@ _user_program_start:
     int 0x80
     test eax, eax
     jne .fail
-    cmp dword [USER_DATA_BASE + (stat_buf - data_start)], 8
+    cmp dword [USER_DATA_BASE + (stat_buf - data_start) + 20], 8
     jne .fail
 
     ; renamed-but-open: the old descriptor follows the entry
@@ -1475,7 +1526,7 @@ _user_program_start:
     int 0x80
     test eax, eax
     jne .fail
-    mov eax, [USER_DATA_BASE + (stat_buf - data_start) + 4]
+    movzx eax, word [USER_DATA_BASE + (stat_buf - data_start) + 8]
     and eax, 0xF000
     cmp eax, HAKU_S_IFDIR       ; stat reports the directory mode
     jne .fail
@@ -2078,7 +2129,11 @@ usage_message:
     db "USER-USAGE-OK per-process memory and resource accounting", 10
 usage_message_end:
 stat_buf:
-    times 8 db 0
+    times 64 db 0
+stat64_buf:
+    times 96 db 0
+statx_buf:
+    times 256 db 0
 fault_path:
     db "FAULT.ELF", 0
 prot_path:

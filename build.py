@@ -116,9 +116,9 @@ def verify_abi_headers(include_dir):
     header = os.path.join(include_dir, "haku", "abi.h")
     nasm_include = os.path.join(include_dir, "haku", "abi.inc")
     c_pattern = re.compile(
-        r"^\s*#define\s+(HAKU_\w+)\s+(0x[0-9A-Fa-f]+|\d+)u?\s*$")
+        r"^\s*#define\s+(HAKU_\w+)\s+(0x[0-9A-Fa-f]+|\d+)u?\s*(?:/\*.*\*/)?\s*$")
     nasm_pattern = re.compile(
-        r"^\s*%define\s+(HAKU_\w+)\s+(0x[0-9A-Fa-f]+|\d+)\s*$")
+        r"^\s*%define\s+(HAKU_\w+)\s+(0x[0-9A-Fa-f]+|\d+)\s*(?:;.*)?\s*$")
 
     def read_definitions(path, pattern):
         values = {}
@@ -567,6 +567,7 @@ def main():
             "FS-FILE-EDGE-OK", # empty files, exact-sector, span, partial writes
             "FS-CORRUPT-OK", # cut/bad/reserved/cyclic chains + data-full ENOSPC
             "FS-ATA-OK",     # ATA bounds/null transfers rejected
+            "FS-STAT-OK",    # stat/fstat metadata: mode/size/nlink/blocks
             "FS-ROLLBACK-OK", # failed writes roll back size/clusters
             "FS-ENOSPC-OK",  # full root directory refused with ENOSPC
             "PIC-OK",        # 8259 remapped to 0x20/0x28

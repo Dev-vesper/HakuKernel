@@ -119,14 +119,22 @@ int brk(void *address) {
     return 0;
 }
 
-int stat(const char *path, haku_stat_t *status) {
+/* stat/lstat use the Linux i386 fstatat64(300) path with AT_FDCWD, the
+ * same call musl makes, and fstat uses fstat64(197). Both fill the
+ * 96-byte "struct stat64" layout. */
+int stat(const char *path, haku_stat64_t *status) {
     return haku_errno_check(
-        haku_syscall2(HAKU_SYS_STAT, (int)path, (int)status));
+        haku_syscall4(HAKU_SYS_FSTATAT64, HAKU_AT_FDCWD, (int)path,
+                      (int)status, 0));
 }
 
-int fstat(int fd, haku_stat_t *status) {
+int lstat(const char *path, haku_stat64_t *status) {
+    return stat(path, status);
+}
+
+int fstat(int fd, haku_stat64_t *status) {
     return haku_errno_check(
-        haku_syscall2(HAKU_SYS_FSTAT, fd, (int)status));
+        haku_syscall2(HAKU_SYS_FSTAT64, fd, (int)status));
 }
 
 void _exit(int status) {

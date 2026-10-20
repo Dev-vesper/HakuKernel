@@ -20,10 +20,12 @@ typedef struct {
     int unlinked;
 } fat12_file_t;
 
-/* Minimal file metadata for stat/fstat (backend maps size/is_dir to
- * vfs_stat_t; entries are regular files or directories). */
+/* File metadata for stat/fstat: the backend maps its directory-entry
+ * data onto the fields the VFS reports (size, a synthetic inode number
+ * taken from the entry position, and the file type). */
 typedef struct {
     uint32_t size;
+    uint32_t ino;
     int is_dir;
 } fat12_stat_t;
 

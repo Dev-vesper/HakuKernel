@@ -376,18 +376,18 @@ static int32_t load_elf_file(uint32_t pid, const char *path,
         vfs_close(pid, (uint32_t)fd);
         return result;
     }
-    if (stat.size == 0 || stat.size > USER_ELF_MAX_SIZE) {
+    if (stat.st_size == 0 || stat.st_size > USER_ELF_MAX_SIZE) {
         vfs_close(pid, (uint32_t)fd);
-        return -(int32_t)(stat.size ? HAKU_E2BIG : HAKU_ENOEXEC);
+        return -(int32_t)(stat.st_size ? HAKU_E2BIG : HAKU_ENOEXEC);
     }
 
-    image = (uint8_t *)kmalloc(stat.size);
+    image = (uint8_t *)kmalloc((uint32_t)stat.st_size);
     if (!image) {
         vfs_close(pid, (uint32_t)fd);
         return -(int32_t)HAKU_ENOMEM;
     }
-    while (offset < stat.size) {
-        uint32_t amount = stat.size - offset;
+    while (offset < stat.st_size) {
+        uint32_t amount = (uint32_t)(stat.st_size - offset);
         if (amount > USER_IO_MAX) amount = USER_IO_MAX;
         result = vfs_read(pid, (uint32_t)fd, image + offset, amount);
         if (result <= 0 || (uint32_t)result > amount) {
@@ -404,7 +404,7 @@ static int32_t load_elf_file(uint32_t pid, const char *path,
     }
 
     memset(program, 0, sizeof(*program));
-    if (!elf_load_executable(image, stat.size, program)) {
+    if (!elf_load_executable(image, (uint32_t)stat.st_size, program)) {
         kfree(image);
         return -(int32_t)HAKU_ENOEXEC;
     }
@@ -532,29 +532,191 @@ static uint32_t sys_rmdir(uint32_t user_path) {
     return result == 1 ? 0u : (uint32_t)result;
 }
 
+/* Convert the VFS metadata into the two Linux i386 stat layouts. */
+static void vfs_stat_to_stat(const vfs_stat_t *in, haku_stat_t *out) {
+    out->st_dev = in->st_dev;
+    out->st_ino = in->st_ino;
+    out->st_mode = (haku_u16)in->st_mode;
+    out->st_nlink = (haku_u16)in->st_nlink;
+    out->st_uid = (haku_u16)in->st_uid;
+    out->st_gid = (haku_u16)in->st_gid;
+    out->st_rdev = in->st_rdev;
+    out->st_size = (haku_u32)in->st_size;
+    out->st_blksize = in->st_blksize;
+    out->st_blocks = (haku_u32)in->st_blocks;
+    out->st_atime = in->st_atime;
+    out->st_atime_nsec = 0u;
+    out->st_mtime = in->st_mtime;
+    out->st_mtime_nsec = 0u;
+    out->st_ctime = in->st_ctime;
+    out->st_ctime_nsec = 0u;
+    out->__unused4 = 0u;
+    out->__unused5 = 0u;
+}
+
+static void vfs_stat_to_stat64(const vfs_stat_t *in, haku_stat64_t *out) {
+    out->st_dev = in->st_dev;
+    out->__pad0[0] = 0u;
+    out->__pad0[1] = 0u;
+    out->__pad0[2] = 0u;
+    out->__pad0[3] = 0u;
+    out->__st_ino = in->st_ino;
+    out->st_mode = in->st_mode;
+    out->st_nlink = in->st_nlink;
+    out->st_uid = in->st_uid;
+    out->st_gid = in->st_gid;
+    out->st_rdev = in->st_rdev;
+    out->__pad3[0] = 0u;
+    out->__pad3[1] = 0u;
+    out->__pad3[2] = 0u;
+    out->__pad3[3] = 0u;
+    out->st_size = (haku_i64)in->st_size;
+    out->st_blksize = in->st_blksize;
+    out->st_blocks = in->st_blocks;
+    out->st_atime = in->st_atime;
+    out->st_atime_nsec = 0u;
+    out->st_mtime = in->st_mtime;
+    out->st_mtime_nsec = 0u;
+    out->st_ctime = in->st_ctime;
+    out->st_ctime_nsec = 0u;
+    out->st_ino = in->st_ino;
+}
+
+/* stat(106)/lstat(107): the 64-byte i386 "struct stat". Haku has no
+ * symbolic links, so lstat reports the same metadata as stat. */
 static uint32_t sys_stat(uint32_t user_path, uint32_t user_buf) {
     char path[VFS_PATH_MAX];
     vfs_stat_t st;
+    haku_stat_t out;
     int32_t result;
     int copied = copy_user_path(user_path, path);
     if (copied != 1) return (uint32_t)copied;
-    if (!paging_user_range_valid(user_buf, sizeof(st), 1))
+    if (!paging_user_range_valid(user_buf, sizeof(out), 1))
         return copy_from_user_error(HAKU_EFAULT);
     result = vfs_stat(scheduler_current_pid(), path, &st);
     if (result != 1) return (uint32_t)result;
-    if (!copy_to_user(user_buf, &st, sizeof(st)))
+    vfs_stat_to_stat(&st, &out);
+    if (!copy_to_user(user_buf, &out, sizeof(out)))
         return copy_from_user_error(HAKU_EFAULT);
     return 0;
 }
 
+/* stat64(195)/lstat64(196): the 96-byte i386 "struct stat64" that glibc
+ * and musl use on i386. */
+static uint32_t sys_stat64(uint32_t user_path, uint32_t user_buf) {
+    char path[VFS_PATH_MAX];
+    vfs_stat_t st;
+    haku_stat64_t out;
+    int32_t result;
+    int copied = copy_user_path(user_path, path);
+    if (copied != 1) return (uint32_t)copied;
+    if (!paging_user_range_valid(user_buf, sizeof(out), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    result = vfs_stat(scheduler_current_pid(), path, &st);
+    if (result != 1) return (uint32_t)result;
+    vfs_stat_to_stat64(&st, &out);
+    if (!copy_to_user(user_buf, &out, sizeof(out)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0;
+}
+
+/* fstatat64(300): the path/dirfd form musl's stat() uses. Only
+ * AT_FDCWD is supported because Haku has no per-process working
+ * directory; Haku paths always resolve from the root. */
+static uint32_t sys_fstatat64(uint32_t dirfd, uint32_t user_path,
+                              uint32_t user_buf, uint32_t flags) {
+    char path[VFS_PATH_MAX];
+    vfs_stat_t st;
+    haku_stat64_t out;
+    int32_t result;
+    int copied;
+
+    if ((int32_t)dirfd != HAKU_AT_FDCWD)
+        return copy_from_user_error(HAKU_ENOSYS);
+    if (flags & ~(haku_u32)HAKU_AT_SYMLINK_NOFOLLOW)
+        return copy_from_user_error(HAKU_EINVAL);
+    copied = copy_user_path(user_path, path);
+    if (copied != 1) return (uint32_t)copied;
+    if (!paging_user_range_valid(user_buf, sizeof(out), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    result = vfs_stat(scheduler_current_pid(), path, &st);
+    if (result != 1) return (uint32_t)result;
+    vfs_stat_to_stat64(&st, &out);
+    if (!copy_to_user(user_buf, &out, sizeof(out)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0;
+}
+
+/* statx(383): the modern metadata call. Haku answers the basic fields
+ * (type, mode, ownership, size, timestamps, inode, blocks) and reports
+ * the mask it filled. musl calls this for stat() on i386 and falls back
+ * to the stat64 family when a kernel does not provide it. */
+static uint32_t sys_statx(uint32_t dirfd, uint32_t user_path, uint32_t flags,
+                          uint32_t mask, uint32_t user_buf) {
+    char path[VFS_PATH_MAX];
+    vfs_stat_t st;
+    haku_statx_t out;
+    int32_t result;
+    int copied;
+
+    if ((int32_t)dirfd != HAKU_AT_FDCWD)
+        return copy_from_user_error(HAKU_ENOSYS);
+    if (flags & ~(haku_u32)(HAKU_AT_SYMLINK_NOFOLLOW |
+                            HAKU_AT_NO_AUTOMOUNT))
+        return copy_from_user_error(HAKU_EINVAL);
+    copied = copy_user_path(user_path, path);
+    if (copied != 1) return (uint32_t)copied;
+    if (!paging_user_range_valid(user_buf, sizeof(out), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    result = vfs_stat(scheduler_current_pid(), path, &st);
+    if (result != 1) return (uint32_t)result;
+
+    memset(&out, 0, sizeof(out));
+    out.stx_mask = mask & HAKU_STATX_BASIC;
+    out.stx_blksize = st.st_blksize;
+    out.stx_nlink = st.st_nlink;
+    out.stx_uid = st.st_uid;
+    out.stx_gid = st.st_gid;
+    out.stx_mode = (haku_u16)st.st_mode;
+    out.stx_ino = st.st_ino;
+    out.stx_size = st.st_size;
+    out.stx_blocks = st.st_blocks;
+    out.stx_atime.tv_sec = (haku_i64)st.st_atime;
+    out.stx_mtime.tv_sec = (haku_i64)st.st_mtime;
+    out.stx_ctime.tv_sec = (haku_i64)st.st_ctime;
+    out.stx_dev_major = 1u;
+    out.stx_dev_minor = 0u;
+    if (!copy_to_user(user_buf, &out, sizeof(out)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0;
+}
+
+/* fstat(108): the 64-byte i386 "struct stat" of an open descriptor. */
 static uint32_t sys_fstat(uint32_t fd, uint32_t user_buf) {
     vfs_stat_t st;
+    haku_stat_t out;
     int32_t result;
-    if (!paging_user_range_valid(user_buf, sizeof(st), 1))
+    if (!paging_user_range_valid(user_buf, sizeof(out), 1))
         return copy_from_user_error(HAKU_EFAULT);
     result = vfs_fstat(scheduler_current_pid(), fd, &st);
     if (result != 1) return (uint32_t)result;
-    if (!copy_to_user(user_buf, &st, sizeof(st)))
+    vfs_stat_to_stat(&st, &out);
+    if (!copy_to_user(user_buf, &out, sizeof(out)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0;
+}
+
+/* fstat64(197): the 96-byte i386 "struct stat64" of an open descriptor. */
+static uint32_t sys_fstat64(uint32_t fd, uint32_t user_buf) {
+    vfs_stat_t st;
+    haku_stat64_t out;
+    int32_t result;
+    if (!paging_user_range_valid(user_buf, sizeof(out), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    result = vfs_fstat(scheduler_current_pid(), fd, &st);
+    if (result != 1) return (uint32_t)result;
+    vfs_stat_to_stat64(&st, &out);
+    if (!copy_to_user(user_buf, &out, sizeof(out)))
         return copy_from_user_error(HAKU_EFAULT);
     return 0;
 }
@@ -706,8 +868,26 @@ regs_t *user_syscall(regs_t *r) {
     case HAKU_SYS_STAT:
         r->eax = sys_stat(r->ebx, r->ecx);
         return r;
+    case HAKU_SYS_LSTAT:
+        r->eax = sys_stat(r->ebx, r->ecx);
+        return r;
     case HAKU_SYS_FSTAT:
         r->eax = sys_fstat(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_STAT64:
+        r->eax = sys_stat64(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_LSTAT64:
+        r->eax = sys_stat64(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_FSTAT64:
+        r->eax = sys_fstat64(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_FSTATAT64:
+        r->eax = sys_fstatat64(r->ebx, r->ecx, r->edx, r->esi);
+        return r;
+    case HAKU_SYS_STATX:
+        r->eax = sys_statx(r->ebx, r->ecx, r->edx, r->esi, r->edi);
         return r;
     case HAKU_SYS_GETPID:
         r->eax = scheduler_current_pid();

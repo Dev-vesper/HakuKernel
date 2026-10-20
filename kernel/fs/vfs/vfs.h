@@ -32,9 +32,26 @@
 /* Longest path (including NUL) the VFS and its backends accept. */
 #define VFS_PATH_MAX 64u
 
-/* Minimal metadata: byte size plus mode. Backends fill size; VFS callers
- * must treat every other attribute as unsupported. */
-typedef haku_stat_t vfs_stat_t;
+/* Filesystem-independent metadata: the fields the Linux stat layouts
+ * carry. Backends fill what their filesystem can answer; the syscall
+ * layer converts this into the i386 "struct stat" and "struct stat64"
+ * user buffers. Times are seconds since the epoch (0 when the backend
+ * has no timestamps) and st_blocks counts 512-byte units. */
+typedef struct {
+    haku_u32 st_dev;
+    haku_u32 st_ino;
+    haku_u32 st_mode;
+    haku_u32 st_nlink;
+    haku_u32 st_uid;
+    haku_u32 st_gid;
+    haku_u32 st_rdev;
+    haku_u64 st_size;
+    haku_u32 st_blksize;
+    haku_u64 st_blocks;
+    haku_u32 st_atime;
+    haku_u32 st_mtime;
+    haku_u32 st_ctime;
+} vfs_stat_t;
 
 /* Filesystem-independent backend interface (Linux file_operations style,
  * scaled to this kernel). VFS owns the per-process descriptor tables and

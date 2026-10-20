@@ -229,16 +229,24 @@ the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `read` (3), `write` (4), `open` (5), `close` (6), `waitpid` (7),
 `unlink` (10), `execve` (11), `lseek` (19), `getpid` (20), `rename` (38),
 `mkdir` (39), `rmdir` (40), `dup` (41), `brk` (45), `dup2` (63),
-`gettimeofday` (78), `mmap` (90), `munmap` (91), `stat` (106), `fstat` (108),
-and `nanosleep` (162), with arguments in
-`ebx`, `ecx`, and `edx` and syscall number/result in `eax`.
+`gettimeofday` (78), `mmap` (90), `munmap` (91), `stat` (106), `lstat` (107),
+`fstat` (108), `nanosleep` (162), `stat64` (195), `lstat64` (196),
+`fstat64` (197), `fstatat64` (300), and `statx` (383), with arguments in
+`ebx`, `ecx`, `edx`, `esi`, and `edi` and syscall number/result in `eax`.
 The Haku-specific `spawn` and `getusage` syscalls use `0x1000` and `0x1001`.
 The public ABI definitions are in `include/haku/abi.h` for C and
 `include/haku/abi.inc` for NASM; the build checks that their numeric
-constants stay synchronized. They define syscall numbers, errno values, open
-flags, and the `stat` buffer layout. `haku_stat_t` contains 32-bit `size` and
-`mode` fields; `stat` and `fstat` report regular files with mode `0644`
-(`S_IFREG`) and directories with mode `0755` (`S_IFDIR`).
+constants stay synchronized. They define the syscall numbers (the ones
+above plus the Linux numbers the coming milestones add, which answer
+`ENOSYS` until then), errno values, open flags, and the metadata layouts.
+`haku_stat_t` is the 64-byte i386 Linux `struct stat` returned by `stat`,
+`lstat`, and `fstat`; `haku_stat64_t` is the 96-byte i386 `struct stat64`
+returned by `stat64`, `lstat64`, `fstat64`, and `fstatat64` — the layout
+glibc and musl use on i386 — and `haku_statx_t` is the 256-byte `struct
+statx` returned by `statx`, the call musl makes for `stat()` on i386.
+Regular files report mode `0644` (`S_IFREG`), directories `0755`
+(`S_IFDIR`), and the metadata carries the link count, owner, size, 512-byte
+block size, and block count.
 `haku_timeval_t` (`tv_sec`, `tv_usec`) and `haku_timespec_t`
 (`tv_sec`, `tv_nsec`) are the 8-byte user time structures. `haku_mmap_arg_t`
 is the 24-byte i386 `old_mmap` argument block.
@@ -324,7 +332,9 @@ boundary-spanning I/O
 (`FS-FILE-EDGE-OK`), injected cut/bad/reserved/cyclic FAT chains (each
 restored, reads must give `EIO`, loops must terminate) plus a crafted
 full data area (`FS-CORRUPT-OK`), and ATA bounds/NULL-transfer rejection
-(`FS-ATA-OK`).
+(`FS-ATA-OK`). The same pass checks the metadata behind `stat`/`fstat`:
+type bits, size, link count, block size, and block count for a file and a
+directory (`FS-STAT-OK`).
 
 `gettimeofday` reports whole seconds and microseconds since boot derived
 from the 100 Hz PIT tick counter; a NULL timeval is allowed (a no-op query),
@@ -423,13 +433,16 @@ the injected key arrives.
 syscall ABI, `types.h`, `errno.h`, `string.h`, `stdlib.h`, `unistd.h`,
 `fcntl.h`, `stat.h`, and `stdio.h`.
 
-- Raw syscalls: `haku_syscall0`..`haku_syscall3` in `user/lib/syscall.asm`
-  (i386 `int 0x80`, arguments in `ebx`/`ecx`/`edx`, result in `eax`). They
-  return the kernel's `-errno` unchanged.
+- Raw syscalls: `haku_syscall0`..`haku_syscall4` in `user/lib/syscall.asm`
+  (i386 `int 0x80`, arguments in `ebx`/`ecx`/`edx`/`esi`, result in `eax`).
+  They return the kernel's `-errno` unchanged.
 - POSIX-style wrappers return `-1` and set `errno`: `read`, `write`, `close`,
-  `lseek`, `dup`, `dup2`, `open`, `stat`, `fstat`, `unlink`, `rename`,
-  `mkdir`, `rmdir`, `getpid`, `waitpid`, `execve`, `spawn`, `getusage`,
-  `gettimeofday`, `nanosleep`, `sleep`, `brk`, and `sbrk`.
+  `lseek`, `dup`, `dup2`, `open`, `stat`, `lstat`, `fstat`, `unlink`,
+  `rename`, `mkdir`, `rmdir`, `getpid`, `waitpid`, `execve`, `spawn`,
+  `getusage`, `gettimeofday`, `nanosleep`, `sleep`, `brk`, and `sbrk`.
+  `stat`/`lstat` use the Linux `fstatat64` (300) call with `AT_FDCWD` and
+  `fstat` uses `fstat64` (197), so the library and a musl program read the
+  same 96-byte `struct stat64` layout.
 - Strings and memory: `mem*`, `str*`, `atoi`, `malloc`/`calloc`/`realloc`/
   `free` (a first-fit free list over `brk`), and `printf`/`puts`/`putchar`
   with a `%c/%s/%d/%u/%x/%X/%p` subset (no floats, 512-byte output buffer).

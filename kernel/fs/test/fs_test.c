@@ -677,6 +677,57 @@ done:
     return ok;
 }
 
+static int test_stat_metadata(void) {
+    int ok = 1;
+    int32_t fd;
+    vfs_stat_t st;
+
+    fd = vfs_open(FS_TEST_PID, "STAT.TXT", VFS_O_CREAT | VFS_O_RDWR);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-create", fd >= 3 ? 0 : fd, 0);
+    if (fd < 3) return 0;
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-write",
+                        vfs_write(FS_TEST_PID, (uint32_t)fd, edge_buf, 700u),
+                        700);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-fstat",
+                        vfs_fstat(FS_TEST_PID, (uint32_t)fd, &st), 1);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-fstat-mode",
+                        (st.st_mode & VFS_S_IFREG) ? 0 : 1, 0);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-fstat-size",
+                        st.st_size == 700u ? 0 : 1, 0);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-fstat-nlink",
+                        st.st_nlink == 1u ? 0 : 1, 0);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-fstat-blksize",
+                        st.st_blksize == 512u ? 0 : 1, 0);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-fstat-blocks",
+                        st.st_blocks == 2u ? 0 : 1, 0);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-fstat-owner",
+                        (st.st_uid == 0u && st.st_gid == 0u) ? 0 : 1, 0);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-fstat-close",
+                        vfs_close(FS_TEST_PID, (uint32_t)fd), 0);
+
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-path",
+                        vfs_stat(FS_TEST_PID, "STAT.TXT", &st), 1);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-path-mode",
+                        (st.st_mode & VFS_S_IFREG) ? 0 : 1, 0);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-path-size",
+                        st.st_size == 700u ? 0 : 1, 0);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-path-ino",
+                        st.st_ino != 0u ? 0 : 1, 0);
+
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-dir",
+                        vfs_stat(FS_TEST_PID, "/", &st), 1);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-dir-mode",
+                        (st.st_mode & VFS_S_IFDIR) ? 0 : 1, 0);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-dir-nlink",
+                        st.st_nlink == 1u ? 0 : 1, 0);
+
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-missing",
+                        vfs_stat(FS_TEST_PID, "NOSUCH.TXT", &st), -VFS_ENOENT);
+    ok &= expect_tagged("FS-STAT-FAIL", "stat-unlink",
+                        vfs_unlink(FS_TEST_PID, "STAT.TXT"), 1);
+    return ok;
+}
+
 static int test_ata_errors(void) {
     int ok = 1;
     uint32_t total = ata_sector_count();
@@ -909,6 +960,16 @@ void fs_error_self_test(void) {
     } else {
         klog_prefix();
         klog_write("FS-ATA-FAIL\n");
+    }
+
+    /* Metadata behind stat/fstat: type bits, size, link count, block
+     * size, and the 512-byte block count the Linux stat layouts carry. */
+    if (test_stat_metadata()) {
+        klog_prefix();
+        klog_write("FS-STAT-OK: mode/size/nlink/blksize/blocks\n");
+    } else {
+        klog_prefix();
+        klog_write("FS-STAT-FAIL\n");
     }
 
     /* Failed-write cleanup: sizes only cover durable bytes, short

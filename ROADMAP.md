@@ -229,11 +229,17 @@ of HakuKernel. glibc is out of scope: it needs the 64-bit `*64` syscall
 variants, `rseq`/`membarrier`, and a much wider syscall surface. The
 userland root becomes a Unix-like RAM filesystem, not FAT12.
 
-- [ ] Publish a Linux-compatible syscall ABI for i386 (keep the numbers that
+- [x] Publish a Linux-compatible syscall ABI for i386 (keep the numbers that
   already match) and a real `struct stat` layout, so unmodified
   Linux-targeted binaries can call the kernel
-  (`include/haku/abi.h` currently exposes a size-only 8-byte stat and a
-  Haku-specific `spawn`/`getusage` pair).
+  (`include/haku/abi.h` lists the i386 Linux numbers, the implemented ones
+  plus the ones the later milestones add; `haku_stat_t` is the 64-byte i386
+  `struct stat`, `haku_stat64_t` the 96-byte `struct stat64` that glibc and
+  musl use on i386, and `haku_statx_t` the 256-byte `struct statx`; the
+  kernel implements `stat`/`lstat`/`fstat`, `stat64`/`lstat64`/`fstat64`,
+  `fstatat64`, and `statx`, and the user library reads the same layout as
+  musl; the Haku-specific `spawn`/`getusage` pair stays outside the Linux
+  range).
 - [ ] Add process creation and reaping: `fork`/`clone` (with `SIGCHLD`),
   `vfork`, `wait4`, and `exit_group`, replacing the ELF-only `spawn` model
   as the primary way to start a second process.

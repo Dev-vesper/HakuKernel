@@ -13,7 +13,7 @@ int main(void) {
     char buffer[64];
     char copy[32];
     char *pointer;
-    haku_stat_t status;
+    haku_stat64_t status;
     haku_timeval_t before;
     haku_timeval_t after;
     haku_timespec_t pause;
@@ -90,10 +90,16 @@ int main(void) {
         expect(read(fd, buffer, sizeof(buffer)) == (ssize_t)length, "read");
         expect(memcmp(buffer, payload, length) == 0, "read data");
         expect(fstat(fd, &status) == 0, "fstat");
-        expect(status.size == length, "fstat size");
+        expect(status.st_size == length, "fstat size");
+        expect(status.st_blksize == 512, "fstat blksize");
+        expect(status.st_nlink == 1, "fstat nlink");
         expect(close(fd) == 0, "close");
         expect(stat("LIB.TMP", &status) == 0, "stat");
-        expect((status.mode & S_IFREG) != 0, "stat mode");
+        expect((status.st_mode & S_IFREG) != 0, "stat mode");
+        expect(status.st_size == length, "stat size");
+        expect(status.st_nlink == 1, "stat nlink");
+        expect(status.st_uid == 0 && status.st_gid == 0, "stat owner");
+        expect(status.st_blocks == (length + 511u) / 512u, "stat blocks");
         expect(rename("LIB.TMP", "LIB2.TMP") == 0, "rename");
         expect(unlink("LIB2.TMP") == 0, "unlink");
         expect(stat("LIB2.TMP", &status) == -1 && errno == ENOENT,
