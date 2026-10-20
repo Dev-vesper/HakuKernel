@@ -1,5 +1,5 @@
 <h1 align="center">
- Haku v0.1 — a tiny x86 operating system in C
+ Haku v0.2.0 — a tiny x86 operating system in C
 </h1>
 
 ## Tech Stack
