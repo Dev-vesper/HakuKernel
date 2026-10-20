@@ -95,6 +95,23 @@ code_start:
     test eax, eax
     jne .fail
 
+    ; Run the C user-library self-test and require a clean exit.
+    mov eax, SYS_SPAWN
+    mov ebx, USER_DATA_BASE + (lib_path - data_start)
+    int 0x80
+    test eax, eax
+    js .fail
+    mov edi, eax
+    mov eax, SYS_WAITPID
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (lib_status - data_start)
+    xor edx, edx
+    int 0x80
+    cmp eax, edi
+    jne .fail
+    cmp dword [USER_DATA_BASE + (lib_status - data_start)], 0
+    jne .fail
+
     mov eax, SYS_WRITE
     mov ebx, 1
     mov ecx, USER_DATA_BASE + (success_message - data_start)
@@ -130,6 +147,10 @@ failure_message:
 failure_message_end:
 saved_file_header:
     times 4 db 0
+lib_path:
+    db "LIB.ELF", 0
+lib_status:
+    dd 0
 expected_arg0:
     db "NEXT.ELF", 0
 expected_arg0_end:

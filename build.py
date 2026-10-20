@@ -306,6 +306,14 @@ def main():
     exec_target_elf = os.path.join(BUILD, "exec_target.elf")
     child_elf = os.path.join(BUILD, "child.elf")
     fault_elf = os.path.join(BUILD, "fault.elf")
+    user_lib_dir = os.path.join(ROOT, "user", "lib")
+    user_lib_sources = sorted(glob.glob(os.path.join(user_lib_dir, "*.c")))
+    user_test_source = os.path.join(ROOT, "user", "tests", "libtest.c")
+    user_start_asm = os.path.join(user_lib_dir, "crt0.asm")
+    user_syscall_asm = os.path.join(user_lib_dir, "syscall.asm")
+    libtest_pe = os.path.join(BUILD, "libtest.exe")
+    libtest_elf = os.path.join(BUILD, "lib.elf")
+    pe2elf_script = os.path.join(ROOT, "tools", "pe2elf.py")
     filesystem_image = os.path.join(BUILD, "haku_fs.img")
     kernel_pe = os.path.join(BUILD, "kernel.pe")
     kernel_bin = os.path.join(BUILD, "kernel.bin")
@@ -324,13 +332,39 @@ def main():
          "-o", exec_target_elf])
     run([nasm, "-I" + nasm_include, "-f", "bin", child_asm, "-o", child_elf])
     run([nasm, "-I" + nasm_include, "-f", "bin", fault_asm, "-o", fault_elf])
+
+    # The user C library is linked into a fixed-base PE image, then repacked
+    # as ELF32 so the existing loader can map RX/R/RW sections.
+    user_objects = []
+    for source in (user_start_asm, user_syscall_asm):
+        obj = os.path.join(BUILD, "uasm_" +
+                           os.path.splitext(os.path.basename(source))[0] + ".obj")
+        run([nasm, "-I" + include_dir, "-f", "win32", source, "-o", obj])
+        user_objects.append(obj)
+    for source in user_lib_sources:
+        obj = os.path.join(BUILD, "ulib_" +
+                           os.path.splitext(os.path.basename(source))[0] + ".obj")
+        run(cc + ["/nologo", "/c", "/GS-", "/Zl", "/O2", "/Oi-", "/W3",
+                  "/I" + include_dir, "/Fo" + obj, source])
+        user_objects.append(obj)
+    user_test_obj = os.path.join(BUILD, "ulib_libtest.obj")
+    run(cc + ["/nologo", "/c", "/GS-", "/Zl", "/Od", "/Oi-", "/W3",
+              "/I" + include_dir, "/Fo" + user_test_obj, user_test_source])
+    user_objects.append(user_test_obj)
+    run(linker + ["/nologo", "/MACHINE:X86", "/SUBSYSTEM:CONSOLE",
+                  "/ENTRY:start", "/BASE:0x40000000", "/FIXED",
+                  "/DYNAMICBASE:NO", "/NXCOMPAT:NO", "/SAFESEH:NO",
+                  "/ALIGN:4096", "/FILEALIGN:512", "/NODEFAULTLIB",
+                  "/OUT:" + libtest_pe] + user_objects)
+    run([py, pe2elf_script, libtest_pe, libtest_elf])
+
     if mode == "headless" or fresh or not os.path.isfile(filesystem_image):
         if mode == "headless" and os.path.isfile(filesystem_image):
             log("headless: recreating the data image "
                 "(fault-injection tests mutate the disk)")
         run([py, fat12_script, user_elf, filesystem_image,
              f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}",
-             f"FAULT.ELF={fault_elf}"])
+             f"FAULT.ELF={fault_elf}", f"LIB.ELF={libtest_elf}"])
         log(f"FAT12 program disk ready "
             f"({os.path.getsize(filesystem_image)} bytes)")
     else:
@@ -340,7 +374,10 @@ def main():
         source_mtime = max(os.path.getmtime(user_asm),
                            os.path.getmtime(exec_target_asm),
                            os.path.getmtime(child_asm),
-                           os.path.getmtime(fault_asm))
+                           os.path.getmtime(fault_asm),
+                           os.path.getmtime(user_test_source),
+                           max(os.path.getmtime(source)
+                               for source in user_lib_sources))
         if source_mtime > os.path.getmtime(filesystem_image):
             log(f"WARNING: {os.path.basename(user_asm)} is newer than the data image - "
                 "test ELFs on disk may be stale; rerun with --fresh")
@@ -484,6 +521,7 @@ def main():
             "CRASH-REPORT-OK", # faulted user frame dumped with registers and CRs
             "EXECVE-OK pid=1", # exec replaced the image and preserved descriptors
             "USER-EXEC-TARGET-OK", # argv/envp stack and image replacement passed
+            "USER-LIB-OK",   # C library syscalls/strings/malloc/file I/O
             "USER-EXIT-OK status=0 pid=1",
             "SCHED-REAP-OK",
             "FS-ERRORS-OK",  # missing/invalid/exists/badfd map to distinct errno

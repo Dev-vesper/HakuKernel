@@ -31,16 +31,17 @@ python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 multi-cluster file reads, subdirectory/path resolution (`USER-DIR-OK`),
 ring-3 process entry, per-process kernel stacks,
 syscall handling, `spawn`/`waitpid` and exit-status reporting, page-protection
-faults (`USER-PROT-OK`), `execve` image replacement, process exit/reaping, and
-timer IRQs through the serial log.
+faults (`USER-PROT-OK`), `execve` image replacement, process exit/reaping,
+the user C library (`USER-LIB-OK`), and timer IRQs through the serial log.
 
 ### Data image lifecycle
 
 `build/haku_fs.img` is the ATA data disk and is treated as user data: an
 existing image is reused untouched, so files created in a previous QEMU
 session survive the next build. It is (re)created from `kernel/arch/x86/user/user.asm`,
-`kernel/arch/x86/user/exec_target.asm`, and `kernel/arch/x86/user/child.asm` only when missing or with
-`--fresh`. If any test-program assembly source is newer than a reused image,
+`kernel/arch/x86/user/exec_target.asm`, `kernel/arch/x86/user/child.asm`, the
+user library in `user/lib/`, and `user/tests/libtest.c` only when missing or
+with `--fresh`. If any test-program source is newer than a reused image,
 the build warns that its test ELFs on disk may be stale. `headless` always
 starts from a fresh image (its fault-injection tests mutate the disk) and,
 after the serial-log check passes, re-verifies the post-run image on the
@@ -228,7 +229,8 @@ current directory and `..` climbs to the parent (clamped at the root). `stat`
 and `fstat` report byte size and mode (`S_IFREG | 0644` for files,
 `S_IFDIR | 0755` for directories) through an 8-byte user buffer. Reads
 and writes are bounded to 4096 bytes, and errors return
-negative errno values (a future libc can translate these to `errno`).
+negative errno values (the user library in `user/lib` translates these to
+`errno`).
 Every FAT12 failure class keeps one distinct errno end to end: missing
 files give `ENOENT`, bad flags/whence/pointers give `EINVAL`, existing
 files give `EEXIST`, bad descriptors give `EBADF`, a full volume gives
@@ -338,6 +340,35 @@ mapping, a read from unmapped memory, and a store through a `munmap`ed page,
 each checked against its expected `#PF` error code (`7`, `7`, `4`, `6`). The
 blocking read is also observed to park the process (`SCHED-WAITQ-OK`) before
 the injected key arrives.
+
+### User C library
+
+`include/haku/` doubles as a freestanding C SDK: `<haku/haku.h>` includes the
+syscall ABI, `types.h`, `errno.h`, `string.h`, `stdlib.h`, `unistd.h`,
+`fcntl.h`, `stat.h`, and `stdio.h`.
+
+- Raw syscalls: `haku_syscall0`..`haku_syscall3` in `user/lib/syscall.asm`
+  (i386 `int 0x80`, arguments in `ebx`/`ecx`/`edx`, result in `eax`). They
+  return the kernel's `-errno` unchanged.
+- POSIX-style wrappers return `-1` and set `errno`: `read`, `write`, `close`,
+  `lseek`, `dup`, `dup2`, `open`, `stat`, `fstat`, `unlink`, `rename`,
+  `mkdir`, `rmdir`, `getpid`, `waitpid`, `execve`, `spawn`, `getusage`,
+  `gettimeofday`, `nanosleep`, `sleep`, `brk`, and `sbrk`.
+- Strings and memory: `mem*`, `str*`, `atoi`, `malloc`/`calloc`/`realloc`/
+  `free` (a first-fit free list over `brk`), and `printf`/`puts`/`putchar`
+  with a `%c/%s/%d/%u/%x/%X/%p` subset (no floats, 512-byte output buffer).
+- `user/lib/crt0.asm` supplies `_start`: it calls `main(void)` and exits with
+  the returned status.
+
+`build.py` compiles the library and `user/tests/libtest.c` with the same
+`cl.exe` (or `clang-cl`) used for the kernel, links a fixed-base PE32 at
+`0x40000000` with no CRT, and `tools/pe2elf.py` repacks its RX/R/RW sections
+into ELF32 `PT_LOAD` segments. The image is installed as `LIB.ELF`;
+`NEXT.ELF` spawns it, requires a clean exit status, and the run prints
+`USER-LIB-OK`. There is no C runtime, dynamic linker, standard header set,
+floating-point formatting, or thread-safe allocator, and data-image filenames
+remain 8.3. The user ELFs are regenerated on every build, but an existing
+`build/haku_fs.img` only receives `LIB.ELF` after `--fresh` or `headless`.
 
 ### Terminal, display, and input
 
@@ -543,14 +574,21 @@ Haku/
                         panic.c/.h: fatal handler + halted state message
                         crash.c/.h: register/MMU/stack crash reports
                         heap.c/.h: kernel kmalloc/kfree allocator
+  user/
+    lib/              errno.c, memory.c, stdio.c, string.c, unistd.c,
+                      crt0.asm, syscall.asm: user C library
+    tests/            libtest.c: C library self-test installed as LIB.ELF
   include/haku/         abi.h + abi.inc: shared user/kernel ABI constants
+                        types/errno/string/stdlib/unistd/fcntl/stat/stdio.h:
+                        user library headers, plus haku.h
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       boot floppy size/signature checks
   tools/mkfat12.py     FAT12 image builder for the user ELF
+  tools/pe2elf.py      fixed-base PE32 to ELF32 (RX/R/RW) for user C
   build.py             the whole build: cl/link/nasm/qemu orchestration
   build/               generated files (stage*.bin, *.obj/pe, haku.img, ...)
   haku.img             bootable floppy image
-  build/haku_fs.img    1.44 MB FAT12 ATA disk image with HAKU.ELF
+  build/haku_fs.img    1.44 MB FAT12 ATA disk image with HAKU/NEXT/LIB ELFs
 ```
 
 ## Troubleshooting

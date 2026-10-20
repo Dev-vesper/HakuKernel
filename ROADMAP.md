@@ -193,10 +193,15 @@ prevent boot.
 
 ### 6. Developer Tooling and Compatibility
 
-- [ ] Provide a small user-space library and headers for syscalls, strings,
-  memory, and file I/O.
-- [ ] Add a build target for user C programs and document a stable toolchain
-  and ABI.
+- [x] Provide a small user-space library and headers for syscalls, strings,
+  memory, and file I/O (`include/haku/` defines the C API; `user/lib/` adds
+  raw `int 0x80` stubs, errno-translating POSIX wrappers, `mem*`/`str*`, a
+  first-fit `malloc` over `brk`, and a small `printf`).
+- [x] Add a build target for user C programs and document a stable toolchain
+  and ABI (`build.py` compiles `user/lib/` and `user/tests/libtest.c` with the
+  kernel `cl.exe`/`clang-cl`, links a fixed-base PE32 without a CRT, and
+  `tools/pe2elf.py` emits the ELF32 `PT_LOAD` image installed as `LIB.ELF`;
+  `NEXT.ELF` spawns it in the headless run and checks `USER-LIB-OK`).
 - [ ] Add automated tests for malformed ELF files, syscalls, VFS, FAT, and the
   scheduler.
 - [ ] Define the limited POSIX subset actually supported; add conformance
