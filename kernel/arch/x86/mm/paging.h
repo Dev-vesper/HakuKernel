@@ -27,6 +27,7 @@
 
 /* CR0 / CR3 bits (Linux arch/x86/include/asm/cpufeatures + control regs). */
 #define CR0_PG_BIT 0x80000000u /* X86_CR0_PG: paging enable */
+#define CR0_WP_BIT 0x00010000u /* X86_CR0_WP: supervisor honours R/W=0 */
 
 /* Keep the boot tables below the kernel load address: the kernel may grow
  * across 0x20000, so placing them there would overwrite its .data section. */

@@ -99,14 +99,20 @@ static void halt(void) {
 }
 
 static regs_t *abort_user(regs_t *r) {
+    uint32_t status = 0x80u | (r->int_no == 14 ? (r->err_code & 0x7Fu)
+                                               : (r->int_no & 0x7Fu));
     vga_write("USER exception vector=");
     vga_dec(r->int_no);
+    vga_write(" err=");
+    vga_hex(r->err_code);
     vga_write(" eip=");
     vga_hex(r->eip);
     vga_write("\nTerminating process.\n");
     klog_prefix();
     klog_write("USER-FAULT: vector=");
     klog_dec(r->int_no);
+    klog_write(" err=");
+    klog_hex(r->err_code);
     klog_write(" eip=");
     klog_hex(r->eip);
     if (r->int_no == 14) {
@@ -114,6 +120,11 @@ static regs_t *abort_user(regs_t *r) {
         klog_hex(paging_get_cr2());
     }
     klog_write("\n");
+    /* waitpid sees only the low byte of ebx shifted into the status word.
+     * Mark a fault with bit 7 and carry the #PF error code (P/W/U...) or
+     * the vector, so a parent can distinguish a protection fault from a
+     * normal exit(n). */
+    r->ebx = status;
     return scheduler_exit_current(r);
 }
 

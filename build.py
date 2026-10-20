@@ -9,7 +9,7 @@ Usage:
     python build.py inspect ...     examine a FAT12 image (see --help there)
 
 Pipeline:
-    arch/x86/user/{user,child,exec_target}.asm --nasm--> ELF files
+    arch/x86/user/{user,child,fault,exec_target}.asm --nasm--> ELF files
         --mkfat12--> haku_fs.img (fresh only)
     kernel/**/*.c --cl--> kernel objects
     + arch/x86/kernel/{entry,isr}.asm --nasm--> entry objects
@@ -282,6 +282,7 @@ def main():
     user_asm = os.path.join(arch_dir, "user", "user.asm")
     exec_target_asm = os.path.join(arch_dir, "user", "exec_target.asm")
     child_asm = os.path.join(arch_dir, "user", "child.asm")
+    fault_asm = os.path.join(arch_dir, "user", "fault.asm")
     boot_dir = os.path.join(arch_dir, "boot")
     stage1_asm = os.path.join(boot_dir, "stage1.asm")
     stage2_asm = os.path.join(boot_dir, "stage2.asm")
@@ -304,6 +305,7 @@ def main():
     user_elf = os.path.join(BUILD, "user.elf")
     exec_target_elf = os.path.join(BUILD, "exec_target.elf")
     child_elf = os.path.join(BUILD, "child.elf")
+    fault_elf = os.path.join(BUILD, "fault.elf")
     filesystem_image = os.path.join(BUILD, "haku_fs.img")
     kernel_pe = os.path.join(BUILD, "kernel.pe")
     kernel_bin = os.path.join(BUILD, "kernel.bin")
@@ -321,12 +323,14 @@ def main():
     run([nasm, "-I" + nasm_include, "-f", "bin", exec_target_asm,
          "-o", exec_target_elf])
     run([nasm, "-I" + nasm_include, "-f", "bin", child_asm, "-o", child_elf])
+    run([nasm, "-I" + nasm_include, "-f", "bin", fault_asm, "-o", fault_elf])
     if mode == "headless" or fresh or not os.path.isfile(filesystem_image):
         if mode == "headless" and os.path.isfile(filesystem_image):
             log("headless: recreating the data image "
                 "(fault-injection tests mutate the disk)")
         run([py, fat12_script, user_elf, filesystem_image,
-             f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}"])
+             f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}",
+             f"FAULT.ELF={fault_elf}"])
         log(f"FAT12 program disk ready "
             f"({os.path.getsize(filesystem_image)} bytes)")
     else:
@@ -335,7 +339,8 @@ def main():
             f"user files preserved; --fresh recreates it)")
         source_mtime = max(os.path.getmtime(user_asm),
                            os.path.getmtime(exec_target_asm),
-                           os.path.getmtime(child_asm))
+                           os.path.getmtime(child_asm),
+                           os.path.getmtime(fault_asm))
         if source_mtime > os.path.getmtime(filesystem_image):
             log(f"WARNING: {os.path.basename(user_asm)} is newer than the data image - "
                 "test ELFs on disk may be stale; rerun with --fresh")
@@ -474,6 +479,7 @@ def main():
             "USER-MEM-OK",   # brk grows/shrinks; mmap/munmap allocate and release pages
             "USER-DIR-OK",   # subdirectories, paths, and "."/".." resolution
             "USER-USAGE-OK", # getusage reports per-process memory and CPU counters
+            "USER-PROT-OK",  # RX/read-only stores, unmapped reads, and freed pages fault
             "EXECVE-OK pid=1", # exec replaced the image and preserved descriptors
             "USER-EXEC-TARGET-OK", # argv/envp stack and image replacement passed
             "USER-EXIT-OK status=0 pid=1",

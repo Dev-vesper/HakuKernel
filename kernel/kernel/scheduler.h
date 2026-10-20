@@ -40,7 +40,7 @@ regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
                           uint32_t options, regs_t *frame);
 regs_t *scheduler_sleep_ticks(uint32_t ticks, regs_t *frame);
 uint32_t scheduler_brk(uint32_t requested);
-uint32_t scheduler_mmap(uint32_t length);
+uint32_t scheduler_mmap(uint32_t length, int writable);
 uint32_t scheduler_munmap(uint32_t address, uint32_t length);
 uint32_t scheduler_current_pid(void);
 void scheduler_note_syscall(void);

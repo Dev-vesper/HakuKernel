@@ -649,12 +649,16 @@ static uint32_t sys_mmap(uint32_t user_arg) {
 
     if (!copy_from_user(arg, user_arg, sizeof(arg)))
         return copy_from_user_error(HAKU_EFAULT);
+    /* PROT_NONE reservations are not implemented: a mapping is either
+     * read-only (PROT_READ) or read/write (PROT_READ|PROT_WRITE), so the
+     * PTE always reflects the requested access. */
     if (arg[0] != 0u ||
         (arg[2] & ~(uint32_t)(HAKU_PROT_READ | HAKU_PROT_WRITE)) != 0u ||
+        arg[2] == (uint32_t)HAKU_PROT_NONE ||
         arg[3] != (uint32_t)(HAKU_MAP_PRIVATE | HAKU_MAP_ANONYMOUS) ||
         arg[5] != 0u)
         return copy_from_user_error(HAKU_EINVAL);
-    return scheduler_mmap(arg[1]);
+    return scheduler_mmap(arg[1], (arg[2] & HAKU_PROT_WRITE) != 0u);
 }
 
 regs_t *user_syscall(regs_t *r) {

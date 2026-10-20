@@ -30,8 +30,9 @@ python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 `python build.py headless` verifies ATA detection, FAT12 mounting and
 multi-cluster file reads, subdirectory/path resolution (`USER-DIR-OK`),
 ring-3 process entry, per-process kernel stacks,
-syscall handling, `spawn`/`waitpid` and exit-status reporting, `execve` image
-replacement, process exit/reaping, and timer IRQs through the serial log.
+syscall handling, `spawn`/`waitpid` and exit-status reporting, page-protection
+faults (`USER-PROT-OK`), `execve` image replacement, process exit/reaping, and
+timer IRQs through the serial log.
 
 ### Data image lifecycle
 
@@ -175,9 +176,18 @@ address hint, no execute bit, and offset 0; it places mappings in a second
 reserved region (`0x60000000`) using first-fit over a per-process table, so
 earlier releases are reused. `munmap` (91) releases a range that lies inside
 one tracked anonymous mapping, trims or splits the region, and frees the pages
-(and any now-empty page tables). Pages are always mapped read/write, so the
-requested protection is validated but not enforced. Both regions are reclaimed
-with the rest of the address space at exit or `execve`.
+(and any now-empty page tables). `PROT_WRITE` selects the PTE `R/W` bit, so a
+`PROT_READ` mapping is enforced read-only by the MMU; `PROT_NONE` reservations
+are rejected with `EINVAL`. Both regions are reclaimed with the rest of the
+address space at exit or `execve`.
+
+The kernel sets `CR0.WP`, so ring-0 writes also honour `R/W=0`: read-only user
+pages can only be filled through their physical direct-map alias. ELF segments
+are mapped from their `PF_W` bit (the loader already rejects `W|X`), and
+`munmap` clears the PTE before returning the frame, so both an `RX` store and a
+store through a released mapping take a page fault. i386 without PAE has no
+execute-disable bit, so W^X is enforced by the loader's `W|X` rejection rather
+than by an NX permission.
 
 ### Per-process memory and resource accounting
 
@@ -311,14 +321,20 @@ rejects unmapped/kernel pointers, wraparound, invalid descriptors and
 oversized I/O. The syscall entry enables interrupts while in kernel code so
 blocking keyboard reads can make progress; the keyboard wait is atomic
 against the interrupt/wakeup race. Ring-3 page faults are contained and
-reported rather than halting the kernel. These syscalls are an initial
-POSIX-inspired kernel interface, not full POSIX conformance. Run
+reported rather than halting the kernel: the fault handler logs the vector,
+error code, and `CR2`, encodes the error code in the exit status byte
+(`0x80 | err`), and terminates only the faulting process. These syscalls are an
+initial POSIX-inspired kernel interface, not full POSIX conformance. Run
 `python build.py headless` to test read/write/open/close/lseek/getpid/exit,
 gettimeofday/nanosleep, brk/mmap/munmap, per-process `getusage` memory and
 resource accounting, bad pointers, descriptor errors, input copying,
 disk-backed create/write/read across a sector boundary, and continued
-timer operation. The blocking read is also observed to park the process
-(`SCHED-WAITQ-OK`) before the injected key arrives.
+timer operation. The protection test spawns one child per fault
+(`USER-PROT-OK`): a store into an `RX` segment, a store into a `PROT_READ`
+mapping, a read from unmapped memory, and a store through a `munmap`ed page,
+each checked against its expected `#PF` error code (`7`, `7`, `4`, `6`). The
+blocking read is also observed to park the process (`SCHED-WAITQ-OK`) before
+the injected key arrives.
 
 ### ATA PIO and FAT12
 
@@ -455,8 +471,9 @@ Haku/
       mm/               paging.c/.h: i386 page tables (identity + 128 MiB direct map + user)
                         frame.c/.h: E820-backed physical page inventory
       elf/              elf.c/.h: validated ELF32 PT_LOAD loader + user spaces
-      user/             user.asm, child.asm, exec_target.asm: ELF32 test
-                        programs (syscall, spawn/waitpid, execve coverage)
+      user/             user.asm, child.asm, fault.asm, exec_target.asm: ELF32
+                        test programs (syscall, spawn/waitpid, protection
+                        faults, execve coverage)
     drivers/            ata.c/.h: primary-master ATA LBA28 polling PIO
                         console.c/.h: VGA text + COM1 serial
     fs/

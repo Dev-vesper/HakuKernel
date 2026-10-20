@@ -1348,6 +1348,12 @@ _user_program_start:
     int 0x80
     cmp eax, -14
     jne .fail
+    mov esi, 95                 ; PROT_NONE reservations are unsupported
+    mov eax, SYS_MMAP
+    mov ebx, USER_DATA_BASE + (mmap_prot_none - data_start)
+    int 0x80
+    cmp eax, -22
+    jne .fail
     mov esi, 115                ; shrink the break and release the top page
     mov eax, SYS_BRK
     mov ebx, [USER_DATA_BASE + (brk_base - data_start)]
@@ -1752,6 +1758,81 @@ _user_program_start:
     cmp eax, edx
     jne .fail
 
+    ; Hardware page protections: each fault child makes one illegal access
+    ; and the kernel must terminate it. abort_user encodes the #PF error
+    ; code into the exit status byte (0x80 | err), so waitpid can tell a
+    ; read-only write (0x87), an unmapped access (0x84), and a write to a
+    ; released mapping (0x86) apart. The mode byte travels through the
+    ; inherited fd 3, the same descriptor path the child test exercises.
+    mov eax, SYS_OPEN
+    mov ebx, USER_DATA_BASE + (prot_path - data_start)
+    mov ecx, 0x242
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jne .fail
+    mov edi, eax
+    mov esi, USER_DATA_BASE + (fault_modes - data_start)
+    mov ebp, USER_DATA_BASE + (fault_statuses - data_start)
+.prot_loop:
+    mov eax, SYS_LSEEK
+    mov ebx, edi
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_WRITE
+    mov ebx, edi
+    mov ecx, esi
+    mov edx, 1
+    int 0x80
+    cmp eax, 1
+    jne .fail
+    mov eax, SYS_LSEEK
+    mov ebx, edi
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_SPAWN
+    mov ebx, USER_DATA_BASE + (fault_path - data_start)
+    int 0x80
+    test eax, eax
+    jle .fail
+    mov ebx, eax
+    mov eax, SYS_WAITPID
+    mov ecx, USER_DATA_BASE + (fault_status - data_start)
+    xor edx, edx
+    int 0x80
+    test eax, eax
+    jle .fail
+    mov eax, [ebp]
+    cmp dword [USER_DATA_BASE + (fault_status - data_start)], eax
+    jne .fail
+    inc esi
+    add ebp, 4
+    cmp esi, USER_DATA_BASE + (fault_modes_end - data_start)
+    jb .prot_loop
+    mov eax, SYS_CLOSE
+    mov ebx, edi
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_UNLINK
+    mov ebx, USER_DATA_BASE + (prot_path - data_start)
+    int 0x80
+    test eax, eax
+    jne .fail
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (prot_message - data_start)
+    mov edx, prot_message_end - prot_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
     ; Failed exec attempts must leave this process image intact.
     mov esi, 61
     mov eax, SYS_EXECVE
@@ -1954,6 +2035,8 @@ mmap_bad_len:
     dd 0, 0, HAKU_PROT_READ | HAKU_PROT_WRITE, HAKU_MAP_PRIVATE | HAKU_MAP_ANONYMOUS, -1, 0
 mmap_bad_flags:
     dd 0, 0x1000, HAKU_PROT_READ | HAKU_PROT_WRITE, HAKU_MAP_PRIVATE, -1, 0
+mmap_prot_none:
+    dd 0, 0x1000, HAKU_PROT_NONE, HAKU_MAP_PRIVATE | HAKU_MAP_ANONYMOUS, -1, 0
 mmap_three_pages:
     dd 0, 0x3000, HAKU_PROT_READ | HAKU_PROT_WRITE, HAKU_MAP_PRIVATE | HAKU_MAP_ANONYMOUS, -1, 0
 mem_message:
@@ -1996,6 +2079,20 @@ usage_message:
 usage_message_end:
 stat_buf:
     times 8 db 0
+fault_path:
+    db "FAULT.ELF", 0
+prot_path:
+    db "PROT.TMP", 0
+fault_modes:
+    db 'C', 'R', 'U', 'F'
+fault_modes_end:
+fault_statuses:
+    dd 0x8700, 0x8700, 0x8400, 0x8600
+fault_status:
+    dd 0
+prot_message:
+    db "USER-PROT-OK read-only, unmapped, and freed-page faults", 10
+prot_message_end:
 exec_path:
     db "NEXT.ELF", 0
 exec_preserved_path:

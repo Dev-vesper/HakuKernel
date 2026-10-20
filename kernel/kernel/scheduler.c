@@ -706,12 +706,12 @@ regs_t *scheduler_sleep_ticks(uint32_t ticks, regs_t *frame) {
                                           tasks[next].frame;
 }
 
-/* Map [start, end) as zero-filled, user-writable pages in the given
- * address space (page-aligned range). On failure the pages mapped by this
- * call are unmapped again, so the caller can report -ENOMEM without
- * leaking address space or frames. */
+/* Map [start, end) as zero-filled user pages in the given address space
+ * (page-aligned range), writable when `writable` is set. On failure the
+ * pages mapped by this call are unmapped again, so the caller can report
+ * -ENOMEM without leaking address space or frames. */
 static int map_user_zero_pages(address_space_t *space, uint32_t start,
-                               uint32_t end) {
+                               uint32_t end, int writable) {
     uint32_t mapped = start;
     for (uint32_t address = start; address < end; address += USER_PAGE_SIZE) {
         void *page = frame_alloc();
@@ -719,7 +719,7 @@ static int map_user_zero_pages(address_space_t *space, uint32_t start,
         if (!page) break;
         physical = (uint32_t)page;
         memset(PHYS_TO_VIRT(physical), 0, USER_PAGE_SIZE);
-        if (!paging_map_user_page(space, address, physical, 1)) {
+        if (!paging_map_user_page(space, address, physical, writable)) {
             frame_free(page);
             break;
         }
@@ -758,7 +758,7 @@ uint32_t scheduler_brk(uint32_t requested) {
 
     rounded = (requested + USER_PAGE_SIZE - 1u) & 0xFFFFF000u;
     if (rounded > task->heap_top) {
-        if (!map_user_zero_pages(space, task->heap_top, rounded))
+        if (!map_user_zero_pages(space, task->heap_top, rounded, 1))
             return 0u - HAKU_ENOMEM;
         task->heap_top = rounded;
     } else if (rounded < task->heap_top) {
@@ -801,9 +801,9 @@ static void mmap_insert_region(task_t *task, uint32_t base, uint32_t size) {
 }
 
 /* Limited mmap(2): anonymous private pages from the per-process mmap
- * region, always zero-filled and writable. Returns the mapped base address
- * or -errno. */
-uint32_t scheduler_mmap(uint32_t length) {
+ * region, always zero-filled; PROT_WRITE decides whether the PTEs carry
+ * R/W. Returns the mapped base address or -errno. */
+uint32_t scheduler_mmap(uint32_t length, int writable) {
     task_t *task;
     address_space_t *space;
     uint32_t rounded;
@@ -822,7 +822,7 @@ uint32_t scheduler_mmap(uint32_t length) {
     rounded = (length + USER_PAGE_SIZE - 1u) & 0xFFFFF000u;
     base = mmap_find_gap(task, rounded);
     if (!base) return 0u - HAKU_ENOMEM;
-    if (!map_user_zero_pages(space, base, base + rounded))
+    if (!map_user_zero_pages(space, base, base + rounded, writable))
         return 0u - HAKU_ENOMEM;
     mmap_insert_region(task, base, rounded);
     return base;

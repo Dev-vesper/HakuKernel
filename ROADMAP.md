@@ -150,8 +150,13 @@ address-space or descriptor sharing.
   `brk` now shrinks and unmaps released heap pages, and `munmap` (91) trims,
   splits, and frees anonymous mappings so later `mmap` calls reuse the
   address space; `USER-MEM-OK` covers shrink, release, and reuse).
-- [ ] Improve page protections and test read-only, unmapped, and
-  use-after-free access.
+- [x] Improve page protections and test read-only, unmapped, and
+  use-after-free access (the kernel sets `CR0.WP`, maps `mmap` pages from
+  `PROT_WRITE` so `PROT_READ` is enforced read-only, rejects `PROT_NONE`
+  reservations, and only tears down user PDEs/PTEs; `USER-PROT-OK` spawns a
+  child per case: store into an `RX` segment, store into a `PROT_READ`
+  mapping, read from unmapped memory, and store through a `munmap`ed page,
+  checked against `#PF` error codes 7, 7, 4, and 6).
 - [x] Track memory and resource usage per process (paging maintains
   mapped-page, page-table, and peak counters per address space; the scheduler
   attributes timer ticks by CPL and counts syscalls plus voluntary and

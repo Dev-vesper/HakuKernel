@@ -83,7 +83,9 @@
 #define HAKU_TIMESPEC_SIZE 8u
 
 /* mmap(2) protection and mapping flags. Only anonymous private mappings
- * are supported today; the values match Linux. */
+ * are supported today; the values match Linux. PROT_WRITE controls the
+ * PTE R/W bit, so a PROT_READ mapping is enforced read-only. PROT_NONE
+ * reservations are rejected with EINVAL. */
 #define HAKU_PROT_NONE  0x0u
 #define HAKU_PROT_READ  0x1u
 #define HAKU_PROT_WRITE 0x2u

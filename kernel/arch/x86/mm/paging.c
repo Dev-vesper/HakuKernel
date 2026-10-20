@@ -70,8 +70,8 @@ void paging_enable(void) {
         mov eax, PAGING_DIR_PHYS
         mov cr3, eax              /* MMU walks our directory from here */
         mov eax, cr0
-        or eax, 080000000h        /* CR0.PG — from this insn on, every */
-        mov cr0, eax              /* address goes through the tables */
+        or eax, 80010000h         /* CR0.PG+WP: paging on from this insn, */
+        mov cr0, eax              /* and ring 0 also honours R/W=0 */
     }
 }
 
@@ -209,13 +209,18 @@ int paging_unmap_user_page(address_space_t *space, uint32_t virtual_addr) {
 
     directory = (uint32_t *)PHYS_TO_VIRT(space->directory_phys);
     directory_index = virtual_addr >> 22;
-    if (!(directory[directory_index] & PAGE_PRESENT)) return 0;
+    /* Only a user page table in the user window may be torn down: a
+     * corrupted or shared supervisor PDE must never release a frame. */
+    if ((directory[directory_index] & (PAGE_PRESENT | PAGE_USER)) !=
+        (PAGE_PRESENT | PAGE_USER))
+        return 0;
     table_phys = directory[directory_index] & 0xFFFFF000u;
     if (table_phys >= PAGING_PHYS_LIMIT) return 0;
     table = (uint32_t *)PHYS_TO_VIRT(table_phys);
     table_index = (virtual_addr >> 12) & 0x3FFu;
     pte = table[table_index];
-    if (!(pte & PAGE_PRESENT)) return 0;
+    if ((pte & (PAGE_PRESENT | PAGE_USER)) != (PAGE_PRESENT | PAGE_USER))
+        return 0;
 
     table[table_index] = 0;
     if (space->mapped_pages) space->mapped_pages--;
@@ -296,7 +301,11 @@ void paging_destroy_user_space(address_space_t *space) {
     directory = (uint32_t *)PHYS_TO_VIRT(space->directory_phys);
     for (uint32_t di = 256; di < (PAGING_USER_LIMIT >> 22); di++) {
         uint32_t pde = directory[di];
-        if (!(pde & PAGE_PRESENT)) continue;
+        /* The user window may also hold shared supervisor mappings in
+         * some build: skip anything without U/S=1 so destroy can only
+         * free frames that belong to this address space. */
+        if ((pde & (PAGE_PRESENT | PAGE_USER)) != (PAGE_PRESENT | PAGE_USER))
+            continue;
         {
             uint32_t table_phys = pde & 0xFFFFF000u;
             uint32_t *table;
