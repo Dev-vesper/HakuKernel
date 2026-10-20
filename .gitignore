@@ -2,6 +2,10 @@
 build/
 haku.img
 
+# release packaging (produced on CI runners, but also reproducible locally)
+package/
+Haku-*.zip
+
 # Visual Studio workspace cache (regenerates on folder open)
 .vs/
 

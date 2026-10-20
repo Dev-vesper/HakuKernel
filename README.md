@@ -2,6 +2,8 @@
  Haku v0.1 — a tiny x86 operating system in C
 </h1>
 
+[![CI](https://github.com/ParsaAzima/HakuKernel/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ParsaAzima/HakuKernel/actions/workflows/ci.yml)
+
 Bootloader (NASM) loads a C kernel and switches the CPU to 32-bit protected
 mode. The kernel initializes paging, interrupts and a GDT/TSS, then reads
 user ELF programs from a FAT12 filesystem on an ATA disk and schedules them
@@ -55,6 +57,30 @@ FATs, exact chains, no orphans) with a nonzero exit on any damage.
 The build is one Python script on purpose — `cmd.exe` quoting of spaced
 paths (e.g. `C:\Program Files\...`) is fragile, while `subprocess` argument
 lists just work.
+
+### Continuous integration and releases
+
+`.github/workflows/ci.yml` runs on every push to `main`, every pull request,
+and manual dispatch. It uses `windows-latest` with the runner's Visual
+Studio, installs NASM and QEMU with Chocolatey, runs
+`python build.py headless`, and uploads `haku.img`, the data image,
+serial/QEMU logs, and any crash screenshots as artifacts even when the boot
+check fails. A missing marker, an unexpected `*-FAIL` marker, or
+`KERNEL PANIC` fails the job.
+
+`.github/workflows/release.yml` runs for `v*` tags. It repeats the headless
+check, deletes the mutated test image, rebuilds a pristine
+`build/haku_fs.img`, and publishes `Haku-<tag>.zip` containing `haku.img`,
+`haku_fs.img`, `README.md`, `LICENSE`, and `SHA256SUMS.txt`:
+
+```cmd
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+Slow runners can tune headless timing with `HAKU_BOOT_DELAY` (seconds before
+the injected key, default 1) and `HAKU_HEADLESS_TIMEOUT` (seconds to wait for
+guest shutdown, default 30).
 
 ## How it works
 
@@ -585,6 +611,8 @@ Haku/
   tools/mkimg.py       boot floppy size/signature checks
   tools/mkfat12.py     FAT12 image builder for the user ELF
   tools/pe2elf.py      fixed-base PE32 to ELF32 (RX/R/RW) for user C
+  .github/workflows/  ci.yml: hosted headless build/test + artifacts
+                      release.yml: tag-driven bootable image release
   build.py             the whole build: cl/link/nasm/qemu orchestration
   build/               generated files (stage*.bin, *.obj/pe, haku.img, ...)
   haku.img             bootable floppy image

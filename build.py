@@ -135,12 +135,35 @@ def verify_abi_headers(include_dir):
 
 
 def find_msvc():
-    pattern = (r"C:\Program Files\Microsoft Visual Studio\2022"
-               r"\*\VC\Tools\MSVC\*\bin\Hostx64\x86\cl.exe")
-    cands = sorted(glob.glob(pattern))
+    """Find an x86-hosted cl.exe from any VS 2022+ installation.
+
+    CI images may expose cl through PATH (developer prompt) or only through
+    the Visual Studio directories, so check both. Prefer an x86 target
+    toolset: an x64 cl.exe cannot produce the 32-bit COFF objects we link.
+    """
+    found = shutil.which("cl")
+    if found and re.search(r"[\\/]Hostx(?:64|86)[\\/]x86[\\/]cl\.exe$",
+                           found, re.IGNORECASE):
+        return found
+    patterns = [
+        r"C:\Program Files\Microsoft Visual Studio\*\*\VC\Tools\MSVC"
+        r"\*\bin\Hostx64\x86\cl.exe",
+        r"C:\Program Files (x86)\Microsoft Visual Studio\*\*\VC\Tools\MSVC"
+        r"\*\bin\Hostx64\x86\cl.exe",
+    ]
+    cands = []
+    for pattern in patterns:
+        cands += glob.glob(pattern)
+
+    def version(path):
+        match = re.search(r"[\\/]MSVC[\\/]([\d.]+)[\\/]bin[\\/]", path)
+        return tuple(int(part) for part in match.group(1).split(".")) \
+            if match else ()
+
     if not cands:
-        sys.exit('x86 cl.exe not found: install VS2022 "Desktop development with C++"')
-    return cands[-1]
+        sys.exit('x86 cl.exe not found: install VS2022 '
+                 '"Desktop development with C++"')
+    return max(cands, key=version)
 
 
 def _latest(paths):
@@ -453,9 +476,12 @@ def main():
                                         "-monitor", f"tcp:127.0.0.1:{MON_PORT},server=on,wait=off"])
         try:
             # The initial test process blocks once in read(0, ..., 1).
-            time.sleep(1.0)
+            # CI runners are slower; allow the environment to delay the key
+            # and to extend the wait without changing local behavior.
+            time.sleep(float(os.environ.get("HAKU_BOOT_DELAY", "1.0")))
             monitor_cmd(MON_PORT, ["sendkey x"])
-            proc.wait(timeout=12)
+            proc.wait(timeout=float(
+                os.environ.get("HAKU_HEADLESS_TIMEOUT", "30")))
         except subprocess.TimeoutExpired:
             # Still alive: interrogate the CPU state, grab a screenshot, stop it.
             regs = monitor_cmd(MON_PORT, ["info registers", f"screendump {shot}",

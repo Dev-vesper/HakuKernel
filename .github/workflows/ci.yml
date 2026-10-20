@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Headless boot waits for the keyboard-injection point; slower hosted
+  # runners need more slack than a local workstation.
+  HAKU_BOOT_DELAY: "3"
+  HAKU_HEADLESS_TIMEOUT: "60"
+
+jobs:
+  headless:
+    name: Build and boot test
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install NASM and QEMU
+        run: choco install nasm qemu --yes --no-progress --limit-output
+
+      - name: Show tool versions
+        run: |
+          nasm -v
+          qemu-system-i386 --version
+
+      - name: Build and run headless tests
+        run: python build.py headless
+
+      - name: Upload boot artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: haku-boot-${{ github.run_id }}
+          path: |
+            haku.img
+            build/haku_fs.img
+            build/serial.log
+            build/qemu.log
+            build/regs.txt
+            build/screen.png
+            build/screen.ppm
+          if-no-files-found: ignore
+          retention-days: 14

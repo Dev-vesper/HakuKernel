@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  HAKU_BOOT_DELAY: "3"
+  HAKU_HEADLESS_TIMEOUT: "60"
+
+jobs:
+  release:
+    name: Package bootable images
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install NASM and QEMU
+        run: choco install nasm qemu --yes --no-progress --limit-output
+
+      - name: Build and run headless tests
+        run: python build.py headless
+
+      - name: Rebuild a pristine data image
+        run: |
+          Remove-Item -Force build/haku_fs.img
+          python build.py
+
+      - name: Package release
+        run: |
+          $tag = "${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item -Path haku.img, README.md, LICENSE -Destination package
+          Copy-Item -Path build/haku_fs.img -Destination package
+          Push-Location package
+          Get-FileHash haku.img, haku_fs.img -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  $([IO.Path]::GetFileName($_.Path))" } |
+            Set-Content SHA256SUMS.txt
+          Pop-Location
+          Compress-Archive -Path package/* -DestinationPath "Haku-$tag.zip" -Force
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Haku-${{ github.ref_name }}.zip
+            package/SHA256SUMS.txt
+          generate_release_notes: true
