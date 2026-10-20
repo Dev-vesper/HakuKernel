@@ -22,7 +22,7 @@ env:
 jobs:
   headless:
     name: Build and boot test
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - name: Check out
@@ -33,12 +33,17 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install NASM and QEMU
-        run: choco install nasm qemu --yes --no-progress --limit-output
+      - name: Install NASM, LLVM, and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            nasm clang lld qemu-system-x86
 
       - name: Show tool versions
         run: |
           nasm -v
+          clang --version
+          lld-link --version
           qemu-system-i386 --version
 
       - name: Build and run headless tests

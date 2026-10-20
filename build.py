@@ -182,6 +182,7 @@ def find_clang_cl():
     cands = []
     for d in ("/usr/lib/llvm-*/bin", "/usr/bin", "/usr/local/bin"):
         cands += glob.glob(os.path.join(d, "clang-cl-*"))
+        cands += glob.glob(os.path.join(d, "clang-cl"))
     if cands:
         return [_latest(cands)]
     clang = shutil.which("clang")
@@ -198,6 +199,7 @@ def find_lld_link():
     cands = []
     for d in ("/usr/lib/llvm-*/bin", "/usr/bin", "/usr/local/bin"):
         cands += glob.glob(os.path.join(d, "lld-link-*"))
+        cands += glob.glob(os.path.join(d, "lld-link"))
     if not cands:
         sys.exit("lld-link not found: install LLVM lld (e.g. apt install lld)")
     return [_latest(cands)]

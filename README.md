@@ -61,11 +61,11 @@ lists just work.
 ### Continuous integration and releases
 
 `.github/workflows/ci.yml` runs on every push to `main`, every pull request,
-and manual dispatch. It uses `windows-latest` with the runner's Visual
-Studio, installs NASM and QEMU with Chocolatey, runs
-`python build.py headless`, and uploads `haku.img`, the data image,
-serial/QEMU logs, and any crash screenshots as artifacts even when the boot
-check fails. A missing marker, an unexpected `*-FAIL` marker, or
+and manual dispatch. It uses `ubuntu-latest`, installs NASM, Clang/LLD, and
+QEMU from apt, runs `python build.py headless` through the
+`clang-cl`/`lld-link` path in `build.py`, and uploads `haku.img`, the data
+image, serial/QEMU logs, and any crash screenshots as artifacts even when the
+boot check fails. A missing marker, an unexpected `*-FAIL` marker, or
 `KERNEL PANIC` fails the job.
 
 `.github/workflows/release.yml` runs for `v*` tags. It repeats the headless
@@ -73,7 +73,7 @@ check, deletes the mutated test image, rebuilds a pristine
 `build/haku_fs.img`, and publishes `Haku-<tag>.zip` containing `haku.img`,
 `haku_fs.img`, `README.md`, `LICENSE`, and `SHA256SUMS.txt`:
 
-```cmd
+```bash
 git tag v0.2.0
 git push origin v0.2.0
 ```
