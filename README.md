@@ -2,6 +2,53 @@
  Haku v0.1 — a tiny x86 operating system in C
 </h1>
 
+## Tech Stack
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Language-C-A8B9CC?style=for-the-badge&logo=c&logoColor=white" alt="C" />
+  <img src="https://img.shields.io/badge/Assembly-NASM-333333?style=for-the-badge" alt="NASM" />
+  <img src="https://img.shields.io/badge/Architecture-x86%20%2F%20i386-0071C5?style=for-the-badge" alt="x86" />
+  <img src="https://img.shields.io/badge/Kernel-Bare%20Metal-222222?style=for-the-badge" alt="Bare Metal" />
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Compiler-MSVC%20%2F%20Clang--CL-5C2D91?style=for-the-badge&logo=visualstudio&logoColor=white" alt="MSVC and Clang-CL" />
+  <img src="https://img.shields.io/badge/Linker-MS%20LINK%20%2F%20LLD-68217A?style=for-the-badge" alt="Linker" />
+  <img src="https://img.shields.io/badge/Build-Python-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python" />
+  <img src="https://img.shields.io/badge/Assembler-NASM-333333?style=for-the-badge" alt="Assembler" />
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Emulator-QEMU-FF6600?style=for-the-badge&logo=qemu&logoColor=white" alt="QEMU" />
+  <img src="https://img.shields.io/badge/Boot-BIOS-555555?style=for-the-badge" alt="BIOS" />
+  <img src="https://img.shields.io/badge/Memory-Paging-0078D4?style=for-the-badge" alt="Paging" />
+  <img src="https://img.shields.io/badge/Executable-ELF32-6E4C13?style=for-the-badge" alt="ELF32" />
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Filesystem-FAT12-4CAF50?style=for-the-badge" alt="FAT12" />
+  <img src="https://img.shields.io/badge/Storage-ATA%20PIO-607D8B?style=for-the-badge" alt="ATA PIO" />
+  <img src="https://img.shields.io/badge/Interface-VFS-795548?style=for-the-badge" alt="VFS" />
+  <img src="https://img.shields.io/badge/ABI-i386%20Syscalls-455A64?style=for-the-badge" alt="i386 syscall ABI" />
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/CI-GitHub%20Actions-2088FF?style=for-the-badge&logo=githubactions&logoColor=white" alt="GitHub Actions" />
+  <img src="https://img.shields.io/badge/Platform-Windows%2011-0078D4?style=for-the-badge&logo=windows11&logoColor=white" alt="Windows 11" />
+  <img src="https://img.shields.io/badge/Testing-Headless%20QEMU-FF6600?style=for-the-badge" alt="Headless QEMU testing" />
+</p>
+
+<p align="center">
+  <a href="https://github.com/ParsaAzima/HakuKernel/actions/workflows/ci.yml">
+    <img src="https://img.shields.io/github/actions/workflow/status/ParsaAzima/HakuKernel/ci.yml?branch=main&style=for-the-badge&label=CI" alt="CI status" />
+  </a>
+  <img src="https://img.shields.io/badge/Version-v0.1-blue?style=for-the-badge" alt="Version v0.1" />
+  <img src="https://img.shields.io/badge/License-See%20LICENSE-lightgrey?style=for-the-badge" alt="License" />
+</p>
+
+---
+
+
 [![CI](https://github.com/ParsaAzima/HakuKernel/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ParsaAzima/HakuKernel/actions/workflows/ci.yml)
 
 Bootloader (NASM) loads a C kernel and switches the CPU to 32-bit protected
