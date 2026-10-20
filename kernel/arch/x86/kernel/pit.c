@@ -1,9 +1,9 @@
 /* Haku PIT driver: 100 Hz-class system timer on IRQ0. */
-#include "console.h"
 #include "idt.h"
 #include "klog.h"
 #include "pic.h"
 #include "pit.h"
+#include "terminal.h"
 
 #define PIT_CH0 0x40
 #define PIT_CMD 0x43
@@ -37,7 +37,7 @@ static void pit_tick(regs_t *r) {
         while (n--) buf[len++] = rev[n];
         buf[len++] = 's';
         buf[len] = 0;
-        vga_corner(buf);
+        terminal_corner(buf);
     }
 }
 

@@ -1,6 +1,5 @@
 #include "fs_test.h"
 #include "ata.h"
-#include "console.h"
 #include "fat12.h"
 #include "fat12_vfs.h"
 #include "heap.h"

@@ -1,11 +1,10 @@
 #include "usermode.h"
-#include "console.h"
 #include "fat12_vfs.h"
-#include "kbd.h"
 #include "klog.h"
 #include "paging.h"
 #include "pit.h"
 #include "scheduler.h"
+#include "terminal.h"
 #include "fat12.h"
 #include "heap.h"
 #include "vfs.h"
@@ -26,32 +25,16 @@ typedef struct {
     uint32_t envp_offsets[USER_EXEC_MAX_ARGUMENTS];
 } exec_arguments_t;
 
-/* The console behind the standard descriptors. Output mirrors the VGA text
- * console and COM1 (with CRLF on serial, as the boot log expects); input is
- * the canonical PS/2 keyboard stream, returning after a newline or count
- * bytes. It is registered with VFS, which installs it as fds 0/1/2. */
+/* The console behind the standard descriptors. The terminal layer owns the
+ * display/serial split and the keyboard input queue; this device is only the
+ * VFS adapter that installs it as fds 0/1/2. */
 static int32_t console_read(void *buffer, uint32_t count, uint32_t *out_count) {
-    uint8_t *bytes = (uint8_t *)buffer;
-    uint32_t copied = 0;
-    while (copied < count) {
-        char ch = kbd_getchar();
-        bytes[copied++] = (uint8_t)ch;
-        if (ch == '\n') break;
-    }
-    *out_count = copied;
-    return 1;
+    return terminal_read(buffer, count, out_count);
 }
 
 static int32_t console_write(const void *buffer, uint32_t count,
                              uint32_t *out_count) {
-    const uint8_t *bytes = (const uint8_t *)buffer;
-    for (uint32_t i = 0; i < count; i++) {
-        console_putc((char)bytes[i]);
-        if (bytes[i] == '\n') serial_putc('\r'); /* serial is CRLF */
-        serial_putc((char)bytes[i]);
-    }
-    *out_count = count;
-    return 1;
+    return terminal_write_bytes(buffer, count, out_count);
 }
 
 static const vfs_device_ops_t console_device = {

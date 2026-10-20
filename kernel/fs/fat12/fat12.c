@@ -1,6 +1,5 @@
 #include "fat12.h"
 #include "ata.h"
-#include "console.h"
 #include "klog.h"
 
 #define FAT12_SECTOR_SIZE 512u

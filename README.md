@@ -216,10 +216,11 @@ ticks have 10 ms granularity.
 ### User-mode system calls
 
 `read` supports stdin from the PS/2 keyboard and regular files; `write`
-supports stdout/stderr to VGA and serial as well as writable regular files.
-The standard descriptors `0`/`1`/`2` are real per-process descriptors backed
-by a registered console device rather than special cases in the syscall
-layer: they resolve through the same VFS descriptor table as file handles.
+supports stdout/stderr to the active display and serial as well as writable
+regular files. The standard descriptors `0`/`1`/`2` are real per-process
+descriptors backed by a registered console device rather than special cases
+in the syscall layer: they resolve through the same VFS descriptor table as
+file handles, and the device itself only forwards to the terminal layer.
 `open`, `close`, `lseek`, `unlink`, `rename`, `mkdir`, `rmdir`, `stat`,
 `fstat`, and per-process file descriptors are backed by the VFS/FAT12 layer.
 Paths are `/`-separated 8.3 names resolved from the root; `.` keeps the
@@ -266,12 +267,13 @@ straight to the halted task or the timer IRQ saves that frame and switches to
 another task. A blocked task is off the run queue, so when nothing else is
 runnable the scheduler selects the idle context instead of rescheduling it.
 `wait_queue_wake_all` is called from IRQ context and marks every parked task
-runnable; waiters re-check their condition after resuming. Console reads are
-the first user of this: IRQ1 wakes them, and `SCHED-WAITQ-OK` proves that a
-read waiting for a key left the run queue and let idle run. `nanosleep` and
-`waitpid` keep their existing `TASK_SLEEPING`/`TASK_WAITING` states; the
-blocked state is deliberately separate so a child exiting cannot wake a task
-that is waiting for console input.
+runnable; waiters re-check their condition after resuming. Keyboard input is
+the first user of this: IRQ1 pushes the character into the terminal's input
+ring and wakes its readers, and `SCHED-WAITQ-OK` proves that a read waiting
+for a key left the run queue and let idle run. `nanosleep` and `waitpid` keep
+their existing `TASK_SLEEPING`/`TASK_WAITING` states; the blocked state is
+deliberately separate so a child exiting cannot wake a task that is waiting
+for console input.
 
 Writes are not atomic: there is no journal, so a failing multi-sector
 write leaves exactly its durable prefix (a short count means those bytes
@@ -335,6 +337,25 @@ mapping, a read from unmapped memory, and a store through a `munmap`ed page,
 each checked against its expected `#PF` error code (`7`, `7`, `4`, `6`). The
 blocking read is also observed to park the process (`SCHED-WAITQ-OK`) before
 the injected key arrives.
+
+### Terminal, display, and input
+
+`kernel/drivers/terminal.c` is the text-I/O layer. Output paths (`klog`, the
+exception handlers, and the console device) call `terminal_putc` /
+`terminal_write`, which render to the active display backend and mirror every
+byte to COM1 with CRLF line endings. Input is a 128-byte single-producer /
+single-consumer ring owned by the terminal: `kbd.c` translates set-1 scancodes
+and calls `terminal_input_push`, while `terminal_getchar`/`terminal_read` park
+on the terminal's wait queue until IRQ1 wakes them. Neither the keyboard
+driver nor the syscall layer knows about the other.
+
+Display backends implement the shared `display_ops_t` table in
+`kernel/drivers/display.h` (`name`, `clear`, `putc`, `status`). The VGA text
+backend is selected at boot and stays the fallback; when the bootloader
+hands over a usable VBE mode, `framebuffer_init` succeeds and the boot path
+switches the active backend with `display_use(&framebuffer_display)`. Backend
+state is protected with IRQ-save spinlocks because the timer redraws the
+status line from interrupt context.
 
 ### ATA PIO and FAT12
 
@@ -410,11 +431,11 @@ The locking rules per subsystem:
   the lock first because it may block. `ofd_release` does not lock — callers
   hold `vfs_lock`.
 - **Drivers**: `kernel/drivers/ata.c` uses a task-context spinlock around the polling
-  transfers; `kernel/arch/x86/kernel/kbd.c` uses an IRQ-save pair around the
-  ring-buffer poll (single-producer IRQ1, single-consumer task) and parks
-  console readers on an IRQ-safe wait queue that IRQ1 wakes;
-  `kernel/drivers/console.c` protects VGA/UART state with IRQ-save spinlocks
-  because `klog` may run from interrupt context.
+  transfers; `kernel/arch/x86/kernel/kbd.c` only translates scancodes and
+  forwards them to `terminal.c`, which owns the input ring (single-producer
+  IRQ1, single-consumer task) and the IRQ-safe wait queue; `terminal.c`
+  serializes output through the display and UART backends, which use IRQ-save
+  spinlocks because `klog` may run from interrupt context.
 
 Locks are non-recursive; the only ordering rule is VFS → backend, never the
 reverse.
@@ -475,7 +496,11 @@ Haku/
                         test programs (syscall, spawn/waitpid, protection
                         faults, execve coverage)
     drivers/            ata.c/.h: primary-master ATA LBA28 polling PIO
-                        console.c/.h: VGA text + COM1 serial
+                        terminal.c/.h: text-I/O layer (output + input ring)
+                        display.c/.h: shared display backend API
+                        vga_text.c/.h: VGA text backend (fallback)
+                        framebuffer.c/.h: VBE framebuffer text backend
+                        serial.c/.h: COM1 output backend
     fs/
       fat12/            fat12.c/.h: writable FAT12 files, subdirectories, paths
                         fat12_vfs.c/.h: FAT12 vfs_fs_ops backend + errno mapping
@@ -486,7 +511,7 @@ Haku/
                         sync.c/.h: spinlocks and IRQ-save locks + locking rules
                         usermode.c/.h: user mappings, syscall ABI, brk/mmap/munmap
                         getusage
-                        klog.c/.h: timestamped console logging
+                        klog.c/.h: timestamped terminal logging
                         heap.c/.h: kernel kmalloc/kfree allocator
   include/haku/         abi.h + abi.inc: shared user/kernel ABI constants
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)

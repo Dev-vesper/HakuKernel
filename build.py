@@ -494,6 +494,7 @@ def main():
             "PIC-OK",        # 8259 remapped to 0x20/0x28
             "PIT-OK",        # 100 Hz timer programmed
             "KBD-OK",        # PS/2 keyboard IRQ1 handler installed
+            "TERMINAL-OK",   # terminal/display abstraction selected a backend
             "T+1s",          # hardware timer IRQs arriving
             "T+2s",
             "T+3s",

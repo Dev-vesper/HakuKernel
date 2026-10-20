@@ -5,7 +5,6 @@
  * limited to the first 8 MiB identity window.
  */
 #include "frame.h"
-#include "console.h"
 #include "heap.h"
 #include "klog.h"
 #include "paging.h"

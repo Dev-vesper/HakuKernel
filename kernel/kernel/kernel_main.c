@@ -5,7 +5,7 @@
  * later commits, once pic.c remaps the 8259).
  */
 #include "cpu.h"
-#include "console.h"
+#include "display.h"
 #include "framebuffer.h"
 #include "heap.h"
 #include "idt.h"
@@ -16,10 +16,11 @@
 #include "pic.h"
 #include "pit.h"
 #include "gdt.h"
+#include "terminal.h"
 #include "usermode.h"
 
 void kernel_main(void) {
-    console_init();
+    terminal_init();
 
     /* Boot banner, Linux-dmesg style. Markers stay inside the lines as
      * subsystem tags: qemu -serial file:serial.log is grepped for them. */
@@ -91,6 +92,7 @@ void kernel_main(void) {
      * with the VBE BIOS calls; map it and draw the console there. Without
      * one the VGA text buffer stays in use. */
     if (framebuffer_init()) {
+        display_use(&framebuffer_display);
         klog_prefix();
         klog_write("FB-OK: vbe linear framebuffer ");
         klog_dec(framebuffer_width());
@@ -101,6 +103,11 @@ void kernel_main(void) {
         klog_prefix();
         klog_write("FB-SKIP: no usable linear framebuffer, VGA text retained\n");
     }
+
+    klog_prefix();
+    klog_write("TERMINAL-OK: text backend=");
+    klog_write(display_name());
+    klog_write("\n");
 
     if (!gdt_init()) {
         klog_prefix();

@@ -169,10 +169,15 @@ leaks or page-table corruption.
 
 ### 5. Hardware and User Experience
 
-- [ ] Define a terminal and text-I/O abstraction, separating keyboard input
-  from syscalls and display backends.
-- [ ] Add framebuffer support only with a boot protocol or safe discovery of
-  the framebuffer mode and memory; retain VGA text as a fallback.
+- [x] Define a terminal and text-I/O abstraction, separating keyboard input
+  from syscalls and display backends (`kernel/drivers/terminal.c/.h` owns the
+  output path and the input ring/wait queue; `kbd.c` only translates scancodes;
+  the VFS console device forwards to `terminal_read`/`terminal_write_bytes`).
+- [x] Add framebuffer support only with a boot protocol or safe discovery of
+  the framebuffer mode and memory; retain VGA text as a fallback
+  (`display.h` defines the shared `display_ops_t` API implemented by
+  `vga_text.c` and `framebuffer.c`; the boot path selects the framebuffer
+  backend after `framebuffer_init` succeeds, otherwise VGA text stays active).
 - [ ] Improve ATA timeout and recovery behavior and support more devices or
   controllers; consider IRQ/DMA instead of PIO polling if required.
 - [ ] Add leveled logging, a panic handler, and useful crash reports in QEMU.

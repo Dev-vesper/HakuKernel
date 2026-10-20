@@ -7,7 +7,6 @@
  * The first block spans [HEAP_START, HEAP_END) and starts as FREE.
  */
 #include "heap.h"
-#include "console.h"
 #include "klog.h"
 #include "sync.h"
 

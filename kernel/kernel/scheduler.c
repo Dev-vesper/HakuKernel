@@ -1,5 +1,4 @@
 #include "scheduler.h"
-#include "console.h"
 #include "frame.h"
 #include "fs_test.h"
 #include "gdt.h"

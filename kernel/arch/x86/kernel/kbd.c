@@ -3,32 +3,21 @@
  * Set-1 scancodes are what the BIOS leaves the controller in after POST.
  * Bit 7 is set on "break" (key-up); everything else is "make" (key-down).
  * We track shift and caps-lock, translate through two lookup tables
- * (unshifted / shifted US layout), and push into a small ring buffer.
+ * (unshifted / shifted US layout), and hand the character to the terminal.
+ *
+ * The driver owns no input queue and no wait queue: it is a pure character
+ * source for the terminal layer (drivers/terminal.c).
  */
-#include "console.h"
 #include "idt.h"
 #include "kbd.h"
 #include "pic.h"
-#include "scheduler.h"
-#include "sync.h"
+#include "terminal.h"
 
-#define KBD_DATA_PORT   0x60
-#define KBD_STATUS_PORT 0x64
-
-/* Ring buffer (power of two). 128 chars is plenty for interactive use. */
-#define KBD_BUF_SIZE 128u
-static volatile uint8_t kbd_buf[KBD_BUF_SIZE];
-static volatile uint32_t kbd_head = 0;
-static volatile uint32_t kbd_tail = 0;
+#define KBD_DATA_PORT 0x60
 
 /* Modifier state. */
 static volatile int shift_down = 0;
 static volatile int caps_lock = 0;
-
-/* Console readers park here while the ring buffer is empty. The producer
- * (IRQ1) wakes them; a line-oriented caller simply re-parks after each
- * byte until it sees a newline. */
-static wait_queue_t kbd_waiters = WAIT_QUEUE_INIT;
 
 /* ------------------------------------------------------------------ */
 /* Set-1 scancode -> ASCII tables (US layout, indices 0x00..0x3F).     */
@@ -55,49 +44,6 @@ static const char scancode_map_shift[0x40] = {
     'B',  'N',  'M',  '<',  '>',  '?',  0,    '*',   /* 0x30-0x37 */
     0,    ' ',  0,    0,    0,    0,    0,    0,     /* 0x38-0x3F */
 };
-
-/* ------------------------------------------------------------------ */
-/* Ring buffer helpers (single-producer: IRQ1; single-consumer: task). */
-/* ------------------------------------------------------------------ */
-static void kbd_push(uint8_t ch) {
-    uint32_t next = (kbd_head + 1) & (KBD_BUF_SIZE - 1);
-    if (next == kbd_tail) return; /* buffer full, drop */
-    kbd_buf[kbd_head] = ch;
-    kbd_head = next;
-}
-
-int kbd_poll(void) {
-    if (kbd_head == kbd_tail) return -1;
-    uint8_t ch = kbd_buf[kbd_tail];
-    kbd_tail = (kbd_tail + 1) & (KBD_BUF_SIZE - 1);
-    return (int)ch;
-}
-
-int kbd_has_char(void) {
-    return kbd_head != kbd_tail;
-}
-
-char kbd_getchar(void) {
-    for (;;) {
-        irqflags_t flags = irq_lock();
-        int c = kbd_poll();
-        if (c >= 0) {
-            wait_queue_cancel(&kbd_waiters);
-            irq_unlock(flags);
-            return (char)c;
-        }
-        /* No byte queued: leave the run queue instead of spinning. IRQs
-         * are still masked here, so no key can arrive between the empty
-         * poll and the sleep; sti's interrupt shadow then makes the
-         * sti/hlt pair atomic, so either IRQ1 wakes us immediately or the
-         * timer parks the task and runs another one. */
-        wait_queue_sleep(&kbd_waiters);
-        __asm {
-            sti
-            hlt
-        }
-    }
-}
 
 /* ------------------------------------------------------------------ */
 /* IRQ1 handler.                                                       */
@@ -131,11 +77,7 @@ static void kbd_irq(regs_t *r) {
     else
         ch = scancode_map[idx];
 
-    if (ch) {
-        kbd_push((uint8_t)ch);
-        /* Wake console readers parked on the input wait queue. */
-        wait_queue_wake_all(&kbd_waiters);
-    }
+    if (ch) terminal_input_push(ch);
 }
 
 /* ------------------------------------------------------------------ */

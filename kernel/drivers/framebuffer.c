@@ -93,6 +93,15 @@ static void fb_fill(uint32_t x0, uint32_t y0, uint32_t w, uint32_t h,
             fb_put_pixel(x, y, color);
 }
 
+/* The signature block is the handshake the headless screendump checks for.
+ * It lives in the unused second status row at the far right, so neither the
+ * text area nor the status text can overwrite it. */
+static void fb_draw_signature(void) {
+    if (fb_status_y + FB_CHAR_HEIGHT + 2u <= fb_height && fb_width >= 16u)
+        fb_fill(fb_width - 16u, fb_status_y + FB_CHAR_HEIGHT, 16u, 2u,
+                fb_signature);
+}
+
 /* --- text -------------------------------------------------------------- */
 
 static void fb_draw_glyph(uint32_t col, uint32_t row, char c) {
@@ -218,6 +227,27 @@ void framebuffer_status(const char *text) {
     spin_unlock_irqrestore(&fb_lock, flags);
 }
 
+/* display.h clear backend: the framebuffer owns its own palette. */
+static void fb_console_clear(uint8_t color) {
+    irqflags_t flags;
+
+    (void)color;
+    if (!fb_ready) return;
+    flags = spin_lock_irqsave(&fb_lock);
+    fb_fill(0, 0, fb_width, fb_height, fb_bg);
+    fb_draw_signature();
+    fb_cursor_x = 0;
+    fb_cursor_y = 0;
+    spin_unlock_irqrestore(&fb_lock, flags);
+}
+
+const display_ops_t framebuffer_display = {
+    "framebuffer",
+    fb_console_clear,
+    framebuffer_putc,
+    framebuffer_status,
+};
+
 int framebuffer_init(void) {
     const fb_handover_t *handover =
         (const fb_handover_t *)(uint32_t)FB_HANDOVER_PHYS;
@@ -286,11 +316,6 @@ int framebuffer_init(void) {
 
 
     fb_fill(0, 0, fb_width, fb_height, fb_bg);
-    /* The signature block is the handshake the headless screendump checks
-     * for. It lives in the unused second status row at the far right, so
-     * neither the text area nor the status text can overwrite it. */
-    if (fb_status_y + FB_CHAR_HEIGHT + 2u <= fb_height && fb_width >= 16u)
-        fb_fill(fb_width - 16u, fb_status_y + FB_CHAR_HEIGHT, 16u, 2u,
-                fb_signature);
+    fb_draw_signature();
     return 1;
 }

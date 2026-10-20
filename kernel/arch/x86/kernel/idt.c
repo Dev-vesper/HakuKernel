@@ -4,7 +4,7 @@
  * pic.c remaps the 8259 there), 48..255 point at a catch-all that reports
  * and halts instead of triple-faulting into a reboot loop.
  */
-#include "console.h"
+#include "terminal.h"
 #include "idt.h"
 #include "klog.h"
 #include "paging.h"
@@ -101,13 +101,13 @@ static void halt(void) {
 static regs_t *abort_user(regs_t *r) {
     uint32_t status = 0x80u | (r->int_no == 14 ? (r->err_code & 0x7Fu)
                                                : (r->int_no & 0x7Fu));
-    vga_write("USER exception vector=");
-    vga_dec(r->int_no);
-    vga_write(" err=");
-    vga_hex(r->err_code);
-    vga_write(" eip=");
-    vga_hex(r->eip);
-    vga_write("\nTerminating process.\n");
+    terminal_write("USER exception vector=");
+    terminal_dec(r->int_no);
+    terminal_write(" err=");
+    terminal_hex(r->err_code);
+    terminal_write(" eip=");
+    terminal_hex(r->eip);
+    terminal_write("\nTerminating process.\n");
     klog_prefix();
     klog_write("USER-FAULT: vector=");
     klog_dec(r->int_no);
@@ -144,11 +144,11 @@ regs_t *isr_handler(regs_t *r) {
          * (The bit layout of err_code is Intel SDM vol 3: P=bit0,
          * W/R=bit1, U/S=bit2.) */
         uint32_t addr = paging_get_cr2();
-        vga_write("PAGE FAULT at ");
-        vga_hex(addr);
-        vga_write(" err=");
-        vga_hex(r->err_code);
-        vga_write("\nSystem halted.\n");
+        terminal_write("PAGE FAULT at ");
+        terminal_hex(addr);
+        terminal_write(" err=");
+        terminal_hex(r->err_code);
+        terminal_write("\nSystem halted.\n");
         klog_prefix();
         klog_write("PFAULT-OK: addr=");
         klog_hex(addr);
@@ -159,20 +159,20 @@ regs_t *isr_handler(regs_t *r) {
         return r;
     }
     if (r->int_no == 255) {
-        vga_write("UNEXPECTED INTERRUPT, halting\n");
+        terminal_write("UNEXPECTED INTERRUPT, halting\n");
         klog_prefix();
         klog_write("EXC-FF-UNEXPECTED: halting\n");
         halt();
         return r;
     }
     const char *name = r->int_no < 32 ? exc_names[r->int_no] : "???";
-    vga_write("CPU EXCEPTION: ");
-    vga_write(name);
-    vga_write(" err=");
-    vga_hex(r->err_code);
-    vga_write(" eip=");
-    vga_hex(r->eip);
-    vga_write("\nSystem halted.\n");
+    terminal_write("CPU EXCEPTION: ");
+    terminal_write(name);
+    terminal_write(" err=");
+    terminal_hex(r->err_code);
+    terminal_write(" eip=");
+    terminal_hex(r->eip);
+    terminal_write("\nSystem halted.\n");
     klog_prefix();
     klog_write("CPU-EXCEPTION ");
     klog_write(name);
@@ -211,7 +211,7 @@ regs_t *irq_handler(regs_t *r) {
         klog_hex(irq);
         klog_write("\n");
     } else {
-        vga_write("Unexpected IRQ\n");
+        terminal_write("Unexpected IRQ\n");
         klog_prefix();
         klog_write("IRQ-UNEXPECTED ");
         klog_hex(irq);

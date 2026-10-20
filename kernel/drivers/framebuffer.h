@@ -10,6 +10,7 @@
 #define HAKU_FRAMEBUFFER_H
 
 #include "cpu.h"
+#include "display.h"
 
 /* Handover record left by stage 2 at physical 0x6FC0 (little-endian). */
 #define FB_HANDOVER_PHYS   0x6FC0u
@@ -31,5 +32,8 @@ void framebuffer_putc(char c);
 void framebuffer_status(const char *text);
 uint32_t framebuffer_width(void);
 uint32_t framebuffer_height(void);
+
+/* display.h backend table; selected once framebuffer_init() succeeds. */
+extern const display_ops_t framebuffer_display;
 
 #endif

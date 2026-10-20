@@ -1,0 +1,68 @@
+/* Haku VGA text display backend.
+ *
+ * Used from task and interrupt context (the timer redraws the status line
+ * from IRQ0), so cursor state is protected with an IRQ-save lock.
+ */
+#include "vga_text.h"
+#include "sync.h"
+
+static volatile uint16_t *const VGA = (uint16_t *)0xB8000;
+static uint8_t vga_row = 0;
+static uint8_t vga_col = 0;
+static uint8_t vga_color = 0x0F; /* bright white on black */
+static spinlock_t vga_lock = SPINLOCK_INIT;
+
+static void vga_scroll(void) {
+    memmove((void *)VGA, (void *)(VGA + VGA_COLS),
+            (VGA_ROWS - 1) * VGA_COLS * sizeof(uint16_t));
+    uint16_t blank = (uint16_t)((vga_color << 8) | ' ');
+    for (int x = 0; x < VGA_COLS; x++)
+        VGA[(VGA_ROWS - 1) * VGA_COLS + x] = blank;
+    vga_row = VGA_ROWS - 1;
+}
+
+static void vga_clear(uint8_t color) {
+    uint16_t blank = (uint16_t)((color << 8) | ' ');
+    irqflags_t flags = spin_lock_irqsave(&vga_lock);
+    for (int i = 0; i < VGA_COLS * VGA_ROWS; i++)
+        VGA[i] = blank;
+    vga_row = 0;
+    vga_col = 0;
+    vga_color = color;
+    spin_unlock_irqrestore(&vga_lock, flags);
+}
+
+static void vga_putc(char c) {
+    irqflags_t flags = spin_lock_irqsave(&vga_lock);
+    if (c == '\n') {
+        vga_col = 0;
+        if (++vga_row >= VGA_ROWS) vga_scroll();
+        spin_unlock_irqrestore(&vga_lock, flags);
+        return;
+    }
+    VGA[vga_row * VGA_COLS + vga_col] =
+        (uint16_t)((vga_color << 8) | (uint8_t)c);
+    if (++vga_col >= VGA_COLS) {
+        vga_col = 0;
+        if (++vga_row >= VGA_ROWS) vga_scroll();
+    }
+    spin_unlock_irqrestore(&vga_lock, flags);
+}
+
+/* Draw a short status string at the top-right corner (overwrites in place). */
+static void vga_status(const char *s) {
+    size_t len = strlen(s);
+    if (len > VGA_COLS) len = VGA_COLS;
+    irqflags_t flags = spin_lock_irqsave(&vga_lock);
+    for (size_t i = 0; i < len; i++)
+        VGA[(VGA_COLS - len) + i] =
+            (uint16_t)(((uint16_t)0x0E << 8) | (uint8_t)s[i]); /* yellow */
+    spin_unlock_irqrestore(&vga_lock, flags);
+}
+
+const display_ops_t vga_text_display = {
+    "vga-text",
+    vga_clear,
+    vga_putc,
+    vga_status,
+};

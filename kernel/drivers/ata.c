@@ -1,5 +1,4 @@
 #include "ata.h"
-#include "console.h"
 #include "klog.h"
 #include "sync.h"
 

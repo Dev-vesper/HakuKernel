@@ -1,0 +1,39 @@
+/* Haku terminal: the text-I/O abstraction between userspace, the keyboard
+ * driver, and the display backends.
+ *
+ * Output goes to the active display (display.h) and is mirrored to COM1 with
+ * CRLF line endings. Input is pushed here by the keyboard IRQ; the terminal
+ * owns the byte ring and the wait queue, so neither the PS/2 driver nor the
+ * syscall layer knows about the other.
+ */
+#ifndef HAKU_TERMINAL_H
+#define HAKU_TERMINAL_H
+
+#include "cpu.h"
+
+#define TERMINAL_BUF_SIZE 128u
+
+/* Serial, display, and input state. Call once from the boot path. */
+void terminal_init(void);
+
+/* Output. Safe from task and interrupt context. */
+void terminal_putc(char c);
+void terminal_write(const char *s);
+void terminal_hex(uint32_t v);
+void terminal_dec(uint32_t v);
+void terminal_corner(const char *s);
+
+/* Console device operations (VFS fd 0/1/2). read() returns after a newline
+ * or count bytes; write() mirrors to the display and COM1. */
+int32_t terminal_read(void *buffer, uint32_t count, uint32_t *out_count);
+int32_t terminal_write_bytes(const void *buffer, uint32_t count,
+                             uint32_t *out_count);
+
+/* Input producer: called from the keyboard IRQ handler. */
+void terminal_input_push(char c);
+/* Non-blocking consume; -1 when the ring is empty. */
+int terminal_input_poll(void);
+/* Block until a character is available. */
+char terminal_getchar(void);
+
+#endif
