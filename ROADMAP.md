@@ -180,7 +180,12 @@ leaks or page-table corruption.
   backend after `framebuffer_init` succeeds, otherwise VGA text stays active).
 - [ ] Improve ATA timeout and recovery behavior and support more devices or
   controllers; consider IRQ/DMA instead of PIO polling if required.
-- [ ] Add leveled logging, a panic handler, and useful crash reports in QEMU.
+- [x] Add leveled logging, a panic handler, and useful crash reports in QEMU
+  (`klog` exposes DEBUG/INFO/WARN/ERROR/CRIT with an INFO threshold and a
+  filtering self-test; `panic.c` halts on fatal faults and boot failures;
+  `crash.c` prints CR0/CR2/CR3, the exception frame, registers, and the
+  validated stack to the display and `build/serial.log`; ring-3 faults reuse
+  the report without halting the kernel).
 
 **Acceptance criteria:** The system remains diagnosable without graphics;
 display backends use a shared API, and missing framebuffer support does not

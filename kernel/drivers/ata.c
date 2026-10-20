@@ -57,8 +57,7 @@ static int ata_init_unlocked(void) {
     status = inb(ATA_STATUS);
     if (status == 0 || status == 0xFFu ||
         !wait_status(ATA_SR_DRQ)) {
-        klog_prefix();
-        klog_write("ATA-FAIL: identify primary master\n");
+        klog_log(KLOG_ERROR, "ATA-FAIL: identify primary master\n");
         return 0;
     }
 
@@ -66,15 +65,13 @@ static int ata_init_unlocked(void) {
         identify_words[i] = inw(ATA_DATA);
 
     if (!(identify_words[49] & (1u << 9))) {
-        klog_prefix();
-        klog_write("ATA-FAIL: LBA unsupported\n");
+        klog_log(KLOG_ERROR, "ATA-FAIL: LBA unsupported\n");
         return 0;
     }
     primary_master_sectors = (uint32_t)identify_words[60] |
                              ((uint32_t)identify_words[61] << 16);
     if (!primary_master_sectors) {
-        klog_prefix();
-        klog_write("ATA-FAIL: empty LBA capacity\n");
+        klog_log(KLOG_ERROR, "ATA-FAIL: empty LBA capacity\n");
         return 0;
     }
 
@@ -112,12 +109,13 @@ static int ata_read_sectors_unlocked(uint32_t lba, uint8_t count, void *buffer) 
         outb(ATA_LBA_HIGH, (uint8_t)(current_lba >> 16));
         outb(ATA_COMMAND, 0x20u); /* READ SECTORS, one sector */
         if (!wait_status(ATA_SR_DRQ)) {
-            klog_prefix();
-            klog_write("ATA-READ-FAIL: lba=");
-            klog_dec(current_lba);
-            klog_write(" error=");
-            klog_hex(inb(ATA_ERROR));
-            klog_write("\n");
+            if (klog_begin(KLOG_ERROR)) {
+                klog_write("ATA-READ-FAIL: lba=");
+                klog_dec(current_lba);
+                klog_write(" error=");
+                klog_hex(inb(ATA_ERROR));
+                klog_write("\n");
+            }
             return 0;
         }
 
@@ -128,10 +126,11 @@ static int ata_read_sectors_unlocked(uint32_t lba, uint8_t count, void *buffer) 
                 (uint8_t)(value >> 8);
         }
         if (!wait_status(0)) {
-            klog_prefix();
-            klog_write("ATA-READ-FAIL: completion lba=");
-            klog_dec(current_lba);
-            klog_write("\n");
+            if (klog_begin(KLOG_ERROR)) {
+                klog_write("ATA-READ-FAIL: completion lba=");
+                klog_dec(current_lba);
+                klog_write("\n");
+            }
             return 0;
         }
     }
@@ -166,12 +165,13 @@ static int ata_write_sectors_unlocked(uint32_t lba, uint8_t count,
         outb(ATA_LBA_HIGH, (uint8_t)(current_lba >> 16));
         outb(ATA_COMMAND, 0x30u); /* WRITE SECTORS, one sector */
         if (!wait_status(ATA_SR_DRQ)) {
-            klog_prefix();
-            klog_write("ATA-WRITE-FAIL: lba=");
-            klog_dec(current_lba);
-            klog_write(" error=");
-            klog_hex(inb(ATA_ERROR));
-            klog_write("\n");
+            if (klog_begin(KLOG_ERROR)) {
+                klog_write("ATA-WRITE-FAIL: lba=");
+                klog_dec(current_lba);
+                klog_write(" error=");
+                klog_hex(inb(ATA_ERROR));
+                klog_write("\n");
+            }
             return 0;
         }
 
@@ -182,10 +182,11 @@ static int ata_write_sectors_unlocked(uint32_t lba, uint8_t count,
             outw(ATA_DATA, value);
         }
         if (!wait_status(0)) {
-            klog_prefix();
-            klog_write("ATA-WRITE-FAIL: completion lba=");
-            klog_dec(current_lba);
-            klog_write("\n");
+            if (klog_begin(KLOG_ERROR)) {
+                klog_write("ATA-WRITE-FAIL: completion lba=");
+                klog_dec(current_lba);
+                klog_write("\n");
+            }
             return 0;
         }
     }

@@ -80,33 +80,30 @@ int usermode_init(void) {
      * speaks the vfs_* interface from here on. */
     vfs_init();
     if (!vfs_register_device(&console_device)) {
-        klog_prefix();
-        klog_write("VFS-DEVICE-FAIL: console device registration\n");
+        klog_log(KLOG_ERROR, "VFS-DEVICE-FAIL: console device registration\n");
         return 0;
     }
     if (!vfs_register_fs(&fat12_fs_ops)) {
-        klog_prefix();
-        klog_write("VFS-FS-FAIL: FAT12 filesystem registration\n");
+        klog_log(KLOG_ERROR, "VFS-FS-FAIL: FAT12 filesystem registration\n");
         return 0;
     }
     if (vfs_mount_root("fat12") != 1) {
-        klog_prefix();
-        klog_write("VFS-MOUNT-FAIL: FAT12 root mount\n");
+        klog_log(KLOG_ERROR, "VFS-MOUNT-FAIL: FAT12 root mount\n");
         return 0;
     }
     image = (uint8_t *)kmalloc(USER_ELF_MAX_SIZE);
     if (!image) {
-        klog_prefix();
-        klog_write("ELF-DISK-FAIL: kernel heap exhausted\n");
+        klog_log(KLOG_ERROR, "ELF-DISK-FAIL: kernel heap exhausted\n");
         return 0;
     }
     read_result = fat12_read_file("HAKU.ELF", image, USER_ELF_MAX_SIZE,
                                   &image_size);
     if (read_result != 1) {
-        klog_prefix();
-        klog_write("ELF-DISK-FAIL: HAKU.ELF read error=");
-        klog_dec((uint32_t)-read_result);
-        klog_write("\n");
+        if (klog_begin(KLOG_ERROR)) {
+            klog_write("ELF-DISK-FAIL: HAKU.ELF read error=");
+            klog_dec((uint32_t)-read_result);
+            klog_write("\n");
+        }
         kfree(image);
         return 0;
     }
@@ -116,14 +113,13 @@ int usermode_init(void) {
     klog_write("\n");
 
     if (!elf_rejection_self_test(image, image_size)) {
-        klog_prefix();
-        klog_write("ELF-REJECT-FAIL: bad image accepted\n");
+        klog_log(KLOG_ERROR, "ELF-REJECT-FAIL: bad image accepted\n");
         kfree(image);
         return 0;
     }
     if (!elf_load_executable(image, image_size, &initial_program)) {
-        klog_prefix();
-        klog_write("ELF-LOAD-FAIL: invalid or unsupported ELF32 image\n");
+        klog_log(KLOG_ERROR,
+                 "ELF-LOAD-FAIL: invalid or unsupported ELF32 image\n");
         kfree(image);
         return 0;
     }
@@ -139,8 +135,8 @@ int usermode_init(void) {
     klog_hex(initial_program.user_stack);
     klog_write("\n");
     if (!scheduler_init(&initial_program)) {
-        klog_prefix();
-        klog_write("SCHED-INIT-FAIL: could not start initial process\n");
+        klog_log(KLOG_ERROR,
+                 "SCHED-INIT-FAIL: could not start initial process\n");
         paging_destroy_user_space(&initial_program.address_space);
         return 0;
     }

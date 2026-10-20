@@ -67,6 +67,7 @@ typedef struct {
 void paging_init(void);        /* zero tables, install PDE0 + 1024 identity PTEs */
 void paging_enable(void);      /* load CR3, set CR0.PG (call with IRQs off) */
 int paging_is_enabled(void);   /* CR0.PG bit test */
+uint32_t paging_get_cr0(void); /* raw CR0 (panic reports) */
 uint32_t paging_get_cr3(void); /* raw CR3 (== PAGING_DIR_PHYS after enable) */
 uint32_t paging_get_cr2(void); /* fault address (for the #PF handler) */
 void paging_flush_all(void);   /* reload CR3: full TLB flush (Linux flush_tlb_all) */

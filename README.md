@@ -323,8 +323,9 @@ rejects unmapped/kernel pointers, wraparound, invalid descriptors and
 oversized I/O. The syscall entry enables interrupts while in kernel code so
 blocking keyboard reads can make progress; the keyboard wait is atomic
 against the interrupt/wakeup race. Ring-3 page faults are contained and
-reported rather than halting the kernel: the fault handler logs the vector,
-error code, and `CR2`, encodes the error code in the exit status byte
+reported rather than halting the kernel: the fault handler prints a crash
+report (vector, error code, `CR2`, control registers, general registers, and
+the validated user stack), encodes the error code in the exit status byte
 (`0x80 | err`), and terminates only the faulting process. These syscalls are an
 initial POSIX-inspired kernel interface, not full POSIX conformance. Run
 `python build.py headless` to test read/write/open/close/lseek/getpid/exit,
@@ -356,6 +357,33 @@ hands over a usable VBE mode, `framebuffer_init` succeeds and the boot path
 switches the active backend with `display_use(&framebuffer_display)`. Backend
 state is protected with IRQ-save spinlocks because the timer redraws the
 status line from interrupt context.
+
+### Logging, panic, and crash reports
+
+`kernel/kernel/klog.c` provides five severities (`DEBUG`, `INFO`, `WARN`,
+`ERROR`, `CRIT`) with an `INFO` default threshold. `klog_log` and
+`klog_begin` add the tag and honour `klog_set_level`; the plain
+`klog_write`/`klog_prefix` path stays unconditional for boot markers and
+test output. `klog_self_test` proves that `DEBUG` is suppressed at the
+default threshold and appears after lowering it (`KLOG-LEVELS-OK`).
+
+`kernel/kernel/panic.c` is the fatal path. It disables interrupts, prints
+`KERNEL PANIC: <reason>`, and calls `crash_report` (`kernel/kernel/crash.c`),
+which dumps `CR0`/`CR2`/`CR3`, the current pid, the exception frame
+(`vector`, `err`, `eip`, `cs`, `eflags`), the general registers, segment
+registers, and the interrupted stack. Ring-0 stacks are dumped directly;
+ring-3 stacks are dumped only after `paging_user_range_valid` confirms they
+are mapped, so a bad user stack cannot fault the reporter. The CPU is then
+parked in `cli; hlt`. Boot self-test failures (`PAGING`, `HEAP`, `FRAME`,
+`GDT`, `usermode`) and fatal kernel exceptions use the same handler.
+
+Contained ring-3 faults use the same report but terminate only the faulting
+process, and the first one logs `CRASH-REPORT-OK`. QEMU captures the report
+in `build/serial.log`; `build.py` also passes `-d int,cpu_reset` and writes
+`build/qemu.log`, and a headless run fails if `KERNEL PANIC` appears. To
+exercise the panic path without changing code, boot with a QEMU monitor and
+send `nmi` while the idle loop is running: the serial log then shows
+`KERNEL PANIC: NMI` followed by the `PANIC:` register and stack dump.
 
 ### ATA PIO and FAT12
 
@@ -511,7 +539,9 @@ Haku/
                         sync.c/.h: spinlocks and IRQ-save locks + locking rules
                         usermode.c/.h: user mappings, syscall ABI, brk/mmap/munmap
                         getusage
-                        klog.c/.h: timestamped terminal logging
+                        klog.c/.h: timestamped, leveled terminal logging
+                        panic.c/.h: fatal handler + halted state message
+                        crash.c/.h: register/MMU/stack crash reports
                         heap.c/.h: kernel kmalloc/kfree allocator
   include/haku/         abi.h + abi.inc: shared user/kernel ABI constants
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
@@ -537,7 +567,8 @@ Haku/
   asks the linker for `__isr0`.
 - **QEMU triple-faults / reboots** — run `python build.py headless` and read
   `build/serial.log`; no `HAKU-BOOT-OK` means the kernel never started
-  (check disk load / GDT / entry address).
+  (check disk load / GDT / entry address). A `KERNEL PANIC:` line is followed
+  by the crash report and `build/qemu.log` has the exception trace.
 - **NASM not found** — install it, then open a fresh terminal (PATH refresh).
 - **kernel exceeds 448 KiB** — the stage-2 loader deliberately stops below
   the bootstrap stack. Move to a memory-backed or later-stage loading design

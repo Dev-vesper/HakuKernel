@@ -215,8 +215,7 @@ done:
         klog_dec(heap_free_bytes());
         klog_write("\n");
     } else {
-        klog_prefix();
-        klog_write("HEAP-FAIL: self-test FAIL\n");
+        klog_log(KLOG_ERROR, "HEAP-FAIL: self-test FAIL\n");
     }
     return pass;
 }

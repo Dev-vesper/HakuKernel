@@ -89,6 +89,15 @@ int paging_is_enabled(void) {
     return (v & CR0_PG_BIT) != 0;
 }
 
+uint32_t paging_get_cr0(void) {
+    uint32_t v;
+    __asm {
+        mov eax, cr0
+        mov v, eax
+    }
+    return v;
+}
+
 uint32_t paging_get_cr3(void) {
     uint32_t v;
     __asm {

@@ -1,8 +1,8 @@
 /* Haku v0.1 — kernel entry point (32-bit protected mode, ring 0).
  *
  * The bootloader has loaded us at 0x10000 with flat segments and a valid
- * stack. From here: console -> IDT -> self-test -> halt (IRQs arrive in
- * later commits, once pic.c remaps the 8259).
+ * stack. From here: terminal -> IDT -> paging/heap/frame -> display ->
+ * GDT+TSS -> usermode -> scheduler; fatal setup failures go through panic().
  */
 #include "cpu.h"
 #include "display.h"
@@ -13,6 +13,7 @@
 #include "klog.h"
 #include "paging.h"
 #include "frame.h"
+#include "panic.h"
 #include "pic.h"
 #include "pit.h"
 #include "gdt.h"
@@ -24,18 +25,17 @@ void kernel_main(void) {
 
     /* Boot banner, Linux-dmesg style. Markers stay inside the lines as
      * subsystem tags: qemu -serial file:serial.log is grepped for them. */
-    klog_prefix();
-    klog_write("Haku version 0.1 (i386) #1 HAKU-BOOT-OK\n");
-    klog_prefix();
-    klog_write("Command line: console=ttyS0 video=vga cpu=386+ mode=protected\n");
+    klog_log(KLOG_INFO,
+             "Haku version 0.1 (i386) #1 HAKU-BOOT-OK\n");
+    klog_log(KLOG_INFO,
+             "Command line: console=ttyS0 video=vga cpu=386+ mode=protected\n");
+    klog_self_test();
 
     idt_init();
-    klog_prefix();
-    klog_write("IDT-OK: 48 gates loaded (32 exceptions + 16 IRQs)\n");
+    klog_log(KLOG_INFO, "IDT-OK: 48 gates loaded (32 exceptions + 16 IRQs)\n");
 
     __asm int 3 /* #BP self-test: the handler prints, then we resume here */
-    klog_prefix();
-    klog_write("INT3-RESUMED: resumed after breakpoint self-test\n");
+    klog_log(KLOG_INFO, "INT3-RESUMED: resumed after breakpoint self-test\n");
 
     /* Paging (Linux-style: traps are up before the MMU, IRQs still off
      * since stage2's cli — same ordering as Linux trap_init/long-mode
@@ -44,11 +44,7 @@ void kernel_main(void) {
     paging_init();
     paging_enable();
     if (!paging_is_enabled() || paging_get_cr3() != PAGING_DIR_PHYS) {
-        klog_prefix();
-        klog_write("PAGING-FAIL: MMU did not enable, halting\n");
-        for (;;) {
-            __asm hlt
-        }
+        panic("PAGING-FAIL: MMU did not enable");
     }
     {   /* R/W probe through the tables: low RAM, 3 MiB, 7 MiB. */
         volatile uint32_t *p1 = (volatile uint32_t *)0x2000u;
@@ -58,24 +54,19 @@ void kernel_main(void) {
         *p2 = 0xA5A5A5A5u;
         *p3 = 0x5A5A5A5Au;
         if (*p1 != 0x12345678u || *p2 != 0xA5A5A5A5u || *p3 != 0x5A5A5A5Au) {
-            klog_prefix();
-            klog_write("PAGING-FAIL: R/W probe mismatch, halting\n");
-            for (;;) {
-                __asm hlt
-            }
+            panic("PAGING-FAIL: R/W probe mismatch");
         }
     }
-    klog_prefix();
-    klog_write("PAGING-OK: 8MB identity + 128MB direct map, cr3=");
-    klog_hex(paging_get_cr3());
-    klog_write(", CR0.PG on\n");
+    if (klog_begin(KLOG_INFO)) {
+        klog_write("PAGING-OK: 8MB identity + 128MB direct map, cr3=");
+        klog_hex(paging_get_cr3());
+        klog_write(", CR0.PG on\n");
+    }
 
     /* Heap: free-list allocator over the identity-mapped 1–4 MiB range. */
     heap_init();
     if (!heap_self_test()) {
-        for (;;) {
-            __asm hlt
-        }
+        panic("HEAP-FAIL: kmalloc self-test failed");
     }
 
     /* E820-backed frame inventory. Every tracked frame below 128 MiB is
@@ -83,9 +74,7 @@ void kernel_main(void) {
      * window. */
     frame_init();
     if (!frame_self_test()) {
-        for (;;) {
-            __asm hlt
-        }
+        panic("FRAME-FAIL: frame allocator self-test failed");
     }
 
     /* Framebuffer console: the bootloader discovered a linear framebuffer
@@ -93,61 +82,49 @@ void kernel_main(void) {
      * one the VGA text buffer stays in use. */
     if (framebuffer_init()) {
         display_use(&framebuffer_display);
-        klog_prefix();
-        klog_write("FB-OK: vbe linear framebuffer ");
-        klog_dec(framebuffer_width());
-        klog_write("x");
-        klog_dec(framebuffer_height());
-        klog_write(" console active\n");
+        if (klog_begin(KLOG_INFO)) {
+            klog_write("FB-OK: vbe linear framebuffer ");
+            klog_dec(framebuffer_width());
+            klog_write("x");
+            klog_dec(framebuffer_height());
+            klog_write(" console active\n");
+        }
     } else {
-        klog_prefix();
-        klog_write("FB-SKIP: no usable linear framebuffer, VGA text retained\n");
+        klog_log(KLOG_INFO,
+                 "FB-SKIP: no usable linear framebuffer, VGA text retained\n");
     }
 
-    klog_prefix();
-    klog_write("TERMINAL-OK: text backend=");
-    klog_write(display_name());
-    klog_write("\n");
+    if (klog_begin(KLOG_INFO)) {
+        klog_write("TERMINAL-OK: text backend=");
+        klog_write(display_name());
+        klog_write("\n");
+    }
 
     if (!gdt_init()) {
-        klog_prefix();
-        klog_write("GDT-FAIL: TSS initialization failed, halting\n");
-        for (;;) {
-            __asm hlt
-        }
+        panic("GDT-FAIL: TSS initialization failed");
     }
-    klog_prefix();
-    klog_write("GDT-OK: ring3 code/data loaded, TSS esp0 configured\n");
+    klog_log(KLOG_INFO, "GDT-OK: ring3 code/data loaded, TSS esp0 configured\n");
 
     if (!usermode_init()) {
-        klog_prefix();
-        klog_write("usermode setup failed, halting\n");
-        for (;;) {
-            __asm hlt
-        }
+        panic("usermode setup failed");
     }
 
     /* PS/2 keyboard on IRQ1 (US layout, shift/caps handled in irq). */
     kbd_init();
-    klog_prefix();
-    klog_write("KBD-OK: PS/2 keyboard on IRQ1, US layout (unmasked)\n");
+    klog_log(KLOG_INFO,
+             "KBD-OK: PS/2 keyboard on IRQ1, US layout (unmasked)\n");
 
     /* Remap the 8259 (IRQs were colliding with CPU exceptions 8..15),
      * start the 100 Hz timer and open IRQ0 only. */
     pic_remap(0x20, 0x28);
-    klog_prefix();
-    klog_write("PIC-OK: 8259 remapped to 0x20/0x28\n");
+    klog_log(KLOG_INFO, "PIC-OK: 8259 remapped to 0x20/0x28\n");
     pit_init(100);
-    klog_prefix();
-    klog_write("PIT-OK: 100Hz timer on IRQ0\n");
+    klog_log(KLOG_INFO, "PIT-OK: 100Hz timer on IRQ0\n");
 
     pic_clear_mask(0);
     cpu_sti();
 
-    klog_prefix();
-    klog_write("input: press one key for the read() test...\n");
+    klog_log(KLOG_INFO, "input: press one key for the read() test...\n");
     usermode_run();
-    klog_prefix();
-    klog_write("sched: returned unexpectedly, halting\n");
-    for (;;) __asm hlt
+    panic("scheduler returned unexpectedly");
 }

@@ -7,6 +7,7 @@
 #include "frame.h"
 #include "heap.h"
 #include "klog.h"
+#include "panic.h"
 #include "paging.h"
 #include "sync.h"
 
@@ -139,21 +140,13 @@ void frame_init(void) {
     volatile e820_entry_t *entries = (volatile e820_entry_t *)E820_MAP_PHYS;
 
     if (count == 0 || count > E820_MAX_ENTRIES) {
-        klog_prefix();
-        klog_write("E820-FAIL: map missing or invalid, halting\n");
-        for (;;) {
-            __asm hlt
-        }
+        panic("E820-FAIL: map missing or invalid");
     }
 
     frame_bitmap = (uint32_t *)kmalloc(FRAME_BMAP_BYTES);
     frame_usable = (uint32_t *)kmalloc(FRAME_BMAP_BYTES);
     if (!frame_bitmap || !frame_usable) {
-        klog_prefix();
-        klog_write("FRAME-FAIL: no heap for bitmaps, halting\n");
-        for (;;) {
-            __asm hlt
-        }
+        panic("FRAME-FAIL: no heap for bitmaps");
     }
     memset(frame_bitmap, 0xFF, FRAME_BMAP_BYTES);
     memset(frame_usable, 0, FRAME_BMAP_BYTES);

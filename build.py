@@ -448,6 +448,7 @@ def main():
             "IDT-OK",        # 48 IDT gates loaded
             "EXC-03-BP",     # INT3 self-test dispatched through the IDT
             "INT3-RESUMED",  # handler returned, execution resumed
+            "KLOG-LEVELS-OK",# leveled logging gates DEBUG at the INFO threshold
             "PAGING-OK",     # 8 MiB identity map, CR0.PG on, R/W probe passed
             "HEAP-OK",       # kmalloc/kfree/krealloc self-test passed
             "E820-OK",       # stage2 INT 15h map handoff verified
@@ -480,6 +481,7 @@ def main():
             "USER-DIR-OK",   # subdirectories, paths, and "."/".." resolution
             "USER-USAGE-OK", # getusage reports per-process memory and CPU counters
             "USER-PROT-OK",  # RX/read-only stores, unmapped reads, and freed pages fault
+            "CRASH-REPORT-OK", # faulted user frame dumped with registers and CRs
             "EXECVE-OK pid=1", # exec replaced the image and preserved descriptors
             "USER-EXEC-TARGET-OK", # argv/envp stack and image replacement passed
             "USER-EXIT-OK status=0 pid=1",
@@ -502,6 +504,8 @@ def main():
         missing = [m for m in expected if m not in content]
         if "EXECVE-FAIL" in content:
             missing.append("successful execve did not return an error")
+        if "KERNEL PANIC" in content:
+            missing.append("kernel panicked during the headless run")
         # The framebuffer console proves itself on the screen: when the
         # graphics mode is live the signature block the driver draws must
         # show up in the captured framebuffer.

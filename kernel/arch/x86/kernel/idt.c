@@ -4,10 +4,11 @@
  * pic.c remaps the 8259 there), 48..255 point at a catch-all that reports
  * and halts instead of triple-faulting into a reboot loop.
  */
-#include "terminal.h"
+#include "crash.h"
 #include "idt.h"
 #include "klog.h"
 #include "paging.h"
+#include "panic.h"
 #include "pic.h"
 #include "scheduler.h"
 #include "usermode.h"
@@ -91,35 +92,17 @@ void irq_install(uint8_t irq, irq_fn_t fn) {
     if (irq < 16) irq_handlers[irq] = fn;
 }
 
-static void halt(void) {
-    cpu_cli();
-    for (;;) {
-        __asm hlt
-    }
-}
+static int crash_reported = 0;
 
 static regs_t *abort_user(regs_t *r) {
     uint32_t status = 0x80u | (r->int_no == 14 ? (r->err_code & 0x7Fu)
                                                : (r->int_no & 0x7Fu));
-    terminal_write("USER exception vector=");
-    terminal_dec(r->int_no);
-    terminal_write(" err=");
-    terminal_hex(r->err_code);
-    terminal_write(" eip=");
-    terminal_hex(r->eip);
-    terminal_write("\nTerminating process.\n");
-    klog_prefix();
-    klog_write("USER-FAULT: vector=");
-    klog_dec(r->int_no);
-    klog_write(" err=");
-    klog_hex(r->err_code);
-    klog_write(" eip=");
-    klog_hex(r->eip);
-    if (r->int_no == 14) {
-        klog_write(" cr2=");
-        klog_hex(paging_get_cr2());
+    crash_report("USER-FAULT", r);
+    if (!crash_reported) {
+        crash_reported = 1;
+        klog_prefix();
+        klog_write("CRASH-REPORT-OK: user fault frame dumped\n");
     }
-    klog_write("\n");
     /* waitpid sees only the low byte of ebx shifted into the status word.
      * Mark a fault with bit 7 and carry the #PF error code (P/W/U...) or
      * the vector, so a parent can distinguish a protection fault from a
@@ -139,40 +122,23 @@ regs_t *isr_handler(regs_t *r) {
         return r;
     }
     if (r->int_no == 14) {
-        /* #PF: early-fault behaviour like Linux mm/fault.c before the
-         * full handler exists — report CR2 + error code, then halt.
-         * (The bit layout of err_code is Intel SDM vol 3: P=bit0,
-         * W/R=bit1, U/S=bit2.) */
-        uint32_t addr = paging_get_cr2();
-        terminal_write("PAGE FAULT at ");
-        terminal_hex(addr);
-        terminal_write(" err=");
-        terminal_hex(r->err_code);
-        terminal_write("\nSystem halted.\n");
+        /* #PF in kernel mode: report CR2 + error code, then panic with the
+         * full frame. (The bit layout of err_code is Intel SDM vol 3:
+         * P=bit0, W/R=bit1, U/S=bit2.) */
         klog_prefix();
         klog_write("PFAULT-OK: addr=");
-        klog_hex(addr);
+        klog_hex(paging_get_cr2());
         klog_write(" err=");
         klog_hex(r->err_code);
-        klog_write(" halting\n");
-        halt();
-        return r;
+        klog_write("\n");
+        panic_exception("page fault in kernel mode", r);
     }
     if (r->int_no == 255) {
-        terminal_write("UNEXPECTED INTERRUPT, halting\n");
         klog_prefix();
         klog_write("EXC-FF-UNEXPECTED: halting\n");
-        halt();
-        return r;
+        panic("unexpected interrupt vector 255");
     }
     const char *name = r->int_no < 32 ? exc_names[r->int_no] : "???";
-    terminal_write("CPU EXCEPTION: ");
-    terminal_write(name);
-    terminal_write(" err=");
-    terminal_hex(r->err_code);
-    terminal_write(" eip=");
-    terminal_hex(r->eip);
-    terminal_write("\nSystem halted.\n");
     klog_prefix();
     klog_write("CPU-EXCEPTION ");
     klog_write(name);
@@ -180,15 +146,14 @@ regs_t *isr_handler(regs_t *r) {
     klog_hex(r->err_code);
     klog_write(" eip=");
     klog_hex(r->eip);
-    klog_write(" halting\n");
-    halt();
+    klog_write("\n");
+    panic_exception(name, r);
     return r;
 }
 
 regs_t *syscall_handler(regs_t *r) {
     if ((r->cs & 3u) != 3u) {
-        klog_prefix();
-        klog_write("SYSCALL-REJECT: non-user caller\n");
+        klog_log(KLOG_WARN, "SYSCALL-REJECT: non-user caller\n");
         r->eax = (uint32_t)-1;
         return r;
     }
@@ -198,24 +163,24 @@ regs_t *syscall_handler(regs_t *r) {
 regs_t *irq_handler(regs_t *r) {
     uint8_t irq = (uint8_t)(r->int_no - 32);
     if (irq >= 16) {
-        klog_prefix();
-        klog_write("IRQ-BAD-VECTOR\n");
+        klog_log(KLOG_ERROR, "IRQ-BAD-VECTOR\n");
         pic_send_eoi(15);
         return r;
     }
     if (irq_handlers[irq])
         irq_handlers[irq](r);
     else if (pic_is_spurious(irq)) {
-        klog_prefix();
-        klog_write("IRQ-SPURIOUS ");
-        klog_hex(irq);
-        klog_write("\n");
+        if (klog_begin(KLOG_DEBUG)) {
+            klog_write("IRQ-SPURIOUS ");
+            klog_hex(irq);
+            klog_write("\n");
+        }
     } else {
-        terminal_write("Unexpected IRQ\n");
-        klog_prefix();
-        klog_write("IRQ-UNEXPECTED ");
-        klog_hex(irq);
-        klog_write("\n");
+        if (klog_begin(KLOG_WARN)) {
+            klog_write("IRQ-UNEXPECTED ");
+            klog_hex(irq);
+            klog_write("\n");
+        }
     }
     pic_send_eoi(irq);
     if (irq == 0)
