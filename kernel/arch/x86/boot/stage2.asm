@@ -182,6 +182,15 @@ stage2:
     mov si, msg_a20
     call print
 
+    ; --- VBE framebuffer discovery (INT 10h AX=4F00h/4F01h/4F02h) -----------
+    ; Safe discovery: the BIOS is asked for its mode list, every mode is
+    ; queried, and only a mode with a colour linear framebuffer that fits
+    ; our single 4 MiB window is accepted. The 8x16 VGA font is copied out
+    ; of the video BIOS ROM before the video mode is switched. If anything
+    ; is missing the machine keeps the BIOS text mode, so the kernel falls
+    ; back to the VGA text buffer.
+    call vbe_discover
+
     ; --- enter 32-bit protected mode ------------------------------------------
     cli
     lgdt [gdt_desc]
@@ -238,6 +247,484 @@ serial_putc:                      ; AL = char
     mov al, ah
     out dx, al
     pop dx
+    ret
+
+; ============================================================== VBE =========
+; Framebuffer discovery with the VESA BIOS Extension (VBE).
+;
+; The structures and the mode selection rules follow Linux:
+;   arch/x86/boot/vesa.h        vesa_general_info / vesa_mode_info
+;   arch/x86/boot/video-vesa.c  vesa_probe() / vesa_set_mode()
+;
+; A mode is accepted when it is a supported graphics mode with a colour
+; linear framebuffer (Linux's rule: attributes & 0x99 == 0x99 and a single
+; plane), 24 or 32 bits per pixel, and a framebuffer that fits the single
+; 4 MiB window the kernel maps. The horizontal resolution is derived from
+; the pitch because some BIOSes leave it at zero.
+;
+; The framebuffer address comes from the mode info when the BIOS reports
+; one; otherwise the VGA device's PCI memory BAR is read directly, the way
+; Linux's fbdev picks up the framebuffer memory. The 8x16 VGA font is
+; copied out of the video BIOS ROM. If anything is missing the machine
+; keeps the BIOS text mode, no handover record is written, and the kernel
+; falls back to the VGA text buffer.
+;
+; Low memory used by this block (DS is 0, so these are linear addresses):
+;   0x6F00  scratch: the best mode, its geometry and the framebuffer base
+;   0x6FC0  handover record: magic, base, pitch, w, h, bpp, masks, mode
+;   0x6FFC  E820 entry count (written earlier)
+;   0x7000  E820 entries (written earlier)
+;   0x7400  VESA mode info buffer (256 B)
+;   0x7500  VESA general info buffer (512 B)
+;   0x9000  the 8x16 VGA font copied out of the video BIOS ROM
+VBE_SCRATCH     equ 0x6F00
+VBE_FB_RECORD   equ 0x6FC0
+VBE_FONT_ADDR   equ 0x9000
+VBE_MODE_ADDR   equ 0x7400
+VBE_INFO_ADDR   equ 0x7500
+VBE_FB_MAGIC    equ 0x31424648        ; 'HFB1'
+VBE_MAX_WIDTH   equ 1024
+VBE_MAX_HEIGHT  equ 768
+VBE_MAX_FB_BYTES equ 0x400000         ; 4 MiB: one page-table window
+VBE_MODE_LIMIT  equ 256
+
+; vesa_general_info (Linux vesa.h)
+VBE_OFF_SIGNATURE  equ 0x00            ; dword "VESA"
+VBE_OFF_VERSION    equ 0x04            ; word
+VBE_OFF_CAPABILITIES equ 0x0A          ; dword
+VBE_OFF_VIDEO_MODE equ 0x0E            ; far_ptr (offset word, segment word)
+VBE_OFF_TOTAL_MEM  equ 0x12            ; word, in 64 KiB blocks
+
+; vesa_mode_info (Linux vesa.h)
+VBE_OFF_MODE_ATTR  equ 0x00            ; word
+VBE_OFF_PITCH      equ 0x10            ; word, logical_scan
+VBE_OFF_HRES       equ 0x12            ; word
+VBE_OFF_VRES       equ 0x14            ; word
+VBE_OFF_PLANES     equ 0x18            ; byte
+VBE_OFF_BPP        equ 0x19            ; byte
+VBE_OFF_LAYOUT     equ 0x1B            ; byte, memory layout
+VBE_OFF_LFB        equ 0x28            ; dword, linear framebuffer address
+
+; scratch slots inside VBE_SCRATCH
+VBE_SL_LIST_SEG  equ 0x00
+VBE_SL_LIST_OFF  equ 0x02
+VBE_SL_CUR_MODE  equ 0x04
+VBE_SL_BEST_W    equ 0x08
+VBE_SL_BEST_H    equ 0x0C
+VBE_SL_BEST_BASE equ 0x10
+VBE_SL_BEST_MODE equ 0x14
+VBE_SL_BEST_PITCH equ 0x18
+VBE_SL_BEST_BPP  equ 0x1C
+VBE_SL_SCANNED   equ 0x20
+VBE_SL_SET_AX    equ 0x24
+VBE_SL_CUR_AX    equ 0x28
+VBE_SL_CUR_PITCH equ 0x2C
+VBE_SL_TARGET_BPP equ 0x30
+VBE_SL_START_SEG equ 0x34
+VBE_SL_START_OFF equ 0x36
+
+vbe_discover:
+    pusha
+
+    ; --- controller info (vesa_general_info) ---
+    ; Some BIOSes report an unsupported status in AX even though the video
+    ; BIOS filled the block, so the block itself is validated instead.
+    xor ax, ax
+    mov es, ax
+    mov di, VBE_INFO_ADDR
+    mov ax, 0x4F00
+    int 0x10
+    cmp dword [VBE_INFO_ADDR + VBE_OFF_SIGNATURE], 0x41534556   ; "VESA"
+    jne .no_vbe
+    cmp word [VBE_INFO_ADDR + VBE_OFF_VERSION], 0x0102
+    jb .no_vbe                           ; VBE 1.2 or newer is required
+
+    ; --- locate the mode list ---
+    ; The spec points at it with a far pointer (usually into the video
+    ; BIOS ROM); some implementations copy the list into the info block
+    ; instead, so scan the block as a fallback. With ES = 0 the offsets
+    ; below are absolute addresses.
+    mov ax, [VBE_INFO_ADDR + VBE_OFF_VIDEO_MODE + 2]  ; segment
+    mov es, ax
+    mov di, [VBE_INFO_ADDR + VBE_OFF_VIDEO_MODE]      ; offset
+    call vbe_check_list
+    jnc .list_ok
+    xor ax, ax
+    mov es, ax
+    mov di, VBE_INFO_ADDR + 0x20                        ; probe the block
+.probe:
+    cmp di, VBE_INFO_ADDR + 0x40
+    jae .no_modes
+    call vbe_check_list
+    jnc .list_ok
+    add di, 2
+    jmp .probe
+.list_ok:
+    mov [VBE_SCRATCH + VBE_SL_LIST_SEG], es
+    mov [VBE_SCRATCH + VBE_SL_LIST_OFF], di
+    ; remember where the list starts so it can be walked again
+    mov [VBE_SCRATCH + VBE_SL_START_SEG], es
+    mov [VBE_SCRATCH + VBE_SL_START_OFF], di
+
+    mov word [VBE_SCRATCH + VBE_SL_BEST_W], 0
+    mov word [VBE_SCRATCH + VBE_SL_BEST_H], 0
+    mov dword [VBE_SCRATCH + VBE_SL_BEST_BASE], 0
+    mov dword [VBE_SCRATCH + VBE_SL_BEST_MODE], 0
+    mov dword [VBE_SCRATCH + VBE_SL_BEST_PITCH], 0
+    mov dword [VBE_SCRATCH + VBE_SL_BEST_BPP], 0
+    mov dword [VBE_SCRATCH + VBE_SL_SCANNED], 0
+
+    ; --- walk the mode list ---
+    ; 32 bits per pixel is preferred; 24 is the fallback.
+    mov byte [VBE_SCRATCH + VBE_SL_TARGET_BPP], 32
+    call vbe_scan_modes
+    jnc .have_mode
+    mov byte [VBE_SCRATCH + VBE_SL_TARGET_BPP], 24
+    call vbe_scan_modes
+    jc .no_mode
+.have_mode:
+
+    ; The framebuffer address: the mode info first, then the VGA device's
+    ; PCI memory BAR (Linux's fbdev reads it from the PCI resources).
+    mov eax, [VBE_SCRATCH + VBE_SL_BEST_BASE]
+    test eax, eax
+    jnz .have_base
+    call vbe_find_pci_fb
+    test eax, eax
+    jz .no_mode
+    mov [VBE_SCRATCH + VBE_SL_BEST_BASE], eax
+.have_base:
+    cmp eax, 0x00100000                ; a framebuffer lives above the ISA hole
+    jb .no_mode
+    ; the address is read as a dword, so it is always inside the 32-bit
+    ; physical range the kernel can map
+
+    ; the font is located by the kernel, which copies it out of the BIOS
+    ; ROM area the way Linux's copy_font() does
+
+    ; switch to the mode with the linear framebuffer enabled (Linux's
+    ; vesa_set_mode(): the 0x4000 flag asks for the linear framebuffer)
+    mov ax, 0x4F02
+    mov bx, [VBE_SCRATCH + VBE_SL_BEST_MODE]
+    or bx, 0x4000
+    int 0x10
+    mov [VBE_SCRATCH + VBE_SL_SET_AX], ax
+    cmp ax, 0x004F
+    je .mode_ok
+    ; some BIOSes report an unsupported status even though the switch
+    ; happened; VBE 4F03h reports the current mode in BX
+    mov ax, 0x4F03
+    int 0x10
+    mov [VBE_SCRATCH + VBE_SL_CUR_AX], ax
+    mov bx, [VBE_SCRATCH + VBE_SL_CUR_AX]
+    and bx, 0x3FF
+    cmp bx, [VBE_SCRATCH + VBE_SL_BEST_MODE]
+    jne .no_set
+.mode_ok:
+
+    ; --- write the handover record ---
+    mov dword [VBE_FB_RECORD + 0], VBE_FB_MAGIC
+    mov eax, [VBE_SCRATCH + VBE_SL_BEST_BASE]
+    mov [VBE_FB_RECORD + 4], eax        ; framebuffer physical address
+    mov eax, [VBE_SCRATCH + VBE_SL_BEST_PITCH]
+    mov [VBE_FB_RECORD + 8], eax        ; pitch
+    movzx eax, word [VBE_SCRATCH + VBE_SL_BEST_W]
+    mov [VBE_FB_RECORD + 12], eax       ; width
+    movzx eax, word [VBE_SCRATCH + VBE_SL_BEST_H]
+    mov [VBE_FB_RECORD + 16], eax       ; height
+    mov eax, [VBE_SCRATCH + VBE_SL_BEST_BPP]
+    mov [VBE_FB_RECORD + 20], eax       ; bits per pixel
+    ; the standard direct-colour layout: 8 bits per channel
+    mov word [VBE_FB_RECORD + 24], 0x1008   ; red: size 8, position 16
+    mov word [VBE_FB_RECORD + 26], 0x0808   ; green: size 8, position 8
+    mov word [VBE_FB_RECORD + 28], 0x0008   ; blue: size 8, position 0
+    mov eax, [VBE_SCRATCH + VBE_SL_BEST_MODE]
+    mov [VBE_FB_RECORD + 30], eax       ; VBE mode number
+    ; framebuffer size = pitch * height
+    mov eax, [VBE_SCRATCH + VBE_SL_BEST_H]
+    imul eax, [VBE_SCRATCH + VBE_SL_BEST_PITCH]
+    mov [VBE_FB_RECORD + 32], eax
+
+    mov al, 'F'                        ; framebuffer mode is live
+    call serial_putc
+    mov al, 10
+    call serial_putc
+    popa
+    ret
+
+.no_vbe:
+    mov al, 'a'                        ; no VESA BIOS extension
+    jmp .report
+.no_modes:
+    mov al, 'b'                        ; no mode list
+    jmp .report
+.no_mode:
+    mov al, 'c'                        ; no usable linear framebuffer mode
+    jmp .report
+.no_font:
+    mov al, 'd'                        ; the VGA font copy failed
+    jmp .report
+.no_set:
+    mov al, 'e'                        ; the mode switch was refused
+.report:
+    call serial_putc
+    mov al, 10
+    call serial_putc
+    popa
+    ret
+
+; in: es:di = candidate mode list.
+; out: CF set when the list looks valid (at least two mode numbers).
+; ES:DI is preserved. The list itself is walked later and ends at the
+; first entry that is not a mode number.
+vbe_check_list:
+    push ax
+    push cx
+    push di
+    mov cx, 2
+.check:
+    mov ax, es:[di]
+    cmp ax, 0x100
+    jb .bad
+    cmp ax, 0x7FF
+    ja .bad
+    add di, 2
+    loop .check
+    clc
+    jmp .out
+.bad:
+    stc
+.out:
+    pop di
+    pop cx
+    pop ax
+    ret
+
+; Walk the mode list and pick the best mode with the target depth.
+; in: the target bits per pixel in VBE_SL_TARGET_BPP.
+; out: CF clear when a usable mode was found.
+vbe_scan_modes:
+    push ax
+    push cx
+    push dx
+    push si
+    push di
+    ; restart at the beginning of the mode list
+    mov ax, [VBE_SCRATCH + VBE_SL_START_SEG]
+    mov [VBE_SCRATCH + VBE_SL_LIST_SEG], ax
+    mov ax, [VBE_SCRATCH + VBE_SL_START_OFF]
+    mov [VBE_SCRATCH + VBE_SL_LIST_OFF], ax
+    mov dword [VBE_SCRATCH + VBE_SL_SCANNED], 0
+.next_mode:
+    cmp dword [VBE_SCRATCH + VBE_SL_SCANNED], VBE_MODE_LIMIT
+    jae .list_done
+    inc dword [VBE_SCRATCH + VBE_SL_SCANNED]
+    mov es, [VBE_SCRATCH + VBE_SL_LIST_SEG]
+    mov di, [VBE_SCRATCH + VBE_SL_LIST_OFF]
+    mov cx, es:[di]                         ; the list lives in BIOS memory
+    add di, 2
+    mov [VBE_SCRATCH + VBE_SL_LIST_OFF], di
+    cmp cx, 0x100
+    jb .list_done                           ; not a mode number: end of list
+    cmp cx, 0x7FF
+    ja .list_done
+    mov [VBE_SCRATCH + VBE_SL_CUR_MODE], cx
+
+    ; query this mode (vesa_mode_info); clear the buffer first so a stale
+    ; block from an earlier query cannot be mistaken for a valid one.
+    ; CX must survive: it carries the mode number to the BIOS.
+    xor ax, ax
+    mov di, VBE_MODE_ADDR
+    mov dx, 32
+.clear_mode:
+    mov word [di], ax
+    add di, 2
+    dec dx
+    jnz .clear_mode
+    xor ax, ax
+    mov es, ax
+    mov di, VBE_MODE_ADDR
+    mov ax, 0x4F01
+    int 0x10
+
+    ; Linux's rule: supported, colour, graphics and linear framebuffer.
+    mov ax, [VBE_MODE_ADDR + VBE_OFF_MODE_ATTR]
+    and ax, 0x99
+    cmp ax, 0x99
+    jne .next
+    cmp byte [VBE_MODE_ADDR + VBE_OFF_PLANES], 1
+    jne .next
+    mov dl, [VBE_SCRATCH + VBE_SL_TARGET_BPP]
+    cmp byte [VBE_MODE_ADDR + VBE_OFF_BPP], dl
+    jne .next
+
+    ; The pitch and the height are the reliable fields; some BIOSes leave
+    ; the horizontal resolution at zero, so the width is derived from the
+    ; pitch and the depth.
+    mov ax, [VBE_MODE_ADDR + VBE_OFF_PITCH]
+    test ax, ax
+    jz .next
+    movzx eax, ax
+    mov [VBE_SCRATCH + VBE_SL_CUR_PITCH], eax
+    ; load the depth into ECX without touching EAX: AL holds the low byte
+    ; of the pitch, so "mov al, [bpp]" would corrupt the dividend.
+    movzx ecx, byte [VBE_MODE_ADDR + VBE_OFF_BPP]
+    shr ecx, 3                     ; bytes per pixel
+    test ecx, ecx
+    jz .next
+    xor edx, edx
+    div ecx                        ; width = pitch / bytes per pixel
+    mov cx, ax
+    test cx, cx
+    jz .next
+    cmp cx, VBE_MAX_WIDTH
+    ja .next
+    mov dx, [VBE_MODE_ADDR + VBE_OFF_VRES]
+    test dx, dx
+    jz .next
+    cmp dx, VBE_MAX_HEIGHT
+    ja .next
+
+    ; the framebuffer must fit the single 4 MiB window we map
+    mov eax, [VBE_SCRATCH + VBE_SL_CUR_PITCH]
+    imul eax, edx
+    cmp eax, VBE_MAX_FB_BYTES
+    ja .next
+
+    ; keep the largest accepted geometry
+    cmp cx, [VBE_SCRATCH + VBE_SL_BEST_W]
+    jb .next
+    je .same_width
+    jmp .take
+.same_width:
+    cmp dx, [VBE_SCRATCH + VBE_SL_BEST_H]
+    jbe .next
+.take:
+    mov [VBE_SCRATCH + VBE_SL_BEST_W], cx
+    mov [VBE_SCRATCH + VBE_SL_BEST_H], dx
+    mov eax, [VBE_SCRATCH + VBE_SL_CUR_MODE]
+    mov [VBE_SCRATCH + VBE_SL_BEST_MODE], eax
+    mov al, [VBE_MODE_ADDR + VBE_OFF_BPP]
+    mov [VBE_SCRATCH + VBE_SL_BEST_BPP], al
+    ; the pitch of the accepted mode
+    mov eax, [VBE_SCRATCH + VBE_SL_CUR_PITCH]
+    mov [VBE_SCRATCH + VBE_SL_BEST_PITCH], eax
+    ; the framebuffer address, when the BIOS reports one
+    mov eax, [VBE_MODE_ADDR + VBE_OFF_LFB]
+    mov [VBE_SCRATCH + VBE_SL_BEST_BASE], eax
+.next:
+    jmp .next_mode
+.list_done:
+    cmp word [VBE_SCRATCH + VBE_SL_BEST_W], 0
+    je .none
+    clc
+    jmp .out
+.none:
+    stc
+.out:
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop ax
+    ret
+
+; Read the framebuffer address from the VGA device's PCI memory BAR.
+; Bus 0 is scanned for a display class device with a memory BAR, the way
+; Linux's fbdev picks up the framebuffer memory. Returns the BAR base in
+; EAX, or 0 when no such device is found.
+vbe_find_pci_fb:
+    push eax
+    push ebx
+    push ecx
+    push edx
+    xor ebx, ebx                    ; device number
+.dev_loop:
+    cmp ebx, 32
+    jae .none
+    ; configuration address 0x80000000 | (device << 11) | offset
+    mov eax, 0x80000000
+    mov ecx, ebx
+    shl ecx, 11
+    or eax, ecx
+    mov edx, eax
+    add edx, 0x00                  ; vendor and device id
+    mov dx, 0xCF8
+    out dx, eax
+    mov dx, 0xCFC
+    in eax, dx
+    cmp al, 0xFF                   ; no device present
+    je .next_dev
+    ; class code: the base class is the top byte of the dword at 0x08
+    mov eax, 0x80000000
+    mov ecx, ebx
+    shl ecx, 11
+    or eax, ecx
+    add eax, 0x08
+    mov edx, eax
+    mov dx, 0xCF8
+    out dx, eax
+    mov dx, 0xCFC
+    in eax, dx
+    shr eax, 24
+    cmp al, 0x03                   ; display controller
+    jne .next_dev
+    ; memory BAR 0 at 0x10
+    mov eax, 0x80000000
+    mov ecx, ebx
+    shl ecx, 11
+    or eax, ecx
+    add eax, 0x10
+    mov edx, eax
+    mov dx, 0xCF8
+    out dx, eax
+    mov dx, 0xCFC
+    in eax, dx
+    test al, 0x01                  ; must be a memory BAR
+    jnz .next_dev
+    and eax, 0xFFFFFFF0
+    test eax, eax
+    jz .next_dev
+    jmp .found
+.next_dev:
+    inc ebx
+    jmp .dev_loop
+.found:
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+.none:
+    xor eax, eax
+    pop edx
+    pop ecx
+    pop ebx
+    pop eax
+    ret
+
+
+; print AX as four hex digits (boot diagnostics)
+vbe_print_hex:
+    push ax
+    push bx
+    push cx
+    mov bx, ax
+    mov cx, 4
+.next_digit:
+    rol bx, 4
+    mov al, bl
+    and al, 0x0F
+    add al, '0'
+    cmp al, '9'
+    jbe .emit
+    add al, 7
+.emit:
+    call serial_putc
+    loop .next_digit
+    pop cx
+    pop bx
+    pop ax
     ret
 
 ; ============================================================ A20 gate ======

@@ -203,6 +203,37 @@ def run(cmd):
     subprocess.run(cmd, check=True)
 
 
+def ppm_has_color(path, rgb):
+    """True when a binary PPM (P6) contains the given RGB triple."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if not data.startswith(b"P6"):
+        return False
+    fields = []
+    index = 2
+    while len(fields) < 3 and index < len(data):
+        while index < len(data) and data[index:index + 1].isspace():
+            index += 1
+        if data[index:index + 1] == b"#":
+            while index < len(data) and data[index:index + 1] != b"\n":
+                index += 1
+            continue
+        start = index
+        while index < len(data) and not data[index:index + 1].isspace():
+            index += 1
+        fields.append(int(data[start:index]))
+    if len(fields) < 3:
+        return False
+    width, height, _maxval = fields
+    pixels = data[index + 1:]
+    red, green, blue = rgb
+    for offset in range(0, min(len(pixels), width * height * 3) - 2, 3):
+        if (pixels[offset] == red and pixels[offset + 1] == green
+                and pixels[offset + 2] == blue):
+            return True
+    return False
+
+
 def main():
     nasm = find_tool("nasm", [
         os.path.join(os.environ.get("LOCALAPPDATA", ""), r"bin\NASM\nasm.exe"),
@@ -370,6 +401,7 @@ def main():
     elif mode == "headless":
         serial = os.path.join(BUILD, "serial.log")
         shot = os.path.join(BUILD, "screen.png")
+        ppm = os.path.join(BUILD, "screen.ppm")
         if os.path.exists(serial):
             os.remove(serial)
         # Human monitor on TCP (for screendump now, sendkey later).
@@ -385,6 +417,7 @@ def main():
         except subprocess.TimeoutExpired:
             # Still alive: interrogate the CPU state, grab a screenshot, stop it.
             regs = monitor_cmd(MON_PORT, ["info registers", f"screendump {shot}",
+                                              f"screendump {ppm}",
                                               "xp /3wx 0x500",
                                               "xp /64wx 0x11240",
                                               "xp /64wx 0x11980"])
@@ -462,6 +495,17 @@ def main():
         missing = [m for m in expected if m not in content]
         if "EXECVE-FAIL" in content:
             missing.append("successful execve did not return an error")
+        # The framebuffer console proves itself on the screen: when the
+        # graphics mode is live the signature block the driver draws must
+        # show up in the captured framebuffer.
+        if "FB-OK" in content:
+            if not os.path.exists(ppm):
+                missing.append("framebuffer active but no screendump captured")
+            elif not ppm_has_color(ppm, (0x20, 0xA0, 0xFF)):
+                missing.append("framebuffer signature color missing from the"
+                               " screendump")
+        elif "FB-SKIP" not in content:
+            missing.append("no framebuffer status line in the serial log")
         unexpected = [m for m in ("USER-SYSCALL-FAIL",
                                      "FS-ERROR-FAIL",
                                      "FS-EDGE-FAIL",

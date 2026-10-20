@@ -31,6 +31,7 @@ void frame_free_pages(void *phys, uint32_t n);
 uint32_t frame_total_count(void);  /* tracked physical frames (up to 128 MiB) */
 uint32_t frame_usable_count(void); /* usable frames reported by E820 */
 uint32_t frame_free_count(void);   /* free frames currently allocatable */
+void frame_reserve_range(uint32_t start, uint32_t end);
 int frame_self_test(void);
 
 #endif

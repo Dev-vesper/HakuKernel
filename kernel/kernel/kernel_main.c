@@ -6,6 +6,7 @@
  */
 #include "cpu.h"
 #include "console.h"
+#include "framebuffer.h"
 #include "heap.h"
 #include "idt.h"
 #include "kbd.h"
@@ -84,6 +85,21 @@ void kernel_main(void) {
         for (;;) {
             __asm hlt
         }
+    }
+
+    /* Framebuffer console: the bootloader discovered a linear framebuffer
+     * with the VBE BIOS calls; map it and draw the console there. Without
+     * one the VGA text buffer stays in use. */
+    if (framebuffer_init()) {
+        klog_prefix();
+        klog_write("FB-OK: vbe linear framebuffer ");
+        klog_dec(framebuffer_width());
+        klog_write("x");
+        klog_dec(framebuffer_height());
+        klog_write(" console active\n");
+    } else {
+        klog_prefix();
+        klog_write("FB-SKIP: no usable linear framebuffer, VGA text retained\n");
     }
 
     if (!gdt_init()) {

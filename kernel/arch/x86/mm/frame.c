@@ -124,6 +124,17 @@ static void reserve_kernel_regions(void) {
     reserve_range(KERNEL_HEAP_START, KERNEL_HEAP_END);
 }
 
+/* Keep a device range (such as a framebuffer aperture) out of the pool.
+ * Ranges outside the tracked window are ignored, and a range that is
+ * already reserved stays reserved. */
+void frame_reserve_range(uint32_t start, uint32_t end) {
+    irqflags_t flags;
+    if (!frame_bitmap || !frame_usable || end <= start) return;
+    flags = spin_lock_irqsave(&frame_lock);
+    reserve_range(start, end);
+    spin_unlock_irqrestore(&frame_lock, flags);
+}
+
 void frame_init(void) {
     uint32_t count = e820_count();
     volatile e820_entry_t *entries = (volatile e820_entry_t *)E820_MAP_PHYS;

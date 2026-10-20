@@ -1,5 +1,8 @@
-/* Haku console: VGA text mode + COM1 serial output. */
+/* Haku console: VGA text mode + COM1 serial output. When a linear
+ * framebuffer is available the text console is drawn there instead; the
+ * VGA text buffer stays the fallback for machines without one. */
 #include "console.h"
+#include "framebuffer.h"
 #include "sync.h"
 
 static volatile uint16_t *const VGA = (uint16_t *)0xB8000;
@@ -50,11 +53,19 @@ static void vga_putc(char c) {
 }
 
 void console_putc(char c) {
+    if (framebuffer_active()) {
+        framebuffer_putc(c);
+        return;
+    }
     vga_putc(c);
 }
 
+/* These three are the console's display primitives: klog and the exception
+ * paths emit through them, so they must follow console_putc() and reach the
+ * framebuffer when one is live instead of writing to the invisible VGA text
+ * buffer in graphics mode. */
 void vga_write(const char *s) {
-    while (*s) vga_putc(*s++);
+    while (*s) console_putc(*s++);
 }
 
 static void put_hex(void (*emit)(char), uint32_t v) {
@@ -66,7 +77,7 @@ static void put_hex(void (*emit)(char), uint32_t v) {
 }
 
 void vga_hex(uint32_t v) {
-    put_hex(vga_putc, v);
+    put_hex(console_putc, v);
 }
 
 static void put_dec(void (*emit)(char), uint32_t v) {
@@ -80,13 +91,17 @@ static void put_dec(void (*emit)(char), uint32_t v) {
 }
 
 void vga_dec(uint32_t v) {
-    put_dec(vga_putc, v);
+    put_dec(console_putc, v);
 }
 
 /* Draw a short status string at the top-right corner (overwrites in place). */
 void vga_corner(const char *s) {
     size_t len = strlen(s);
     irqflags_t flags;
+    if (framebuffer_active()) {
+        framebuffer_status(s);
+        return;
+    }
     if (len > VGA_COLS) len = VGA_COLS;
     flags = spin_lock_irqsave(&vga_lock);
     for (size_t i = 0; i < len; i++)

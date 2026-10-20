@@ -131,11 +131,14 @@ int paging_create_user_space(address_space_t *space) {
     directory[0] = DIR[0];
     directory[1] = DIR[1];
     /* Share the supervisor direct map so high physical frames remain
-     * reachable from syscalls and task switches. */
+     * reachable from syscalls and task switches. The framebuffer window
+     * is shared too, so the console keeps drawing while a user space
+     * is the active address space. */
     for (uint32_t i = 0; i < PAGING_DIRECT_MAP_TABLES; i++) {
         uint32_t index = (PAGING_DIRECT_MAP_BASE >> 22) + i;
         directory[index] = DIR[index];
     }
+    directory[PAGING_FB_WINDOW >> 22] = DIR[PAGING_FB_WINDOW >> 22];
     space->directory_phys = directory_phys;
     space->mapped_pages = 0;
     space->page_tables = 0;
@@ -229,6 +232,43 @@ int paging_unmap_user_page(address_space_t *space, uint32_t virtual_addr) {
     if (current) paging_flush_all();
     frame_free((void *)table_phys);
     return 1;
+}
+
+/* Map a device framebuffer into the supervisor-only window at
+ * PAGING_FB_WINDOW. The framebuffer usually lives above the direct map
+ * (PCI BARs sit at 0xFD000000 on QEMU), so it needs its own mapping.
+ * The physical range is mapped with 4 KiB pages; the window covers one
+ * page-directory entry, so the caller must keep the range inside it. */
+uint32_t paging_map_framebuffer(uint32_t physical_base, uint32_t length) {
+    uint32_t directory_index = PAGING_FB_WINDOW >> 22;
+    uint32_t offset = physical_base & 0xFFFu;
+    uint32_t table_phys;
+    uint32_t *table;
+    uint32_t pages;
+
+    if (!physical_base || !length) return 0;
+    if (offset + length > PAGING_FB_WINDOW_BYTES) return 0;
+
+    /* The window is one page directory entry, so map whole 4 KiB pages
+     * starting at the page-aligned physical base. */
+    pages = (offset + length + 0xFFFu) >> 12;
+    if (pages > PAGING_ENTRIES) return 0;
+
+    table_phys = alloc_page_table();
+    if (!table_phys) return 0;
+    table = (uint32_t *)PHYS_TO_VIRT(table_phys);
+    for (uint32_t i = 0; i < PAGING_ENTRIES; i++)
+        table[i] = 0;
+    /* Each entry maps the next physical page of the aperture; mapping the
+     * same page for every slot would alias the whole window onto the first
+     * 4 KiB and collapse the picture (and the text console) onto one row. */
+    for (uint32_t i = 0; i < pages; i++)
+        table[i] = ((physical_base & 0xFFFFF000u) + (i << 12))
+                   | PAGE_PRESENT | PAGE_RW;
+
+    DIR[directory_index] = table_phys | PAGE_PRESENT | PAGE_RW;
+    paging_flush_all();
+    return PAGING_FB_WINDOW + offset;
 }
 
 void paging_activate_user_space(const address_space_t *space) {

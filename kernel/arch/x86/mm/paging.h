@@ -46,6 +46,12 @@
 #define PAGING_PHYS_LIMIT (PAGING_DIRECT_MAP_MB * 1024u * 1024u)
 #define PHYS_TO_VIRT(phys) ((void *)(PAGING_DIRECT_MAP_BASE + (uint32_t)(phys)))
 
+/* Supervisor window for the linear framebuffer. It sits between the user
+ * limit and the direct map and covers one page-directory entry (4 MiB),
+ * which is the most a VBE mode may use. */
+#define PAGING_FB_WINDOW  0xD0000000u
+#define PAGING_FB_WINDOW_BYTES 0x400000u
+
 /* Per-space accounting maintained by the mapping helpers. mapped_pages
  * counts present user PTEs (code, data, stack, heap, and mmap), page_tables
  * counts the non-directory user page tables, and peak_mapped_pages is the
@@ -68,6 +74,9 @@ int paging_create_user_space(address_space_t *space);
 int paging_map_user_page(address_space_t *space, uint32_t virtual_addr,
                          uint32_t physical_addr, int writable);
 int paging_unmap_user_page(address_space_t *space, uint32_t virtual_addr);
+/* Map the framebuffer's physical pages into PAGING_FB_WINDOW. Returns the
+ * virtual base of the requested physical address, or 0 on failure. */
+uint32_t paging_map_framebuffer(uint32_t physical_base, uint32_t length);
 void paging_activate_user_space(const address_space_t *space);
 void paging_activate_kernel_space(void);
 void paging_destroy_user_space(address_space_t *space);
