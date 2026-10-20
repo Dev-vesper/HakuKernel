@@ -2,7 +2,9 @@
 
 This roadmap separates implemented capabilities from planned work. HakuKernel
 aims to be a small, testable x86 operating system that grows toward running
-independent programs and providing a POSIX-inspired environment. Full POSIX
+independent programs and providing a POSIX-inspired environment. The long
+term direction is a Linux-compatible syscall ABI plus a statically linked
+GNU userland (musl, e.g. busybox) booted from an initramfs; full POSIX
 compatibility is not a short-term goal.
 
 ## Current Status
@@ -220,14 +222,64 @@ prevent boot.
 the documented toolchain, and `python build.py headless` runs all regression
 tests repeatably.
 
+### 7. Linux-Compatible ABI and a GNU Userland
+
+Goal: run a real GNU userland (statically linked musl, e.g. busybox) on top
+of HakuKernel. glibc is out of scope: it needs the 64-bit `*64` syscall
+variants, `rseq`/`membarrier`, and a much wider syscall surface. The
+userland root becomes a Unix-like RAM filesystem, not FAT12.
+
+- [ ] Publish a Linux-compatible syscall ABI for i386 (keep the numbers that
+  already match) and a real `struct stat` layout, so unmodified
+  Linux-targeted binaries can call the kernel
+  (`include/haku/abi.h` currently exposes a size-only 8-byte stat and a
+  Haku-specific `spawn`/`getusage` pair).
+- [ ] Add process creation and reaping: `fork`/`clone` (with `SIGCHLD`),
+  `vfork`, `wait4`, and `exit_group`, replacing the ELF-only `spawn` model
+  as the primary way to start a second process.
+- [ ] Add signals: `kill`/`tkill`/`tgkill`, `rt_sigaction`,
+  `rt_sigprocmask`, `rt_sigreturn`, pending-signal delivery, and default
+  dispositions (the kernel currently has no signal state at all).
+- [ ] Add the memory syscalls a libc needs: `mmap2` with
+  `MAP_FIXED`/`MAP_ANONYMOUS`/`MAP_SHARED`, `mprotect`, `mremap`,
+  `madvise`, and thread-local storage through `set_thread_area` (today
+  `mmap` only accepts `MAP_PRIVATE|MAP_ANONYMOUS` and rejects fixed
+  addresses).
+- [ ] Add `futex` so libc locks, and later threads, behave correctly.
+- [ ] Extend the filesystem ABI for libc and shell tooling: the `*at` family
+  (`openat`, `unlinkat`, `renameat`, `mkdirat`, `fstatat`), `statx`,
+  `fchmod`/`fchown`, `symlink`/`readlink`, `truncate`/`ftruncate`, `access`,
+  `getdents64`, `chdir`/`getcwd`, `dup3`, `pipe`/`pipe2`, `fcntl`, `ioctl`
+  (termios for an interactive shell), `poll`/`select`, `uname`,
+  `getrlimit`/`setrlimit`, `getrandom`, `sched_yield`, `prctl`, and
+  `personality`.
+- [ ] Add a Unix-like filesystem for the userland: an in-memory filesystem
+  (initramfs) with long names, permission bits, symlinks, timestamps, and
+  nested directories, plus a device layer (`/dev/null`, `/dev/zero`,
+  `/dev/urandom`, `/dev/console`, `/dev/tty`) and a minimal `/proc`
+  (FAT12 stays as the data-disk backend for the existing 8.3 tree).
+- [ ] Load a userland image at boot: unpack an initramfs/cpio archive into
+  the RAM filesystem and `execve` `/init` as PID 1 (the boot path currently
+  loads a single ELF from the FAT12 disk).
+- [ ] Build the userland in the Linux CI (static musl, e.g. busybox and/or
+  GNU coreutils), ship it with the release artifacts, and extend the
+  headless test to assert its behavior (for example `busybox sh -c "echo"`
+  and a file round-trip through the RAM filesystem).
+
+**Acceptance criteria:** A statically linked musl binary runs as PID 1 from
+an initramfs, executes shell builtins and applets, reads and writes files
+in the RAM filesystem, and the headless test asserts its output; glibc,
+dynamic linking, and shared libraries stay out of scope.
+
 ## Out of Scope for This Roadmap
 
 These features require separate milestones and design decisions:
 
 - SMP, 64-bit/long mode, and architectures other than x86.
 - Networking, TCP/IP, USB, audio, and a complete graphical interface.
-- Full POSIX/Linux compatibility, a dynamic linker, shared libraries, and
-  Linux binaries.
+- Full POSIX and glibc compatibility, a dynamic linker, and shared
+  libraries; the userland target is a statically linked musl userland
+  (see Milestone 7).
 - Journaling or transactional guarantees and power-loss recovery.
 
 ## Delivery Process
