@@ -144,19 +144,13 @@ int fat12_test_write_sector(uint32_t lba, const void *buffer) {
     return ata_write_sectors(lba, 1, buffer) ? 1 : -FAT12_ERR_IO;
 }
 
-int fat12_mount(void) {
+static int fat12_mount_device(void) {
     uint32_t root_bytes;
     uint32_t data_sectors;
     uint32_t fat_bytes;
     uint32_t required_fat_bytes;
     uint16_t total16;
 
-    memset(&volume, 0, sizeof(volume));
-    if (!ata_init()) return -FAT12_ERR_IO;
-    if (!ata_read_sectors(0, 1, sector_buffer)) {
-        klog_log(KLOG_ERROR, "FAT12-FAIL: boot sector read\n");
-        return -FAT12_ERR_IO;
-    }
     total16 = read_u16(&sector_buffer[19]);
     volume.total_sectors = total16 ? total16 : read_u32(&sector_buffer[32]);
     volume.sectors_per_cluster = sector_buffer[13];
@@ -175,7 +169,6 @@ int fat12_mount(void) {
         !volume.total_sectors ||
         volume.total_sectors > ata_sector_count() ||
         sector_buffer[510] != 0x55u || sector_buffer[511] != 0xAAu) {
-        klog_log(KLOG_ERROR, "FAT12-FAIL: invalid BPB\n");
         return -FAT12_ERR_INVALID;
     }
 
@@ -208,6 +201,36 @@ int fat12_mount(void) {
     klog_dec(volume.cluster_count);
     klog_write("\n");
     return 1;
+}
+
+int fat12_mount(void) {
+    uint32_t devices;
+    int last_error = -FAT12_ERR_IO;
+
+    memset(&volume, 0, sizeof(volume));
+    if (!ata_init()) return -FAT12_ERR_IO;
+
+    /* Every detected ATA disk is probed: the FAT12 volume may live on the
+     * secondary channel or on a slave, not only on the primary master. */
+    devices = ata_device_count();
+    for (uint32_t index = 0; index < devices; index++) {
+        if (!ata_select_device(index)) continue;
+        if (!ata_read_sectors(0, 1, sector_buffer)) {
+            last_error = -FAT12_ERR_IO;
+            continue;
+        }
+        last_error = fat12_mount_device();
+        if (last_error == 1)
+            return 1;
+        if (klog_begin(KLOG_WARN)) {
+            klog_write("fat12: skipping device ");
+            klog_dec(index);
+            klog_write(", no FAT12 volume\n");
+        }
+    }
+
+    klog_log(KLOG_ERROR, "FAT12-FAIL: no FAT12 volume on any ATA device\n");
+    return last_error;
 }
 
 static int make_short_name(const char *name, uint8_t result[11]) {

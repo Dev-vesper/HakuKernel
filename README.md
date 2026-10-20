@@ -76,7 +76,10 @@ python build.py headless        :: fresh data image + boot headless, verify
 python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 ```
 
-`python build.py headless` verifies ATA detection, FAT12 mounting and
+`python build.py headless` verifies ATA detection on both legacy channels
+(`ATA-SCAN-OK devices=2`), the software-reset recovery path
+(`ATA-RECOVERY-OK`), cross-channel sector reads (`ATA-MULTI-OK`),
+FAT12 mounting and
 multi-cluster file reads, subdirectory/path resolution (`USER-DIR-OK`),
 ring-3 process entry, per-process kernel stacks,
 syscall handling, `spawn`/`waitpid` and exit-status reporting, page-protection
@@ -491,9 +494,28 @@ send `nmi` while the idle loop is running: the serial log then shows
 
 ### ATA PIO and FAT12
 
-`kernel/drivers/ata.c` detects the primary-master ATA device with IDENTIFY and reads
-and writes LBA28 sectors using bounded polling PIO. `kernel/fs/fat12/fat12.c` mounts a
-FAT12 superfloppy and supports creating, reading, writing, truncating and
+`kernel/drivers/ata.c` probes the legacy primary and secondary ATA channels
+(`0x1F0`/`0x3F6` and `0x170`/`0x376`) at both master and slave positions,
+ignores floating buses and ATAPI devices, and keeps every usable disk in a
+device list. Devices are identified with IDENTIFY; LBA28 is used when
+available and LBA48 addressing is the fallback. Identify, read, write, and
+cache-flush commands use bounded polling PIO: a failed or timed-out command
+is retried after a software reset (SRST) up to a fixed number of attempts,
+and every write is followed by FLUSH CACHE before it is reported complete
+(a drive that rejects the flush keeps the accepted data and only logs a
+warning). PIO polling is retained deliberately: the initial FAT mount runs
+before the PIC and PIT are initialized, while IRQ completion requires
+remapping/unmasking IRQ14/15 and DMA completion adds PCI bus-master
+programming and physical-buffer constraints. The synchronous path keeps boot
+deterministic and headless-testable; AHCI, PCI native-mode controllers, and
+ATAPI are not supported. The boot self-tests prove the recovery path
+(`ATA-RECOVERY-OK`: a software reset followed by an identical sector reread)
+and cross-channel I/O (`ATA-MULTI-OK`: the second device answers a sector
+read), and the headless run checks the scan itself (`ATA-SCAN-OK devices=2`).
+`kernel/fs/fat12/fat12.c` mounts a
+FAT12 superfloppy from any detected ATA disk (the first disk that carries a
+valid BPB wins, so the volume may live on the secondary channel or on a
+slave) and supports creating, reading, writing, truncating and
 seeking 8.3-named files anywhere in the tree, plus `mkdir`/`rmdir` of
 single-cluster subdirectories with real `.`/`..` entries. Paths are
 `/`-separated and resolved from the root; `.` and `..` are handled during
@@ -528,7 +550,9 @@ and verifies multi-sector writes, reads, seeks, close, and reopen.
 `tools/mkfat12.py` puts `HAKU.ELF`, the exec target `NEXT.ELF`, and the
 spawn/wait child `CHILD.ELF` on a generated 1.44 MB FAT12 image. QEMU
 attaches this image as the primary-master IDE disk while the existing boot
-floppy still starts the kernel. The kernel
+floppy still starts the kernel; the build also attaches a generated
+1.44 MB spare disk as secondary master so the headless run exercises
+device scanning across both legacy channels. The kernel
 loads the initial ELF at startup; `execve` uses VFS to load subsequent ELF
 files from the disk into a fresh address space before replacing the current
 image.
@@ -627,7 +651,8 @@ Haku/
       user/             user.asm, child.asm, fault.asm, exec_target.asm: ELF32
                         test programs (syscall, spawn/waitpid, protection
                         faults, execve coverage)
-    drivers/            ata.c/.h: primary-master ATA LBA28 polling PIO
+    drivers/            ata.c/.h: primary/secondary ATA (master/slave) LBA28/LBA48
+                        polling PIO with reset/retry recovery and cache flush
                         terminal.c/.h: text-I/O layer (output + input ring)
                         display.c/.h: shared display backend API
                         vga_text.c/.h: VGA text backend (fallback)
@@ -664,6 +689,7 @@ Haku/
   build/               generated files (stage*.bin, *.obj/pe, haku.img, ...)
   haku.img             bootable floppy image
   build/haku_fs.img    1.44 MB FAT12 ATA disk image with HAKU/NEXT/LIB ELFs
+  build/ata_spare.img  1.44 MB blank ATA disk on the secondary channel (scan test)
 ```
 
 ## Troubleshooting

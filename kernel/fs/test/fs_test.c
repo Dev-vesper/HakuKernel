@@ -681,6 +681,8 @@ static int test_ata_errors(void) {
     int ok = 1;
     uint32_t total = ata_sector_count();
     ok &= expect_tagged("FS-ATA-FAIL", "ata-present", total != 0, 1);
+    ok &= expect_tagged("FS-ATA-FAIL", "ata-device-count",
+                        ata_device_count() != 0, 1);
     /* Out-of-range, overflowing, empty, and NULL transfers are rejected
      * before touching the device; genuine device faults surface as 0
      * and become EIO upstairs. Sector 0 must stay readable. */

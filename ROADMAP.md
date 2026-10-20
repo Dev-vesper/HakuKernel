@@ -22,7 +22,9 @@ compatibility is not a short-term goal.
   later reuse.
 - [x] Time and accounting: `gettimeofday`, `nanosleep`, and the Haku-specific
   `getusage` snapshot of per-process memory and CPU usage.
-- [x] ATA primary-master LBA28 PIO polling driver.
+- [x] ATA driver for both legacy channels (primary/secondary) and all
+  master/slave positions, LBA28 with LBA48 fallback, bounded polling with
+  software-reset retry recovery, and FLUSH CACHE after writes.
 - [x] Writable FAT12 for 8.3 files and subdirectories (paths with `.`/`..`):
   create, read, write, truncate, append, mkdir/rmdir, with a VFS and
   per-process file descriptors.
@@ -178,8 +180,14 @@ leaks or page-table corruption.
   (`display.h` defines the shared `display_ops_t` API implemented by
   `vga_text.c` and `framebuffer.c`; the boot path selects the framebuffer
   backend after `framebuffer_init` succeeds, otherwise VGA text stays active).
-- [ ] Improve ATA timeout and recovery behavior and support more devices or
-  controllers; consider IRQ/DMA instead of PIO polling if required.
+- [x] Improve ATA timeout and recovery behavior and support more devices or
+  controllers; consider IRQ/DMA instead of PIO polling if required
+  (`kernel/drivers/ata.c` scans both legacy channels and all master/slave
+  positions, rejects floating-bus and ATAPI devices, uses bounded polling
+  with software-reset retry recovery, and flushes the write cache; FAT12
+  mounts from any detected disk; IRQ/DMA completion is deliberately deferred
+  because the FAT mount runs before the PIC/PIT exist, so the synchronous
+  path stays deterministic).
 - [x] Add leveled logging, a panic handler, and useful crash reports in QEMU
   (`klog` exposes DEBUG/INFO/WARN/ERROR/CRIT with an INFO threshold and a
   filtering self-test; `panic.c` halts on fatal faults and boot failures;

@@ -17,7 +17,8 @@ Pipeline:
     arch/x86/boot/stage1.asm --nasm--> stage1.bin (512 B)
     arch/x86/boot/stage2.asm --nasm (kernel entry + size from PE)--> stage2.bin
     stage1 + stage2 + kernel.bin --mkimg--> haku.img (boot floppy)
-    QEMU boots haku.img and attaches haku_fs.img as primary-master ATA disk
+    QEMU boots haku.img and attaches haku_fs.img as primary-master ATA disk,
+    plus a generated spare disk on the secondary channel for device scanning
 
 The data image (build/haku_fs.img) is user data: an existing image is
 reused as-is so files from previous QEMU sessions survive the build, and
@@ -340,6 +341,7 @@ def main():
     libtest_elf = os.path.join(BUILD, "lib.elf")
     pe2elf_script = os.path.join(ROOT, "tools", "pe2elf.py")
     filesystem_image = os.path.join(BUILD, "haku_fs.img")
+    spare_image = os.path.join(BUILD, "ata_spare.img")
     kernel_pe = os.path.join(BUILD, "kernel.pe")
     kernel_bin = os.path.join(BUILD, "kernel.bin")
     stage1_bin = os.path.join(BUILD, "stage1.bin")
@@ -457,8 +459,12 @@ def main():
          stage1_bin, stage2_bin, kernel_bin, str(kernel_sectors), img,
          stage1_asm, stage2_asm])
 
+    with open(spare_image, "wb") as f:
+        f.truncate(1474560)
+
     disk = [qemu, "-drive", f"file={img},format=raw,if=floppy,index=0",
             "-drive", f"file={filesystem_image},format=raw,if=ide,index=0,media=disk",
+            "-drive", f"file={spare_image},format=raw,if=ide,index=2,media=disk",
             "-boot", "order=a", "-no-reboot"]
     # CPU exception trace: shows every #GP/#PF/triple-fault with EIP.
     trace = ["-d", "int,cpu_reset", "-D", os.path.join(BUILD, "qemu.log")]
@@ -523,6 +529,10 @@ def main():
             "ELF-LOAD-OK",   # valid ELF32 PT_LOAD segments loaded to fresh CR3
             "USERMODE-READY",# user stack mapped in its own address space
             "ATA-OK primary-master LBA28",
+            "ATA-SCAN-OK devices=2",
+            "secondary-master LBA28", # spare disk on the second IDE channel
+            "ATA-RECOVERY-OK",   # software reset + reread after a recovery
+            "ATA-MULTI-OK",     # second channel device answers sector reads
             "FAT12-MOUNT-OK",
             "FAT12-READ-OK name=HAKU.ELF",
             "USERMODE-ENTER",# iret entered CPL 3
