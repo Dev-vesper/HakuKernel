@@ -620,6 +620,92 @@ static uint32_t sys_stat64(uint32_t user_path, uint32_t user_buf) {
     return 0;
 }
 
+/* fork(2): the child continues at the return address with 0, the parent
+ * gets the child pid. The child owns a copy of the address space and
+ * inherits the open descriptors. */
+static regs_t *sys_fork(regs_t *frame) {
+    frame->eax = (uint32_t)scheduler_fork(frame);
+    return frame;
+}
+
+/* clone(2): Haku implements the fork-like case only. The sharing flags
+ * (CLONE_VM, CLONE_FILES, CLONE_THREAD, ...) need address-space sharing
+ * and threads, which the kernel does not have yet. */
+static regs_t *sys_clone(regs_t *frame, uint32_t flags, uint32_t stack,
+                         uint32_t parent_tid, uint32_t child_tid,
+                         uint32_t tls) {
+    if (flags & (HAKU_CLONE_VM | HAKU_CLONE_FS | HAKU_CLONE_FILES |
+                 HAKU_CLONE_SIGHAND | HAKU_CLONE_VFORK | HAKU_CLONE_THREAD)) {
+        frame->eax = 0u - HAKU_EINVAL;
+        return frame;
+    }
+    if (stack || parent_tid || child_tid || tls) {
+        /* CLONE_SETTLS/CLONE_PARENT_SETTID/CLONE_CHILD_SETTID need
+         * thread-local storage and a second thread: not supported. */
+        frame->eax = 0u - HAKU_EINVAL;
+        return frame;
+    }
+    return sys_fork(frame);
+}
+
+/* wait4(2): the Linux form of waitpid, with WNOHANG and a rusage block. */
+static regs_t *sys_wait4(regs_t *frame, uint32_t pid, uint32_t user_status,
+                         uint32_t options, uint32_t user_rusage) {
+    if (user_status &&
+        !paging_user_range_valid(user_status, sizeof(uint32_t), 1)) {
+        frame->eax = 0u - HAKU_EFAULT;
+        return frame;
+    }
+    if (user_rusage &&
+        !paging_user_range_valid(user_rusage, sizeof(haku_rusage_t), 1)) {
+        frame->eax = 0u - HAKU_EFAULT;
+        return frame;
+    }
+    return scheduler_wait4(pid, user_status, options, user_rusage, frame);
+}
+
+/* uname(2): the kernel identifies itself; the fields are the Linux
+ * utsname layout (six 65-byte strings). */
+static uint32_t sys_uname(uint32_t user_buf) {
+    haku_utsname_t name;
+    if (!paging_user_range_valid(user_buf, sizeof(name), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    memset(&name, 0, sizeof(name));
+    memcpy(name.sysname, "Linux", 5);
+    memcpy(name.nodename, "haku", 4);
+    memcpy(name.release, "0.2.0", 5);
+    memcpy(name.version, "HakuKernel 0.2.0", 14);
+    memcpy(name.machine, "i686", 4);
+    if (!copy_to_user(user_buf, &name, sizeof(name)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0;
+}
+
+/* getrusage(2): Haku tracks ticks per process but not the detailed
+ * resource counters, so the block is reported as zeros. */
+static uint32_t sys_getrusage(uint32_t user_buf, uint32_t who) {
+    haku_rusage_t usage;
+    if (who != 0) return copy_from_user_error(HAKU_EINVAL);
+    if (!paging_user_range_valid(user_buf, sizeof(usage), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    memset(&usage, 0, sizeof(usage));
+    if (!copy_to_user(user_buf, &usage, sizeof(usage)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0;
+}
+
+/* times(2): the clock ticks are not exposed separately yet, so the four
+ * counters are reported as zeros. */
+static uint32_t sys_times(uint32_t user_buf) {
+    haku_tms_t ticks;
+    if (!paging_user_range_valid(user_buf, sizeof(ticks), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    memset(&ticks, 0, sizeof(ticks));
+    if (!copy_to_user(user_buf, &ticks, sizeof(ticks)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0;
+}
+
 /* fstatat64(300): the path/dirfd form musl's stat() uses. Only
  * AT_FDCWD is supported because Haku has no per-process working
  * directory; Haku paths always resolve from the root. */
@@ -806,6 +892,9 @@ regs_t *user_syscall(regs_t *r) {
     scheduler_note_syscall();
     switch (r->eax) {
     case HAKU_SYS_EXIT:
+    case HAKU_SYS_EXIT_GROUP:
+        /* Haku runs one thread per process, so ending the group and ending
+         * the calling thread are the same operation. */
         cpu_cli();
         klog_prefix();
         klog_write("USER-EXIT-OK status=");
@@ -814,6 +903,12 @@ regs_t *user_syscall(regs_t *r) {
         klog_dec(scheduler_current_pid());
         klog_write("\n");
         return scheduler_exit_current(r);
+    case HAKU_SYS_FORK:
+        return sys_fork(r);
+    case HAKU_SYS_CLONE:
+        return sys_clone(r, r->ebx, r->ecx, r->edx, r->esi, r->edi);
+    case HAKU_SYS_WAIT4:
+        return sys_wait4(r, r->ebx, r->ecx, r->edx, r->esi);
     case HAKU_SYS_READ:
         r->eax = sys_read(r->ebx, r->ecx, r->edx);
         return r;
@@ -891,6 +986,28 @@ regs_t *user_syscall(regs_t *r) {
         return r;
     case HAKU_SYS_GETPID:
         r->eax = scheduler_current_pid();
+        return r;
+    case HAKU_SYS_GETPPID:
+        r->eax = scheduler_parent_pid();
+        return r;
+    case HAKU_SYS_GETTID:
+        r->eax = scheduler_current_pid();
+        return r;
+    case HAKU_SYS_GETUID:
+    case HAKU_SYS_GETEUID:
+    case HAKU_SYS_GETGID:
+    case HAKU_SYS_GETEGID:
+        /* Haku has a single user: the root account. */
+        r->eax = 0u;
+        return r;
+    case HAKU_SYS_UNAME:
+        r->eax = sys_uname(r->ebx);
+        return r;
+    case HAKU_SYS_GETRUSAGE:
+        r->eax = sys_getrusage(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_TIMES:
+        r->eax = sys_times(r->ebx);
         return r;
     case HAKU_SYS_GETTIMEOFDAY:
         r->eax = sys_gettimeofday(r->ebx);

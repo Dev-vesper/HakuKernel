@@ -123,6 +123,31 @@ int main(void) {
     expect(unlink("LIBDIR/F.TXT") == 0, "unlink in directory");
     expect(rmdir("LIBDIR") == 0, "rmdir");
 
+    /* fork: the child writes a file and leaves with status 7, the parent
+     * waits for it and sees the status. */
+    {
+        int child = fork();
+        if (child == 0) {
+            int child_fd = open("FORK.TXT", O_CREAT | O_RDWR | O_TRUNC, 0644);
+            if (child_fd >= 3) {
+                write(child_fd, "x", 1);
+                close(child_fd);
+            }
+            exit(7);
+        }
+        expect(child > 0, "fork");
+        if (child > 0) {
+            int child_status = 0;
+            int reaped = waitpid(child, &child_status, 0);
+            expect(reaped == child, "waitpid child");
+            expect(child_status == (7 << 8), "waitpid status");
+            expect(waitpid(child, &child_status, 0) == -1 &&
+                       errno == ECHILD,
+                   "waitpid reaped twice");
+            expect(unlink("FORK.TXT") == 0, "unlink fork file");
+        }
+    }
+
     expect(atoi("-123") == -123, "atoi");
 
     if (failures) {

@@ -301,6 +301,59 @@ void paging_activate_kernel_space(void) {
     }
 }
 
+int paging_copy_user_space(const address_space_t *source,
+                           address_space_t *destination) {
+    uint32_t *source_directory;
+    uint32_t *destination_directory;
+
+    if (!source || !destination || !source->directory_phys ||
+        !destination->directory_phys)
+        return 0;
+
+    source_directory = (uint32_t *)PHYS_TO_VIRT(source->directory_phys);
+    destination_directory = (uint32_t *)PHYS_TO_VIRT(destination->directory_phys);
+
+    /* Only the user half of the address space belongs to the process; the
+     * supervisor direct map and the framebuffer window are shared by every
+     * space and must stay shared. */
+    for (uint32_t di = 256; di < (PAGING_USER_LIMIT >> 22); di++) {
+        uint32_t pde = source_directory[di];
+        uint32_t table_phys;
+        uint32_t *table;
+        if ((pde & (PAGE_PRESENT | PAGE_USER)) != (PAGE_PRESENT | PAGE_USER))
+            continue;
+        table_phys = pde & 0xFFFFF000u;
+        if (table_phys >= PAGING_PHYS_LIMIT) continue;
+        table = (uint32_t *)PHYS_TO_VIRT(table_phys);
+        for (uint32_t ti = 0; ti < PAGING_ENTRIES; ti++) {
+            uint32_t pte = table[ti];
+            uint32_t source_phys;
+            uint32_t virtual_addr;
+            void *page;
+            if (!(pte & PAGE_PRESENT)) continue;
+            source_phys = pte & 0xFFFFF000u;
+            if (source_phys >= PAGING_PHYS_LIMIT) goto failed;
+            page = frame_alloc();
+            if (!page) goto failed;
+            memcpy(PHYS_TO_VIRT(page), PHYS_TO_VIRT(source_phys), FRAME_SIZE);
+            virtual_addr = (di << 22) | (ti << 12);
+            if (!paging_map_user_page(destination, virtual_addr,
+                                      (uint32_t)page,
+                                      (pte & PAGE_RW) ? 1 : 0)) {
+                frame_free(page);
+                goto failed;
+            }
+        }
+    }
+    return 1;
+
+failed:
+    /* The destination space is discarded whole: a half-copied address
+     * space must never be activated. */
+    paging_destroy_user_space(destination);
+    return 0;
+}
+
 void paging_destroy_user_space(address_space_t *space) {
     uint32_t *directory;
     if (!space || !space->directory_phys ||

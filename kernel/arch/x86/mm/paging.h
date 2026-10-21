@@ -82,6 +82,12 @@ uint32_t paging_map_framebuffer(uint32_t physical_base, uint32_t length);
 void paging_activate_user_space(const address_space_t *space);
 void paging_activate_kernel_space(void);
 void paging_destroy_user_space(address_space_t *space);
+/* Copy every user page of one address space into another (fork): the
+ * destination gets its own frames with the same contents and protection.
+ * The destination must already have a directory; on failure it is
+ * destroyed and 0 is returned. */
+int paging_copy_user_space(const address_space_t *source,
+                           address_space_t *destination);
 int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
                             int write_access);
 int paging_copy_to_user_space(const address_space_t *space,

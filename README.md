@@ -191,16 +191,26 @@ so reserved pages cannot accidentally be released.
 ### Processes and preemptive scheduling
 
 `kernel/kernel/scheduler.c` starts the initial process from `HAKU.ELF`; a successful
-`spawn` creates a child process from a root-filesystem ELF and `waitpid`
-suspends the parent until the requested child exits. Exit status is returned
-in the traditional high-byte wait status format; a successful wait reaps the
-child record. The current spawn interface accepts a pathname only and starts
-the child with empty argument and environment vectors; the child inherits a
-copy of the parent's descriptor table (standard descriptors and any open
-files, each sharing the parent's open file description). `waitpid` accepts a
-specific child PID or `-1` (any child)
-and currently supports only options `0`. `execve` replaces a process image
-from the root filesystem.
+`spawn` creates a child process from a root-filesystem ELF, `fork` creates one
+as a copy of the caller, and `waitpid`/`wait4` suspends the parent until the
+requested child exits. Exit status is returned in the traditional high-byte
+wait status format; a successful wait reaps the child record. The current
+spawn interface accepts a pathname only and starts the child with empty
+argument and environment vectors; the child inherits a copy of the parent's
+descriptor table (standard descriptors and any open files, each sharing the
+parent's open file description). `waitpid` accepts a specific child PID or
+`-1` (any child) and currently supports only options `0`; `wait4` follows the
+Linux call, accepting `WNOHANG` and writing a zeroed `struct rusage` (the
+per-process accounting described below is not yet wired into it).
+`exit_group` ends the calling process like `exit`. `clone` is accepted only
+for the `SIGCHLD` form (`fork` with no sharing flags) and returns `EINVAL` for
+the thread-creating flags, stack pointer, or parent-tid arguments, so no
+half-supported threading model is exposed. A forked child gets a private copy
+of the address space (code, data, stacks, heap, and mappings), a copy of the
+caller's saved register frame with `eax` zeroed, and its own descriptor table;
+the parent sees the child PID. Fork does not yet share or copy expanded
+segments lazily (copy-on-write), so the copy is eager. `execve` replaces a
+process image from the root filesystem.
 Each process has its own address space and an 8 KiB ring-0 stack; the stack
 is allocated as physical frames and addressed through the kernel direct map.
 `gdt_set_kernel_stack` updates `TSS.esp0` at every task switch so the next
@@ -217,7 +227,8 @@ identity and direct-map entries and maps its user program and two-page user
 stack with user permissions.
 
 `kernel/arch/x86/user/user.asm` is built as an ELF32 image and entered via `iret` at CPL 3.
-It tests `spawn` (`0x1000`, Haku-specific) and `waitpid` (7), as well as
+It tests `spawn` (`0x1000`, Haku-specific), `fork` (2), `wait4` (114), and
+`waitpid` (7), as well as
 `execve` (11), which loads another ELF32 image, builds an aligned
 initial user stack containing `argc`, `argv`, `envp`, and a terminating
 `AT_NULL` auxiliary-vector entry, and replaces the calling process without
@@ -226,12 +237,15 @@ strings; their strings are limited to 4096 combined bytes including NUL
 terminators and must fit the two-page initial stack. Larger inputs return
 `E2BIG`, and invalid user pointers return `EFAULT`. The syscall ABI follows
 the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
-`read` (3), `write` (4), `open` (5), `close` (6), `waitpid` (7),
+`fork` (2), `read` (3), `write` (4), `open` (5), `close` (6), `waitpid` (7),
 `unlink` (10), `execve` (11), `lseek` (19), `getpid` (20), `rename` (38),
 `mkdir` (39), `rmdir` (40), `dup` (41), `brk` (45), `dup2` (63),
 `gettimeofday` (78), `mmap` (90), `munmap` (91), `stat` (106), `lstat` (107),
-`fstat` (108), `nanosleep` (162), `stat64` (195), `lstat64` (196),
-`fstat64` (197), `fstatat64` (300), and `statx` (383), with arguments in
+`fstat` (108), `wait4` (114), `clone` (120), `nanosleep` (162),
+`stat64` (195), `lstat64` (196),
+`fstat64` (197), `exit_group` (252), `fstatat64` (300), `uname` (122),
+`getrusage` (77), `times` (43), `getppid` (64), `getuid` (24), `geteuid` (49),
+`getgid` (47), `getegid` (50), and `statx` (383), with arguments in
 `ebx`, `ecx`, `edx`, `esi`, and `edi` and syscall number/result in `eax`.
 The Haku-specific `spawn` and `getusage` syscalls use `0x1000` and `0x1001`.
 The public ABI definitions are in `include/haku/abi.h` for C and

@@ -36,13 +36,22 @@ regs_t *scheduler_preempt(regs_t *frame);
 regs_t *scheduler_exit_current(regs_t *frame);
 int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame);
 int32_t scheduler_spawn(loaded_elf_t *program);
+/* fork(2)/clone(2): the child gets a copy of the parent's user address
+ * space and inherits its descriptors; the child returns 0 from the call
+ * and the parent gets the new pid. */
+int32_t scheduler_fork(regs_t *frame);
 regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
                           uint32_t options, regs_t *frame);
+/* wait4(2): like waitpid, but WNOHANG is accepted and the rusage block
+ * is written when the caller provides one. */
+regs_t *scheduler_wait4(uint32_t pid, uint32_t user_status, uint32_t options,
+                        uint32_t user_rusage, regs_t *frame);
 regs_t *scheduler_sleep_ticks(uint32_t ticks, regs_t *frame);
 uint32_t scheduler_brk(uint32_t requested);
 uint32_t scheduler_mmap(uint32_t length, int writable);
 uint32_t scheduler_munmap(uint32_t address, uint32_t length);
 uint32_t scheduler_current_pid(void);
+uint32_t scheduler_parent_pid(void);
 void scheduler_note_syscall(void);
 int scheduler_get_usage(haku_usage_t *usage);
 

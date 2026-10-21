@@ -549,6 +549,7 @@ def main():
             "STDIO-OK",      # standard descriptors 0/1/2 installed on the console
             "USER-STDIO-OK", # stdio redirect via dup2, close, and restore
             "SPAWN-CHILD-RAN",
+            "USER-FORK-OK",   # fork/wait4/exit_group round trip
             "USER-WAITPID-OK child status=42 reaped",
             "USER-FD-INHERIT-OK", # spawn inherited fd 3; child exit closed it
             "USER-TIME-OK",  # gettimeofday reads ticks; nanosleep blocks until wake

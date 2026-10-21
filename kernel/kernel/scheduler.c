@@ -33,6 +33,7 @@ typedef struct {
     uint32_t exit_status;
     uint32_t wait_pid;
     uint32_t wait_status_user;
+    uint32_t wait_rusage_user;
     uint32_t wake_tick;
     uint32_t heap_brk;    /* current program break (0 = not yet used) */
     uint32_t heap_top;    /* highest heap page ever mapped (grow only) */
@@ -189,6 +190,20 @@ static void release_task_resources(task_t *task) {
     task->frame = 0;
 }
 
+/* Free the slots of children that their parent already reaped. The
+ * timer-driven reap does this too, but a new task must not depend on a
+ * timer tick landing in the right window: the process table would
+ * otherwise run out of slots while a freed one is still pending. */
+static void release_reaped_slots(void) {
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        task_t *task = &tasks[i];
+        if (task->state != TASK_REAP_PENDING || (int)i == current_task)
+            continue;
+        release_task_resources(task);
+        memset(task, 0, sizeof(*task));
+    }
+}
+
 static void reap_completed_tasks(void) {
     for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
         task_t *task = &tasks[i];
@@ -321,6 +336,27 @@ regs_t *scheduler_preempt(regs_t *frame) {
                                           tasks[next].frame;
 }
 
+/* Hand the wait result to the parent: the exit status and, when the
+ * parent asked for one, a zeroed rusage block. The parent's return value
+ * is the reaped child pid, or -EFAULT when a user pointer is invalid. */
+static int deliver_wait_result(task_t *parent, task_t *child, uint32_t status) {
+    haku_rusage_t usage;
+    if (parent->wait_status_user &&
+        !paging_copy_to_user_space(&parent->program.address_space,
+                                   parent->wait_status_user, &status,
+                                   sizeof(status)))
+        return 0;
+    if (parent->wait_rusage_user) {
+        memset(&usage, 0, sizeof(usage));
+        if (!paging_copy_to_user_space(&parent->program.address_space,
+                                       parent->wait_rusage_user, &usage,
+                                       sizeof(usage)))
+            return 0;
+    }
+    parent->frame->eax = child->pid;
+    return 1;
+}
+
 regs_t *scheduler_exit_current(regs_t *frame) {
     int next;
     task_t *exiting;
@@ -361,16 +397,12 @@ regs_t *scheduler_exit_current(regs_t *frame) {
             pid_matches = parent->wait_pid == 0xFFFFFFFFu ||
                           parent->wait_pid == exiting->pid;
             if (!pid_matches) continue;
-            if (parent->wait_status_user &&
-                !paging_copy_to_user_space(&parent->program.address_space,
-                                           parent->wait_status_user,
-                                           &status, sizeof(status)))
+            if (!deliver_wait_result(parent, exiting, status))
                 parent->frame->eax = 0u - 14u;
-            else
-                parent->frame->eax = exiting->pid;
             parent->state = TASK_RUNNABLE;
             parent->wait_pid = 0;
             parent->wait_status_user = 0;
+            parent->wait_rusage_user = 0;
             exiting->state = TASK_REAP_PENDING;
             break;
         }
@@ -443,6 +475,12 @@ uint32_t scheduler_current_pid(void) {
     if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
         return 0;
     return tasks[current_task].pid;
+}
+
+uint32_t scheduler_parent_pid(void) {
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0;
+    return tasks[current_task].parent_pid;
 }
 
 void scheduler_note_syscall(void) {
@@ -556,6 +594,7 @@ int32_t scheduler_spawn(loaded_elf_t *program) {
      * acquired with interrupts disabled. A STARTING task is ignored by the
      * scheduler until it is fully built. */
     flags = irq_lock();
+    release_reaped_slots();
     parent_pid = tasks[current_task].pid;
     for (slot = 1; slot < SCHEDULER_MAX_PROCESSES; slot++) {
         if (tasks[slot].state == TASK_UNUSED) {
@@ -604,6 +643,113 @@ int32_t scheduler_spawn(loaded_elf_t *program) {
     klog_dec(child->pid);
     klog_write("\n");
     return (int32_t)child->pid;
+}
+
+/* Build the child's kernel stack and register frame for a fork: the frame
+ * is a copy of the parent's syscall frame, so the child resumes at the
+ * same instruction with eax = 0 (the fork return value). */
+static int initialize_fork_stack(task_t *task, const regs_t *parent_frame) {
+    uint32_t stack_bytes = TASK_KERNEL_STACK_PAGES * FRAME_SIZE;
+    uint32_t stack_top;
+    regs_t *frame;
+
+    task->kernel_stack = (uint32_t)frame_alloc_pages(TASK_KERNEL_STACK_PAGES);
+    if (!task->kernel_stack ||
+        task->kernel_stack + stack_bytes > PAGING_PHYS_LIMIT) {
+        if (task->kernel_stack)
+            frame_free_pages((void *)task->kernel_stack,
+                             TASK_KERNEL_STACK_PAGES);
+        task->kernel_stack = 0;
+        return 0;
+    }
+    stack_top = (uint32_t)PHYS_TO_VIRT(task->kernel_stack) + stack_bytes;
+    frame = (regs_t *)(stack_top - sizeof(regs_t));
+    memcpy(frame, parent_frame, sizeof(*frame));
+    frame->eax = 0u;
+    task->frame = frame;
+    return 1;
+}
+
+int32_t scheduler_fork(regs_t *frame) {
+    irqflags_t flags;
+    uint32_t parent_pid;
+    uint32_t slot;
+    task_t *child = 0;
+    task_t *parent;
+
+    if (!scheduler_started || !frame || current_task < 0 ||
+        current_task >= SCHEDULER_IDLE_INDEX)
+        return -(int32_t)HAKU_EINVAL;
+    if ((frame->cs & 3u) != 3u)
+        return -(int32_t)HAKU_EINVAL;
+    parent = &tasks[current_task];
+
+    /* Reserve a slot first: a STARTING task is ignored by the scheduler
+     * until it is fully built. */
+    flags = irq_lock();
+    release_reaped_slots();
+    parent_pid = parent->pid;
+    for (slot = 1; slot < SCHEDULER_MAX_PROCESSES; slot++) {
+        if (tasks[slot].state == TASK_UNUSED) {
+            child = &tasks[slot];
+            break;
+        }
+    }
+    if (!child) {
+        irq_unlock(flags);
+        return -(int32_t)HAKU_EAGAIN;
+    }
+    memset(child, 0, sizeof(*child));
+    child->pid = slot + 1u;
+    child->parent_pid = parent_pid;
+    child->state = TASK_STARTING;
+    irq_unlock(flags);
+
+    /* The child gets its own copy of the user address space: same pages,
+     * same contents, separate frames (no copy-on-write yet). */
+    if (!paging_create_user_space(&child->program.address_space))
+        goto failed;
+    if (!paging_copy_user_space(&parent->program.address_space,
+                                &child->program.address_space))
+        goto failed;
+    child->program.entry = parent->program.entry;
+    child->program.user_stack = parent->program.user_stack;
+
+    if (!initialize_fork_stack(child, frame))
+        goto failed;
+
+    /* The child inherits the parent's descriptors and shares the same open
+     * file descriptions (refcounted), exactly like a Linux fork. */
+    if (vfs_inherit(parent_pid, child->pid) != 1)
+        goto failed;
+
+    /* The heap break and the anonymous mappings belong to the child too. */
+    child->heap_brk = parent->heap_brk;
+    child->heap_top = parent->heap_top;
+    child->mmap_region_count = parent->mmap_region_count;
+    memcpy(child->mmap_regions, parent->mmap_regions,
+           sizeof(child->mmap_regions));
+
+    flags = irq_lock();
+    child->state = TASK_RUNNABLE;
+    irq_unlock(flags);
+    klog_prefix();
+    klog_write("sched: FORK-OK parent=");
+    klog_dec(parent_pid);
+    klog_write(" child=");
+    klog_dec(child->pid);
+    klog_write("\n");
+    return (int32_t)child->pid;
+
+failed:
+    /* The partially built child is discarded whole: its address space and
+     * kernel stack are released and the slot returns to the table. It is
+     * still TASK_STARTING here, so the scheduler never runs it. */
+    release_task_resources(child);
+    flags = irq_lock();
+    memset(child, 0, sizeof(*child));
+    irq_unlock(flags);
+    return -(int32_t)HAKU_ENOMEM;
 }
 
 regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
@@ -655,15 +801,13 @@ regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
     }
 
     if (zombie) {
-        if (user_status &&
-            !paging_copy_to_user_space(&parent->program.address_space,
-                                       user_status, &zombie->exit_status,
-                                       sizeof(zombie->exit_status))) {
+        parent->wait_status_user = user_status;
+        parent->wait_rusage_user = 0;
+        if (!deliver_wait_result(parent, zombie, zombie->exit_status)) {
             frame->eax = 0u - 14u;
             irq_unlock(flags);
             return frame;
         }
-        frame->eax = zombie->pid;
         zombie->state = TASK_REAP_PENDING;
         irq_unlock(flags);
         return frame;
@@ -672,6 +816,93 @@ regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
     parent->state = TASK_WAITING;
     parent->wait_pid = pid;
     parent->wait_status_user = user_status;
+    parent->wait_rusage_user = 0;
+    parent->frame = frame;
+    next = find_next_task();
+    activate_task(next);
+    return next == SCHEDULER_IDLE_INDEX ? idle_task.frame :
+                                          tasks[next].frame;
+}
+
+/* wait4(2): the Linux form of waitpid. It accepts WNOHANG, treats pid 0
+ * as "any child" (Haku has no process groups), and writes a rusage block
+ * when the caller passes one. */
+regs_t *scheduler_wait4(uint32_t pid, uint32_t user_status, uint32_t options,
+                        uint32_t user_rusage, regs_t *frame) {
+    task_t *parent;
+    task_t *zombie = 0;
+    int has_child = 0;
+    int next;
+    irqflags_t flags;
+
+    if (!frame || current_task < 0 ||
+        current_task >= SCHEDULER_IDLE_INDEX)
+        return frame;
+    flags = irq_lock();
+    if (options & ~(uint32_t)HAKU_WNOHANG) {
+        frame->eax = 0u - HAKU_EINVAL;
+        irq_unlock(flags);
+        return frame;
+    }
+    if (pid == 0) pid = 0xFFFFFFFFu;
+    if (pid != 0xFFFFFFFFu && pid > 0x7FFFFFFFu) {
+        frame->eax = 0u - HAKU_EINVAL;
+        irq_unlock(flags);
+        return frame;
+    }
+    if (pid != 0xFFFFFFFFu && pid > SCHEDULER_MAX_PROCESSES) {
+        frame->eax = 0u - HAKU_ECHILD;
+        irq_unlock(flags);
+        return frame;
+    }
+
+    parent = &tasks[current_task];
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        task_t *child = &tasks[i];
+        if (child->state == TASK_UNUSED ||
+            child->state == TASK_REAP_PENDING ||
+            child->parent_pid != parent->pid)
+            continue;
+        if (pid != 0xFFFFFFFFu && child->pid != pid) continue;
+        has_child = 1;
+        if (child->state == TASK_ZOMBIE) {
+            zombie = child;
+            break;
+        }
+    }
+    if (!has_child) {
+        frame->eax = 0u - HAKU_ECHILD;
+        irq_unlock(flags);
+        return frame;
+    }
+
+    if (zombie) {
+        parent->wait_status_user = user_status;
+        parent->wait_rusage_user = user_rusage;
+        if (!deliver_wait_result(parent, zombie, zombie->exit_status)) {
+            frame->eax = 0u - 14u;
+            parent->wait_rusage_user = 0;
+            irq_unlock(flags);
+            return frame;
+        }
+        parent->wait_rusage_user = 0;
+        zombie->state = TASK_REAP_PENDING;
+        irq_unlock(flags);
+        return frame;
+    }
+
+    if (options & HAKU_WNOHANG) {
+        /* No child has exited yet: report "nothing ready" and stay
+         * runnable instead of blocking. */
+        frame->eax = 0u;
+        irq_unlock(flags);
+        return frame;
+    }
+
+    parent->state = TASK_WAITING;
+    parent->wait_pid = pid;
+    parent->wait_status_user = user_status;
+    parent->wait_rusage_user = user_rusage;
     parent->frame = frame;
     next = find_next_task();
     activate_task(next);

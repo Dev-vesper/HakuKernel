@@ -240,9 +240,17 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   `fstatat64`, and `statx`, and the user library reads the same layout as
   musl; the Haku-specific `spawn`/`getusage` pair stays outside the Linux
   range).
-- [ ] Add process creation and reaping: `fork`/`clone` (with `SIGCHLD`),
-  `vfork`, `wait4`, and `exit_group`, replacing the ELF-only `spawn` model
-  as the primary way to start a second process.
+- [x] Add process creation and reaping: `fork` (an eager copy of the address
+  space, the caller's saved register frame with `eax` zeroed, and the
+  descriptor table), the `SIGCHLD` form of `clone`, `wait4` (`WNOHANG` and
+  any-child forms; `rusage` is accepted but zeroed), and `exit_group`. The
+  ELF-only `spawn` model is no longer the only way to start a process; it is
+  covered by `USER-FORK-OK` in the ring-3 self-test and by the C library
+  (whose `waitpid` is now a `wait4` wrapper).
+- [ ] Add `vfork` (share the address space until `execve`/`exit`) and
+  copy-on-write for `fork` instead of the eager copy, so large processes do
+  not pay for a full duplicate. `clone` still rejects the thread-creating
+  flags, stack pointers, and parent-tid arguments with `EINVAL`.
 - [ ] Add signals: `kill`/`tkill`/`tgkill`, `rt_sigaction`,
   `rt_sigprocmask`, `rt_sigreturn`, pending-signal delivery, and default
   dispositions (the kernel currently has no signal state at all).
@@ -253,12 +261,13 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   addresses).
 - [ ] Add `futex` so libc locks, and later threads, behave correctly.
 - [ ] Extend the filesystem ABI for libc and shell tooling: the `*at` family
-  (`openat`, `unlinkat`, `renameat`, `mkdirat`, `fstatat`), `statx`,
+  (`openat`, `unlinkat`, `renameat`, `mkdirat`, `fstatat`),
   `fchmod`/`fchown`, `symlink`/`readlink`, `truncate`/`ftruncate`, `access`,
   `getdents64`, `chdir`/`getcwd`, `dup3`, `pipe`/`pipe2`, `fcntl`, `ioctl`
-  (termios for an interactive shell), `poll`/`select`, `uname`,
+  (termios for an interactive shell), `poll`/`select`,
   `getrlimit`/`setrlimit`, `getrandom`, `sched_yield`, `prctl`, and
-  `personality`.
+  `personality` (`statx`, `uname`, and the caller's `getuid` family are
+  already implemented).
 - [ ] Add a Unix-like filesystem for the userland: an in-memory filesystem
   (initramfs) with long names, permission bits, symlinks, timestamps, and
   nested directories, plus a device layer (`/dev/null`, `/dev/zero`,

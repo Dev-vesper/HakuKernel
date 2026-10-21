@@ -13,6 +13,7 @@
 
 /* i386 Linux syscall numbers implemented by Haku. */
 #define HAKU_SYS_EXIT    1u
+#define HAKU_SYS_FORK    2u
 #define HAKU_SYS_READ    3u
 #define HAKU_SYS_WRITE   4u
 #define HAKU_SYS_OPEN    5u
@@ -22,12 +23,21 @@
 #define HAKU_SYS_EXECVE  11u
 #define HAKU_SYS_LSEEK   19u
 #define HAKU_SYS_GETPID  20u
+/* i386 set*id/get*id: Haku has a single user, so every process runs as
+ * uid/gid 0 and the setters are not implemented. */
+#define HAKU_SYS_GETUID  24u
 #define HAKU_SYS_RENAME  38u
 #define HAKU_SYS_MKDIR   39u
 #define HAKU_SYS_RMDIR   40u
 #define HAKU_SYS_DUP     41u
+#define HAKU_SYS_TIMES   43u
 #define HAKU_SYS_BRK     45u
+#define HAKU_SYS_GETGID  47u
+#define HAKU_SYS_GETEUID 49u
+#define HAKU_SYS_GETEGID 50u
 #define HAKU_SYS_DUP2    63u
+#define HAKU_SYS_GETPPID 64u
+#define HAKU_SYS_GETRUSAGE 77u
 #define HAKU_SYS_GETTIMEOFDAY 78u
 /* i386 old_mmap: a single pointer to haku_mmap_arg_t in ebx. */
 #define HAKU_SYS_MMAP    90u
@@ -36,18 +46,24 @@
 #define HAKU_SYS_STAT    106u
 #define HAKU_SYS_LSTAT   107u
 #define HAKU_SYS_FSTAT   108u
+#define HAKU_SYS_WAIT4   114u
+#define HAKU_SYS_CLONE   120u
+#define HAKU_SYS_UNAME   122u
 #define HAKU_SYS_NANOSLEEP    162u
 /* i386 "stat64" family: the 96-byte struct stat64 layout that glibc and
  * musl use on i386 (musl's stat() goes through fstatat64). */
 #define HAKU_SYS_STAT64  195u
 #define HAKU_SYS_LSTAT64 196u
 #define HAKU_SYS_FSTAT64 197u
+#define HAKU_SYS_GETTID  224u
+#define HAKU_SYS_EXIT_GROUP 252u
 #define HAKU_SYS_FSTATAT64 300u
+/* The call musl's stat() makes first on i386. */
+#define HAKU_SYS_STATX   383u
 
 /* i386 Linux syscall numbers reserved for the upcoming milestones: they
  * are listed so the ABI stays a single, Linux-shaped table, but the kernel
  * answers -ENOSYS until the matching work lands. */
-#define HAKU_SYS_FORK      2u
 #define HAKU_SYS_LINK      9u
 #define HAKU_SYS_CHDIR     12u
 #define HAKU_SYS_MKNOD     14u
@@ -58,18 +74,11 @@
 #define HAKU_SYS_IOCTL     54u
 #define HAKU_SYS_FCNTL     55u
 #define HAKU_SYS_SETUID    23u
-#define HAKU_SYS_GETUID    24u
 #define HAKU_SYS_ACCESS    33u
 #define HAKU_SYS_KILL      37u
 #define HAKU_SYS_PIPE      42u
-#define HAKU_SYS_TIMES     43u
 #define HAKU_SYS_SETGID    46u
-#define HAKU_SYS_GETGID    47u
-#define HAKU_SYS_GETEUID   49u
-#define HAKU_SYS_GETEGID   50u
-#define HAKU_SYS_GETPPID   64u
 #define HAKU_SYS_SETRLIMIT 75u
-#define HAKU_SYS_GETRUSAGE 77u
 #define HAKU_SYS_SYMLINK   83u
 #define HAKU_SYS_READLINK  85u
 #define HAKU_SYS_REBOOT    88u
@@ -77,9 +86,6 @@
 #define HAKU_SYS_FTRUNCATE 93u
 #define HAKU_SYS_FCHMOD    94u
 #define HAKU_SYS_FCHOWN    95u
-#define HAKU_SYS_WAIT4     114u
-#define HAKU_SYS_CLONE     120u
-#define HAKU_SYS_UNAME     122u
 #define HAKU_SYS_MPROTECT  125u
 #define HAKU_SYS_FCHDIR    133u
 #define HAKU_SYS_PERSONALITY 136u
@@ -99,11 +105,9 @@
 #define HAKU_SYS_MMAP2     192u
 #define HAKU_SYS_GETDENTS64 220u
 #define HAKU_SYS_FCNTL64   221u
-#define HAKU_SYS_GETTID    224u
 #define HAKU_SYS_TKILL     238u
 #define HAKU_SYS_FUTEX     240u
 #define HAKU_SYS_SET_THREAD_AREA 243u
-#define HAKU_SYS_EXIT_GROUP 252u
 #define HAKU_SYS_EPOLL_CREATE 254u
 #define HAKU_SYS_EPOLL_CTL 255u
 #define HAKU_SYS_EPOLL_WAIT 256u
@@ -125,8 +129,21 @@
 #define HAKU_SYS_PIPE2     331u
 #define HAKU_SYS_PRLIMIT64 340u
 #define HAKU_SYS_GETRANDOM 355u
-#define HAKU_SYS_STATX     383u
 #define HAKU_SYS_RSEQ      386u
+
+/* Process-creation flags (Linux). Haku implements the fork-like case of
+ * clone: a new process with its own copy of the address space and the
+ * parent's descriptors. The sharing flags (CLONE_VM and friends) are
+ * rejected with EINVAL. */
+#define HAKU_SIGCHLD       17u
+#define HAKU_CLONE_VM      0x100u
+#define HAKU_CLONE_FS      0x200u
+#define HAKU_CLONE_FILES   0x400u
+#define HAKU_CLONE_SIGHAND 0x800u
+#define HAKU_CLONE_VFORK   0x4000u
+#define HAKU_CLONE_THREAD  0x10000u
+/* wait4(2) options. */
+#define HAKU_WNOHANG       0x1u
 
 /* Haku-specific syscalls for starting a child ELF from a pathname and for
  * reading the calling process's memory/resource usage. They live outside
@@ -186,6 +203,9 @@
 #define HAKU_STAT_SIZE     64u
 #define HAKU_STAT64_SIZE   96u
 #define HAKU_STAT_BLKSIZE  512u
+#define HAKU_RUSAGE_SIZE   72u
+#define HAKU_TMS_SIZE      16u
+#define HAKU_UTSNAME_SIZE  390u
 /* AT_FDCWD is the "relative to the current directory" dirfd value. */
 #define HAKU_AT_FDCWD      (-100)
 #define HAKU_AT_SYMLINK_NOFOLLOW 0x100u
@@ -376,6 +396,46 @@ typedef struct {
 } haku_statx_t;
 #pragma pack(pop)
 
+/* i386 Linux "struct rusage" (80 bytes) and "struct tms" (16 bytes):
+ * the accounting blocks wait4(2) and getrusage(2) fill in. */
+typedef struct {
+    haku_u32 ru_utime_sec;
+    haku_u32 ru_utime_usec;
+    haku_u32 ru_stime_sec;
+    haku_u32 ru_stime_usec;
+    haku_i32 ru_maxrss;
+    haku_i32 ru_ixrss;
+    haku_i32 ru_idrss;
+    haku_i32 ru_isrss;
+    haku_i32 ru_minflt;
+    haku_i32 ru_majflt;
+    haku_i32 ru_nswap;
+    haku_i32 ru_inblock;
+    haku_i32 ru_oublock;
+    haku_i32 ru_msgsnd;
+    haku_i32 ru_msgrcv;
+    haku_i32 ru_nsignals;
+    haku_i32 ru_nvcsw;
+    haku_i32 ru_nivcsw;
+} haku_rusage_t;
+
+typedef struct {
+    haku_u32 tms_utime;
+    haku_u32 tms_stime;
+    haku_u32 tms_cutime;
+    haku_u32 tms_cstime;
+} haku_tms_t;
+
+/* i386 Linux "struct utsname": six 65-byte fields (390 bytes). */
+typedef struct {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+} haku_utsname_t;
+
 typedef char haku_u32_must_be_32_bits[(sizeof(haku_u32) == 4u) ? 1 : -1];
 typedef char haku_u64_must_be_64_bits[(sizeof(haku_u64) == 8u) ? 1 : -1];
 typedef char haku_stat_must_be_64_bytes[
@@ -384,6 +444,12 @@ typedef char haku_stat64_must_be_96_bytes[
     (sizeof(haku_stat64_t) == 96u) ? 1 : -1];
 typedef char haku_statx_must_be_256_bytes[
     (sizeof(haku_statx_t) == 256u) ? 1 : -1];
+typedef char haku_rusage_must_be_72_bytes[
+    (sizeof(haku_rusage_t) == 72u) ? 1 : -1];
+typedef char haku_tms_must_be_16_bytes[
+    (sizeof(haku_tms_t) == 16u) ? 1 : -1];
+typedef char haku_utsname_must_be_390_bytes[
+    (sizeof(haku_utsname_t) == 390u) ? 1 : -1];
 typedef char haku_stat_mode_must_be_16_bits[
     (sizeof(((haku_stat_t *)0)->st_mode) == 2u) ? 1 : -1];
 typedef char haku_timeval_must_be_8_bytes[

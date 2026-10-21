@@ -58,9 +58,42 @@ int getpid(void) {
     return haku_syscall0(HAKU_SYS_GETPID);
 }
 
+int getppid(void) {
+    return haku_syscall0(HAKU_SYS_GETPPID);
+}
+
+int getuid(void) {
+    return haku_syscall0(HAKU_SYS_GETUID);
+}
+
+int geteuid(void) {
+    return haku_syscall0(HAKU_SYS_GETEUID);
+}
+
+int getgid(void) {
+    return haku_syscall0(HAKU_SYS_GETGID);
+}
+
+int getegid(void) {
+    return haku_syscall0(HAKU_SYS_GETEGID);
+}
+
+/* fork(2): the child returns 0 and continues at the same instruction
+ * with its own copy of the address space; the parent gets the child pid. */
+int fork(void) {
+    int result = haku_syscall0(HAKU_SYS_FORK);
+    if (result < 0) {
+        errno = -result;
+        return -1;
+    }
+    return result;
+}
+
+/* waitpid(2) goes through the Linux wait4(114) call, so WNOHANG and the
+ * "any child" pid forms behave the way a Linux program expects. */
 int waitpid(int pid, int *status, int options) {
     return haku_errno_check(
-        haku_syscall3(HAKU_SYS_WAITPID, pid, (int)status, options));
+        haku_syscall4(HAKU_SYS_WAIT4, pid, (int)status, options, 0));
 }
 
 int spawn(const char *path) {
@@ -144,5 +177,9 @@ void _exit(int status) {
 }
 
 void exit(int status) {
-    _exit(status);
+    /* exit_group(252) ends the whole process, like a Linux libc does;
+     * Haku runs one thread per process, so it ends this task. */
+    haku_syscall1(HAKU_SYS_EXIT_GROUP, status);
+    for (;;) {
+    }
 }

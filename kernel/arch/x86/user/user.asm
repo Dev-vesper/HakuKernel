@@ -1244,6 +1244,77 @@ _user_program_start:
     cmp eax, edx
     jne .fail
 
+    ; fork(2): the child gets a copy of the address space and the parent's
+    ; descriptors. It writes a file and exits with 42; the parent waits for
+    ; it with wait4(2) and checks the reported status.
+    mov esi, 162
+    mov eax, SYS_FORK
+    int 0x80
+    test eax, eax
+    jz .fork_child
+    jl .fork_failed
+    mov [USER_DATA_BASE + (fork_pid - data_start)], eax
+    mov eax, SYS_WAIT4
+    mov ebx, [USER_DATA_BASE + (fork_pid - data_start)]
+    mov ecx, USER_DATA_BASE + (fork_status - data_start)
+    xor edx, edx                ; options
+    xor esi, esi                ; rusage
+    int 0x80
+    cmp eax, [USER_DATA_BASE + (fork_pid - data_start)]
+    jne .fork_failed
+    cmp dword [USER_DATA_BASE + (fork_status - data_start)], 0x2A00
+    jne .fork_failed
+    ; wait4 on a reaped child reports ECHILD
+    mov eax, SYS_WAIT4
+    mov ebx, [USER_DATA_BASE + (fork_pid - data_start)]
+    mov ecx, USER_DATA_BASE + (fork_status - data_start)
+    xor edx, edx
+    xor esi, esi
+    int 0x80
+    cmp eax, -10
+    jne .fork_failed
+    jmp .fork_done
+.fork_child:
+    ; the child writes its marker file and leaves with status 42
+    mov eax, SYS_OPEN
+    mov ebx, USER_DATA_BASE + (fork_path - data_start)
+    mov ecx, 0x242              ; O_CREAT | O_RDWR | O_TRUNC
+    xor edx, edx
+    int 0x80
+    cmp eax, 3
+    jb .fork_child_failed
+    mov edi, eax
+    mov eax, SYS_WRITE
+    mov ebx, edi
+    mov ecx, USER_DATA_BASE + (fork_payload - data_start)
+    mov edx, fork_payload_end - fork_payload
+    int 0x80
+    cmp eax, fork_payload_end - fork_payload
+    jne .fork_child_failed
+    mov eax, SYS_CLOSE
+    mov ebx, edi
+    int 0x80
+    test eax, eax
+    jne .fork_child_failed
+    mov eax, SYS_EXIT_GROUP
+    mov ebx, 42
+    int 0x80
+.fork_child_failed:
+    mov eax, SYS_EXIT_GROUP
+    mov ebx, 1
+    int 0x80
+.fork_failed:
+    mov esi, 162
+    jmp .fail
+.fork_done:
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (fork_message - data_start)
+    mov edx, fork_message_end - fork_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
     ; Time: gettimeofday reads the tick counter and nanosleep blocks for
     ; at least the requested interval (the task is parked until its wake
     ; tick passes, not busy-waited).
@@ -2055,6 +2126,18 @@ stdio_message:
 stdio_message_end:
 inherit_path:
     db "I1.TXT", 0
+fork_path:
+    db "F1.TXT", 0
+fork_payload:
+    db "FORK"
+fork_payload_end:
+fork_pid:
+    dd 0
+fork_status:
+    dd 0
+fork_message:
+    db "USER-FORK-OK fork/wait4/exit-group", 10
+fork_message_end:
 inherit_payload:
     db "INHERITED-FD"
 inherit_payload_end:
