@@ -269,9 +269,11 @@ static uint32_t build_exec_stack(loaded_elf_t *program,
 
 static int copy_to_user(uint32_t destination, const void *source,
                         uint32_t length) {
-    if (!paging_user_range_valid(destination, length, 1)) return 0;
-    if (length) memcpy((void *)destination, source, length);
-    return 1;
+    address_space_t *space = scheduler_current_space();
+    if (!space) return 0;
+    /* The generic copy resolves copy-on-write pages: a syscall that writes
+     * its result into a forked stack must get a private page first. */
+    return paging_copy_to_user_space(space, destination, source, length);
 }
 
 static uint32_t sys_write(uint32_t fd, uint32_t user_buffer,
@@ -905,6 +907,11 @@ regs_t *user_syscall(regs_t *r) {
         return scheduler_exit_current(r);
     case HAKU_SYS_FORK:
         return sys_fork(r);
+    case HAKU_SYS_VFORK:
+        /* The child borrows the parent's address space and the parent is
+         * parked until the child execs or exits, so this call may return a
+         * different task's frame (like a blocking wait). */
+        return scheduler_vfork(r);
     case HAKU_SYS_CLONE:
         return sys_clone(r, r->ebx, r->ecx, r->edx, r->esi, r->edi);
     case HAKU_SYS_WAIT4:

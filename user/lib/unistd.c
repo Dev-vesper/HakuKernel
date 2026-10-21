@@ -79,7 +79,8 @@ int getegid(void) {
 }
 
 /* fork(2): the child returns 0 and continues at the same instruction
- * with its own copy of the address space; the parent gets the child pid. */
+ * with its own copy-on-write view of the address space; the parent gets
+ * the child pid. */
 int fork(void) {
     int result = haku_syscall0(HAKU_SYS_FORK);
     if (result < 0) {

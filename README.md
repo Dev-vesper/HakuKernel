@@ -84,14 +84,17 @@ multi-cluster file reads, subdirectory/path resolution (`USER-DIR-OK`),
 ring-3 process entry, per-process kernel stacks,
 syscall handling, `spawn`/`waitpid` and exit-status reporting, page-protection
 faults (`USER-PROT-OK`), `execve` image replacement, process exit/reaping,
-the user C library (`USER-LIB-OK`), and timer IRQs through the serial log.
+copy-on-write `fork` and `vfork` (`USER-COW-OK`, `USER-VFORK-OK`,
+`VFORK-EXEC-RAN`), the user C library (`USER-LIB-OK`), and timer IRQs
+through the serial log.
 
 ### Data image lifecycle
 
 `build/haku_fs.img` is the ATA data disk and is treated as user data: an
 existing image is reused untouched, so files created in a previous QEMU
 session survive the next build. It is (re)created from `kernel/arch/x86/user/user.asm`,
-`kernel/arch/x86/user/exec_target.asm`, `kernel/arch/x86/user/child.asm`, the
+`kernel/arch/x86/user/exec_target.asm`, `kernel/arch/x86/user/child.asm`,
+`kernel/arch/x86/user/vfork_target.asm`, the
 user library in `user/lib/`, and `user/tests/libtest.c` only when missing or
 with `--fresh`. If any test-program source is newer than a reused image,
 the build warns that its test ELFs on disk may be stale. `headless` always
@@ -208,9 +211,15 @@ the thread-creating flags, stack pointer, or parent-tid arguments, so no
 half-supported threading model is exposed. A forked child gets a private copy
 of the address space (code, data, stacks, heap, and mappings), a copy of the
 caller's saved register frame with `eax` zeroed, and its own descriptor table;
-the parent sees the child PID. Fork does not yet share or copy expanded
-segments lazily (copy-on-write), so the copy is eager. `execve` replaces a
-process image from the root filesystem.
+the parent sees the child PID. Pages are shared copy-on-write: each frame
+carries a reference count, both address spaces keep the same read-only
+mapping, and the first write on either side takes a protection fault that
+hands the writer a private copy (the kernel also breaks the share before
+writing through the direct map on the caller's behalf). `vfork` goes further
+and shares the address space outright: the child runs in the parent's space
+and on its stack while the parent stays suspended, and the parent resumes
+with the child PID as soon as the child calls `execve` or exits. `execve`
+replaces a process image from the root filesystem.
 Each process has its own address space and an 8 KiB ring-0 stack; the stack
 is allocated as physical frames and addressed through the kernel direct map.
 `gdt_set_kernel_stack` updates `TSS.esp0` at every task switch so the next
@@ -228,7 +237,8 @@ stack with user permissions.
 
 `kernel/arch/x86/user/user.asm` is built as an ELF32 image and entered via `iret` at CPL 3.
 It tests `spawn` (`0x1000`, Haku-specific), `fork` (2), `wait4` (114), and
-`waitpid` (7), as well as
+`waitpid` (7), checks that a forked child really shares pages copy-on-write,
+runs `vfork` both to a plain `exit` and across an `execve`, as well as
 `execve` (11), which loads another ELF32 image, builds an aligned
 initial user stack containing `argc`, `argv`, `envp`, and a terminating
 `AT_NULL` auxiliary-vector entry, and replaces the calling process without
@@ -241,7 +251,7 @@ the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `unlink` (10), `execve` (11), `lseek` (19), `getpid` (20), `rename` (38),
 `mkdir` (39), `rmdir` (40), `dup` (41), `brk` (45), `dup2` (63),
 `gettimeofday` (78), `mmap` (90), `munmap` (91), `stat` (106), `lstat` (107),
-`fstat` (108), `wait4` (114), `clone` (120), `nanosleep` (162),
+`fstat` (108), `wait4` (114), `clone` (120), `nanosleep` (162), `vfork` (190),
 `stat64` (195), `lstat64` (196),
 `fstat64` (197), `exit_group` (252), `fstatat64` (300), `uname` (122),
 `getrusage` (77), `times` (43), `getppid` (64), `getuid` (24), `geteuid` (49),
@@ -452,8 +462,12 @@ syscall ABI, `types.h`, `errno.h`, `string.h`, `stdlib.h`, `unistd.h`,
   They return the kernel's `-errno` unchanged.
 - POSIX-style wrappers return `-1` and set `errno`: `read`, `write`, `close`,
   `lseek`, `dup`, `dup2`, `open`, `stat`, `lstat`, `fstat`, `unlink`,
-  `rename`, `mkdir`, `rmdir`, `getpid`, `waitpid`, `execve`, `spawn`,
-  `getusage`, `gettimeofday`, `nanosleep`, `sleep`, `brk`, and `sbrk`.
+  `rename`, `mkdir`, `rmdir`, `getpid`, `fork`, `vfork`, `waitpid`, `execve`,
+  `spawn`, `getusage`, `gettimeofday`, `nanosleep`, `sleep`, `brk`, and
+  `sbrk`. `vfork` is written in `syscall.asm` rather than C: the child runs
+  on the caller's stack, so the pending return address is parked in `edx`
+  across the syscall instead of being left where the child would overwrite
+  it.
   `stat`/`lstat` use the Linux `fstatat64` (300) call with `AT_FDCWD` and
   `fstat` uses `fstat64` (197), so the library and a musl program read the
   same 96-byte `struct stat64` layout.
@@ -675,9 +689,10 @@ Haku/
       mm/               paging.c/.h: i386 page tables (identity + 128 MiB direct map + user)
                         frame.c/.h: E820-backed physical page inventory
       elf/              elf.c/.h: validated ELF32 PT_LOAD loader + user spaces
-      user/             user.asm, child.asm, fault.asm, exec_target.asm: ELF32
-                        test programs (syscall, spawn/waitpid, protection
-                        faults, execve coverage)
+      user/             user.asm, child.asm, fault.asm, exec_target.asm,
+                        vfork_target.asm: ELF32 test programs (syscall,
+                        spawn/waitpid, protection faults, execve/vfork)
+                        coverage)
     drivers/            ata.c/.h: primary/secondary ATA (master/slave) LBA28/LBA48
                         polling PIO with reset/retry recovery and cache flush
                         terminal.c/.h: text-I/O layer (output + input ring)

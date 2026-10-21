@@ -148,6 +148,27 @@ int main(void) {
         }
     }
 
+    /* vfork: the child borrows our address space, so a variable it writes
+     * is visible when the parent resumes with the child pid. */
+    {
+        static volatile int shared_word;
+        int child;
+        shared_word = 0;
+        child = vfork();
+        if (child == 0) {
+            shared_word = 1234;
+            exit(5);
+        }
+        expect(child > 0, "vfork");
+        if (child > 0) {
+            int child_status = 0;
+            expect(shared_word == 1234, "vfork shared memory");
+            expect(waitpid(child, &child_status, 0) == child,
+                   "waitpid vfork child");
+            expect(child_status == (5 << 8), "vfork status");
+        }
+    }
+
     expect(atoi("-123") == -123, "atoi");
 
     if (failures) {

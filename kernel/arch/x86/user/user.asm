@@ -3,7 +3,7 @@
 [org 0]
 
 %define USER_CODE_BASE 0x40000000
-%define USER_DATA_BASE 0x40002000
+%define USER_DATA_BASE 0x40003000
 %define USER_STACK_TOP 0xC0000000
 
 %include "haku/abi.inc"
@@ -25,13 +25,13 @@
     dw 40, 0, 0                   ; no section headers
 
 ; RX code segment: file offset 0x1000, virtual address 0x40000000.
-; Two 4 KiB pages are reserved for the code so the tests can grow.
+; Three 4 KiB pages are reserved for the code so the tests can grow.
     dd 1, 0x1000, USER_CODE_BASE, USER_CODE_BASE
     dd code_end - code_start, code_end - code_start
     dd 5, 0x1000
 
-; RW data segment: file offset 0x3000, virtual address 0x40002000.
-    dd 1, 0x3000, USER_DATA_BASE, USER_DATA_BASE
+; RW data segment: file offset 0x4000, virtual address 0x40003000.
+    dd 1, 0x4000, USER_DATA_BASE, USER_DATA_BASE
     dd data_file_end - data_start, data_end - data_start
     dd 6, 0x1000
 
@@ -1315,6 +1315,145 @@ _user_program_start:
     cmp eax, edx
     jne .fail
 
+    ; Copy-on-write: fork shares the pages, so both sides see the prototype
+    ; value until they write. The child's write is private and the parent's
+    ; own write faults once and gets a private copy too.
+    mov dword [USER_DATA_BASE + (cow_word - data_start)], 0x11111111
+    mov esi, 1630
+    mov eax, SYS_FORK
+    int 0x80
+    test eax, eax
+    jz .cow_child
+    jl .cow_failed
+    mov [USER_DATA_BASE + (cow_pid - data_start)], eax
+    mov eax, SYS_WAIT4
+    mov ebx, [USER_DATA_BASE + (cow_pid - data_start)]
+    mov ecx, USER_DATA_BASE + (cow_status - data_start)
+    xor edx, edx
+    xor esi, esi
+    int 0x80
+    mov esi, 1631
+    cmp eax, [USER_DATA_BASE + (cow_pid - data_start)]
+    jne .cow_failed
+    mov esi, 1632
+    cmp dword [USER_DATA_BASE + (cow_status - data_start)], 0
+    jne .cow_failed
+    mov esi, 1633
+    cmp dword [USER_DATA_BASE + (cow_word - data_start)], 0x11111111
+    jne .cow_failed
+    ; writing after the fork breaks the share for the parent as well
+    mov dword [USER_DATA_BASE + (cow_word - data_start)], 0x33333333
+    mov esi, 1634
+    cmp dword [USER_DATA_BASE + (cow_word - data_start)], 0x33333333
+    jne .cow_failed
+    jmp .cow_done
+.cow_child:
+    mov dword [USER_DATA_BASE + (cow_word - data_start)], 0x22222222
+    mov ebx, 1
+    cmp dword [USER_DATA_BASE + (cow_word - data_start)], 0x22222222
+    jne .cow_child_exit
+    xor ebx, ebx
+.cow_child_exit:
+    mov eax, SYS_EXIT
+    int 0x80
+.cow_failed:
+    jmp .fail
+.cow_done:
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (cow_message - data_start)
+    mov edx, cow_message_end - cow_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
+    ; vfork(2): the child borrows the parent's address space and the parent
+    ; stays parked until the child exits, then resumes with the child pid.
+    mov dword [USER_DATA_BASE + (vfork_word - data_start)], 0
+    mov esi, 164
+    mov eax, SYS_VFORK
+    int 0x80
+    test eax, eax
+    jz .vfork_child
+    jl .vfork_failed
+    ; what the child wrote is visible: the space was shared, not copied
+    cmp eax, [USER_DATA_BASE + (vfork_pid - data_start)]
+    jne .vfork_failed
+    cmp dword [USER_DATA_BASE + (vfork_word - data_start)], 0x5A5A5A5A
+    jne .vfork_failed
+    ; the child is a normal waitable zombie
+    mov eax, SYS_WAIT4
+    mov ebx, [USER_DATA_BASE + (vfork_pid - data_start)]
+    mov ecx, USER_DATA_BASE + (vfork_status - data_start)
+    xor edx, edx
+    xor esi, esi
+    int 0x80
+    cmp eax, [USER_DATA_BASE + (vfork_pid - data_start)]
+    jne .vfork_failed
+    cmp dword [USER_DATA_BASE + (vfork_status - data_start)], 0x900
+    jne .vfork_failed
+    jmp .vfork_done
+.vfork_child:
+    mov dword [USER_DATA_BASE + (vfork_word - data_start)], 0x5A5A5A5A
+    mov eax, SYS_GETPID
+    int 0x80
+    mov [USER_DATA_BASE + (vfork_pid - data_start)], eax
+    mov eax, SYS_EXIT
+    mov ebx, 9
+    int 0x80
+.vfork_failed:
+    mov esi, 164
+    jmp .fail
+.vfork_done:
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (vfork_message - data_start)
+    mov edx, vfork_message_end - vfork_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
+    ; vfork(2) + execve(2): the parent must wake up when the child replaces
+    ; its borrowed image, and the child then runs in its own address space.
+    mov esi, 165
+    mov eax, SYS_VFORK
+    int 0x80
+    test eax, eax
+    jz .vfork_exec_child
+    jl .vfork_exec_failed
+    mov [USER_DATA_BASE + (vfork_exec_pid - data_start)], eax
+    mov eax, SYS_WAIT4
+    mov ebx, [USER_DATA_BASE + (vfork_exec_pid - data_start)]
+    mov ecx, USER_DATA_BASE + (vfork_exec_status - data_start)
+    xor edx, edx
+    xor esi, esi
+    int 0x80
+    cmp eax, [USER_DATA_BASE + (vfork_exec_pid - data_start)]
+    jne .vfork_exec_failed
+    cmp dword [USER_DATA_BASE + (vfork_exec_status - data_start)], 0x700
+    jne .vfork_exec_failed
+    jmp .vfork_exec_done
+.vfork_exec_child:
+    mov eax, SYS_EXECVE
+    mov ebx, USER_DATA_BASE + (vfork_exec_path - data_start)
+    xor ecx, ecx
+    xor edx, edx
+    int 0x80
+    mov eax, SYS_EXIT
+    mov ebx, 111
+    int 0x80
+.vfork_exec_failed:
+    mov esi, 165
+    jmp .fail
+.vfork_exec_done:
+    mov eax, SYS_WRITE
+    mov ebx, 1
+    mov ecx, USER_DATA_BASE + (vfork_exec_message - data_start)
+    mov edx, vfork_exec_message_end - vfork_exec_message
+    int 0x80
+    cmp eax, edx
+    jne .fail
+
     ; Time: gettimeofday reads the tick counter and nanosleep blocks for
     ; at least the requested interval (the task is parked until its wake
     ; tick passes, not busy-waited).
@@ -2038,7 +2177,7 @@ _user_program_start:
     jmp .hang
 code_end:
 
-    times 0x3000 - ($ - $$) db 0
+    times 0x4000 - ($ - $$) db 0
 data_start:
 startup_message:
     db "USERMODE-OK ELF32 RX/RW + POSIX-style file syscalls", 10
@@ -2138,6 +2277,33 @@ fork_status:
 fork_message:
     db "USER-FORK-OK fork/wait4/exit-group", 10
 fork_message_end:
+cow_word:
+    dd 0
+cow_pid:
+    dd 0
+cow_status:
+    dd 0
+cow_message:
+    db "USER-COW-OK fork shares pages copy-on-write", 10
+cow_message_end:
+vfork_word:
+    dd 0
+vfork_pid:
+    dd 0
+vfork_status:
+    dd 0
+vfork_message:
+    db "USER-VFORK-OK vfork shares the address space", 10
+vfork_message_end:
+vfork_exec_path:
+    db "VFORK.ELF", 0
+vfork_exec_pid:
+    dd 0
+vfork_exec_status:
+    dd 0
+vfork_exec_message:
+    db "USER-VFORK-OK vfork parent resumed on child execve", 10
+vfork_exec_message_end:
 inherit_payload:
     db "INHERITED-FD"
 inherit_payload_end:

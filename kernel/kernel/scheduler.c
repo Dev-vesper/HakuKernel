@@ -34,6 +34,8 @@ typedef struct {
     uint32_t wait_pid;
     uint32_t wait_status_user;
     uint32_t wait_rusage_user;
+    uint32_t vfork_parent;  /* this task is a vfork child of that pid */
+    uint32_t vfork_child;   /* this task is parked in vfork for that child */
     uint32_t wake_tick;
     uint32_t heap_brk;    /* current program break (0 = not yet used) */
     uint32_t heap_top;    /* highest heap page ever mapped (grow only) */
@@ -357,6 +359,28 @@ static int deliver_wait_result(task_t *parent, task_t *child, uint32_t status) {
     return 1;
 }
 
+/* Release a parent that is parked inside vfork: the child either replaced
+ * its image (exec) or exited, so the two processes no longer share the
+ * address space and the parent resumes with the child pid. Called with
+ * interrupts disabled. */
+static void wake_vfork_parent(uint32_t child_pid) {
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        task_t *parent = &tasks[i];
+        if (parent->vfork_child != child_pid) continue;
+        parent->vfork_child = 0;
+        /* vfork returns the child pid in the parent, as fork does. */
+        if (parent->frame) parent->frame->eax = child_pid;
+        if (parent->state == TASK_WAITING) parent->state = TASK_RUNNABLE;
+        return;
+    }
+}
+
+address_space_t *scheduler_current_space(void) {
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0;
+    return &tasks[current_task].program.address_space;
+}
+
 regs_t *scheduler_exit_current(regs_t *frame) {
     int next;
     task_t *exiting;
@@ -406,6 +430,12 @@ regs_t *scheduler_exit_current(regs_t *frame) {
             exiting->state = TASK_REAP_PENDING;
             break;
         }
+    }
+    /* A vfork child that exits without exec releases its parent; the child
+     * stays a zombie so a later waitpid reports the status. */
+    if (exiting->vfork_parent) {
+        wake_vfork_parent(exiting->pid);
+        exiting->vfork_parent = 0;
     }
     next = find_next_task();
     activate_task(next);
@@ -461,7 +491,16 @@ int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
     task->frame = frame;
 
     paging_activate_user_space(&task->program.address_space);
-    paging_destroy_user_space(&previous.address_space);
+    if (previous.address_space.shared) {
+        /* The replaced image was the parent's address space (vfork): it is
+         * still in use, so only detach from it and release the parent. */
+        if (task->vfork_parent) {
+            wake_vfork_parent(task->pid);
+            task->vfork_parent = 0;
+        }
+    } else {
+        paging_destroy_user_space(&previous.address_space);
+    }
     irq_unlock(flags);
 
     klog_prefix();
@@ -705,12 +744,12 @@ int32_t scheduler_fork(regs_t *frame) {
     child->state = TASK_STARTING;
     irq_unlock(flags);
 
-    /* The child gets its own copy of the user address space: same pages,
-     * same contents, separate frames (no copy-on-write yet). */
+    /* The child gets its own address space that shares the parent's frames
+     * copy-on-write: nothing is copied until either side writes. */
     if (!paging_create_user_space(&child->program.address_space))
         goto failed;
-    if (!paging_copy_user_space(&parent->program.address_space,
-                                &child->program.address_space))
+    if (!paging_share_user_space(&parent->program.address_space,
+                                 &child->program.address_space))
         goto failed;
     child->program.entry = parent->program.entry;
     child->program.user_stack = parent->program.user_stack;
@@ -750,6 +789,99 @@ failed:
     memset(child, 0, sizeof(*child));
     irq_unlock(flags);
     return -(int32_t)HAKU_ENOMEM;
+}
+
+/* vfork(2): the child runs in the parent's address space until it calls
+ * execve or exits, and the parent is suspended until then (that is the
+ * whole point: the child owns the parent's memory and stack). The child
+ * therefore returns 0 and the parent returns 0 once the child is done,
+ * exactly like Linux. */
+regs_t *scheduler_vfork(regs_t *frame) {
+    irqflags_t flags;
+    uint32_t parent_pid;
+    uint32_t slot;
+    task_t *child = 0;
+    task_t *parent;
+    int next;
+
+    if (!scheduler_started || !frame || current_task < 0 ||
+        current_task >= SCHEDULER_IDLE_INDEX ||
+        (frame->cs & 3u) != 3u) {
+        frame->eax = 0u - HAKU_EINVAL;
+        return frame;
+    }
+    parent = &tasks[current_task];
+
+    flags = irq_lock();
+    release_reaped_slots();
+    parent_pid = parent->pid;
+    for (slot = 1; slot < SCHEDULER_MAX_PROCESSES; slot++) {
+        if (tasks[slot].state == TASK_UNUSED) {
+            child = &tasks[slot];
+            break;
+        }
+    }
+    if (!child) {
+        frame->eax = 0u - HAKU_EAGAIN;
+        irq_unlock(flags);
+        return frame;
+    }
+    memset(child, 0, sizeof(*child));
+    child->pid = slot + 1u;
+    child->parent_pid = parent_pid;
+    child->state = TASK_STARTING;
+    child->vfork_parent = parent_pid;
+    irq_unlock(flags);
+
+    /* Borrow the parent's address space: same CR3, same frames, no copy.
+     * Nothing may tear it down while the child runs (see
+     * paging_destroy_user_space), and the parent cannot run until the
+     * child has finished with it. */
+    child->program = parent->program;
+    child->program.address_space.shared = 1;
+    if (!initialize_fork_stack(child, frame))
+        goto failed;
+    if (vfs_inherit(parent_pid, child->pid) != 1)
+        goto failed;
+
+    child->heap_brk = parent->heap_brk;
+    child->heap_top = parent->heap_top;
+    child->mmap_region_count = parent->mmap_region_count;
+    memcpy(child->mmap_regions, parent->mmap_regions,
+           sizeof(child->mmap_regions));
+
+    klog_prefix();
+    klog_write("sched: VFORK-OK parent=");
+    klog_dec(parent_pid);
+    klog_write(" child=");
+    klog_dec(child->pid);
+    klog_write(" shared-space\n");
+
+    /* Park the parent and switch to the child with interrupts masked: the
+     * saved frame is the only way back in, so no timer tick may replace it
+     * (a preempted frame resumes inside this function, not after the
+     * syscall). wake_vfork_parent() releases the parent with the child pid
+     * once the child execs or exits. */
+    flags = irq_lock();
+    child->state = TASK_RUNNABLE;
+    parent->state = TASK_WAITING;
+    parent->vfork_child = child->pid;
+    parent->frame = frame;
+    frame->eax = 0u;
+    next = find_next_task();
+    activate_task(next);
+    return next == SCHEDULER_IDLE_INDEX ? idle_task.frame :
+                                          tasks[next].frame;
+
+failed:
+    /* The parent never started the child, so it must not stay parked. The
+     * borrowed space belongs to the parent and is not released here. */
+    release_task_resources(child);
+    flags = irq_lock();
+    memset(child, 0, sizeof(*child));
+    irq_unlock(flags);
+    frame->eax = 0u - HAKU_ENOMEM;
+    return frame;
 }
 
 regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
@@ -801,6 +933,7 @@ regs_t *scheduler_waitpid(uint32_t pid, uint32_t user_status,
     }
 
     if (zombie) {
+        parent->frame = frame;
         parent->wait_status_user = user_status;
         parent->wait_rusage_user = 0;
         if (!deliver_wait_result(parent, zombie, zombie->exit_status)) {
@@ -877,6 +1010,7 @@ regs_t *scheduler_wait4(uint32_t pid, uint32_t user_status, uint32_t options,
     }
 
     if (zombie) {
+        parent->frame = frame;
         parent->wait_status_user = user_status;
         parent->wait_rusage_user = user_rusage;
         if (!deliver_wait_result(parent, zombie, zombie->exit_status)) {

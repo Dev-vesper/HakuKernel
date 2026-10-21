@@ -50,6 +50,7 @@
 #define HAKU_SYS_CLONE   120u
 #define HAKU_SYS_UNAME   122u
 #define HAKU_SYS_NANOSLEEP    162u
+#define HAKU_SYS_VFORK   190u
 /* i386 "stat64" family: the 96-byte struct stat64 layout that glibc and
  * musl use on i386 (musl's stat() goes through fstatat64). */
 #define HAKU_SYS_STAT64  195u
@@ -100,7 +101,6 @@
 #define HAKU_SYS_RT_SIGPROCMASK 175u
 #define HAKU_SYS_CHOWN     182u
 #define HAKU_SYS_GETCWD    183u
-#define HAKU_SYS_VFORK     190u
 #define HAKU_SYS_GETRLIMIT 191u
 #define HAKU_SYS_MMAP2     192u
 #define HAKU_SYS_GETDENTS64 220u

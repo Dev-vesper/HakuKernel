@@ -240,17 +240,24 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   `fstatat64`, and `statx`, and the user library reads the same layout as
   musl; the Haku-specific `spawn`/`getusage` pair stays outside the Linux
   range).
-- [x] Add process creation and reaping: `fork` (an eager copy of the address
+- [x] Add process creation and reaping: `fork` (a private copy of the address
   space, the caller's saved register frame with `eax` zeroed, and the
   descriptor table), the `SIGCHLD` form of `clone`, `wait4` (`WNOHANG` and
   any-child forms; `rusage` is accepted but zeroed), and `exit_group`. The
   ELF-only `spawn` model is no longer the only way to start a process; it is
   covered by `USER-FORK-OK` in the ring-3 self-test and by the C library
   (whose `waitpid` is now a `wait4` wrapper).
-- [ ] Add `vfork` (share the address space until `execve`/`exit`) and
+- [x] Add `vfork` (share the address space until `execve`/`exit`) and
   copy-on-write for `fork` instead of the eager copy, so large processes do
-  not pay for a full duplicate. `clone` still rejects the thread-creating
-  flags, stack pointers, and parent-tid arguments with `EINVAL`.
+  not pay for a full duplicate. Pages are shared with per-frame reference
+  counts and broken on the write-protection fault, for kernel-side copies
+  too; a `vfork` parent stays suspended until the child execs or exits and
+  then resumes with the child PID. The library's `vfork` keeps its return
+  address in `edx` across the syscall because the child runs on the caller's
+  stack. Covered by `USER-COW-OK`, `USER-VFORK-OK`, `VFORK-EXEC-RAN`, and a
+  `vfork` case in the C library self-test. `clone` still rejects the
+  thread-creating flags, stack pointers, and parent-tid arguments with
+  `EINVAL`.
 - [ ] Add signals: `kill`/`tkill`/`tgkill`, `rt_sigaction`,
   `rt_sigprocmask`, `rt_sigreturn`, pending-signal delivery, and default
   dispositions (the kernel currently has no signal state at all).

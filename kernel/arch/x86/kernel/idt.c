@@ -112,6 +112,16 @@ static regs_t *abort_user(regs_t *r) {
 }
 
 regs_t *isr_handler(regs_t *r) {
+    if (r->int_no == 14 && (r->cs & 3u) == 3u) {
+        /* A write to a copy-on-write page is not a fault: the writer gets
+         * a private copy and re-executes the instruction (P=1, W/R=1). */
+        if ((r->err_code & 3u) == 3u) {
+            address_space_t *space = scheduler_current_space();
+            if (space && paging_break_cow(space, paging_get_cr2()))
+                return r;
+        }
+        return abort_user(r);
+    }
     if (r->int_no < 32 && (r->cs & 3u) == 3u) {
         return abort_user(r);
     }

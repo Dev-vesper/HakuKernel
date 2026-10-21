@@ -308,6 +308,7 @@ def main():
     user_asm = os.path.join(arch_dir, "user", "user.asm")
     exec_target_asm = os.path.join(arch_dir, "user", "exec_target.asm")
     child_asm = os.path.join(arch_dir, "user", "child.asm")
+    vfork_asm = os.path.join(arch_dir, "user", "vfork_target.asm")
     fault_asm = os.path.join(arch_dir, "user", "fault.asm")
     boot_dir = os.path.join(arch_dir, "boot")
     stage1_asm = os.path.join(boot_dir, "stage1.asm")
@@ -331,6 +332,7 @@ def main():
     user_elf = os.path.join(BUILD, "user.elf")
     exec_target_elf = os.path.join(BUILD, "exec_target.elf")
     child_elf = os.path.join(BUILD, "child.elf")
+    vfork_elf = os.path.join(BUILD, "vfork_target.elf")
     fault_elf = os.path.join(BUILD, "fault.elf")
     user_lib_dir = os.path.join(ROOT, "user", "lib")
     user_lib_sources = sorted(glob.glob(os.path.join(user_lib_dir, "*.c")))
@@ -358,6 +360,7 @@ def main():
     run([nasm, "-I" + nasm_include, "-f", "bin", exec_target_asm,
          "-o", exec_target_elf])
     run([nasm, "-I" + nasm_include, "-f", "bin", child_asm, "-o", child_elf])
+    run([nasm, "-I" + nasm_include, "-f", "bin", vfork_asm, "-o", vfork_elf])
     run([nasm, "-I" + nasm_include, "-f", "bin", fault_asm, "-o", fault_elf])
 
     # The user C library is linked into a fixed-base PE image, then repacked
@@ -391,7 +394,8 @@ def main():
                 "(fault-injection tests mutate the disk)")
         run([py, fat12_script, user_elf, filesystem_image,
              f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}",
-             f"FAULT.ELF={fault_elf}", f"LIB.ELF={libtest_elf}"])
+             f"FAULT.ELF={fault_elf}", f"LIB.ELF={libtest_elf}",
+             f"VFORK.ELF={vfork_elf}"])
         log(f"FAT12 program disk ready "
             f"({os.path.getsize(filesystem_image)} bytes)")
     else:
@@ -401,6 +405,7 @@ def main():
         source_mtime = max(os.path.getmtime(user_asm),
                            os.path.getmtime(exec_target_asm),
                            os.path.getmtime(child_asm),
+                           os.path.getmtime(vfork_asm),
                            os.path.getmtime(fault_asm),
                            os.path.getmtime(user_test_source),
                            max(os.path.getmtime(source)
@@ -550,6 +555,9 @@ def main():
             "USER-STDIO-OK", # stdio redirect via dup2, close, and restore
             "SPAWN-CHILD-RAN",
             "USER-FORK-OK",   # fork/wait4/exit_group round trip
+            "USER-COW-OK",    # forked pages are private once either side writes
+            "USER-VFORK-OK",  # vfork shares the space; parent wakes on exit/exec
+            "VFORK-EXEC-RAN",
             "USER-WAITPID-OK child status=42 reaped",
             "USER-FD-INHERIT-OK", # spawn inherited fd 3; child exit closed it
             "USER-TIME-OK",  # gettimeofday reads ticks; nanosleep blocks until wake

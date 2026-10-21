@@ -24,6 +24,11 @@
 #define PAGE_DIRTY    0x040u /* _PAGE_DIRTY    */
 #define PAGE_PSE      0x080u /* _PAGE_PSE (4 MiB pages, unused here) */
 #define PAGE_GLOBAL   0x100u /* _PAGE_GLOBAL   */
+/* Bits 9-11 are free for the OS (Intel SDM vol 3, 4.5). Linux calls them
+ * _PAGE_BIT_SOFTW1..; Haku uses bit 9 to mark a copy-on-write page: the
+ * frame is shared read-only between address spaces and the first write
+ * fault gives the writer a private copy. */
+#define PAGE_COW      0x200u /* _PAGE_BIT_SOFTW1: copy-on-write */
 
 /* CR0 / CR3 bits (Linux arch/x86/include/asm/cpufeatures + control regs). */
 #define CR0_PG_BIT 0x80000000u /* X86_CR0_PG: paging enable */
@@ -56,12 +61,16 @@
 /* Per-space accounting maintained by the mapping helpers. mapped_pages
  * counts present user PTEs (code, data, stack, heap, and mmap), page_tables
  * counts the non-directory user page tables, and peak_mapped_pages is the
- * high-water mark used for per-process memory reporting. */
+ * high-water mark used for per-process memory reporting.
+ *
+ * shared marks a vfork child's address space: it belongs to the parent and
+ * must never be torn down by the child (the parent still runs in it). */
 typedef struct {
     uint32_t directory_phys;
     uint32_t mapped_pages;
     uint32_t page_tables;
     uint32_t peak_mapped_pages;
+    int shared;
 } address_space_t;
 
 void paging_init(void);        /* zero tables, install PDE0 + 1024 identity PTEs */
@@ -82,15 +91,24 @@ uint32_t paging_map_framebuffer(uint32_t physical_base, uint32_t length);
 void paging_activate_user_space(const address_space_t *space);
 void paging_activate_kernel_space(void);
 void paging_destroy_user_space(address_space_t *space);
-/* Copy every user page of one address space into another (fork): the
- * destination gets its own frames with the same contents and protection.
- * The destination must already have a directory; on failure it is
- * destroyed and 0 is returned. */
-int paging_copy_user_space(const address_space_t *source,
-                           address_space_t *destination);
+/* Share every user page of one address space with another (fork). Both
+ * spaces map the same frames; writable pages are write-protected and
+ * marked PAGE_COW in both, so the first write in either space copies the
+ * page (see paging_break_cow). The destination must already have a
+ * directory; on failure it is destroyed and 0 is returned. The source
+ * table is modified, so its TLB is flushed when it is the active space. */
+int paging_share_user_space(address_space_t *source,
+                            address_space_t *destination);
+/* Resolve a copy-on-write fault: give the space a private writable copy of
+ * the page that holds virtual_addr (any offset within it). Returns 1 when
+ * the page was copied, 0 when it is not a COW page or memory ran out. */
+int paging_break_cow(address_space_t *space, uint32_t virtual_addr);
 int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
                             int write_access);
-int paging_copy_to_user_space(const address_space_t *space,
+/* Copy into a user space, resolving copy-on-write pages first. The space
+ * may be a blocked process's (the scheduler delivers wait results this
+ * way), so it is passed explicitly rather than taken from CR3. */
+int paging_copy_to_user_space(address_space_t *space,
                               uint32_t virtual_addr, const void *source,
                               uint32_t length);
 

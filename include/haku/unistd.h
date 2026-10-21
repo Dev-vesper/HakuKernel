@@ -25,6 +25,11 @@ int geteuid(void);
 int getgid(void);
 int getegid(void);
 int fork(void);
+/* vfork(2): the child runs in the caller's address space and on its stack
+ * until execve/_exit; the parent resumes with the child pid. Implemented in
+ * syscall.asm so the pending return address is not left where the child
+ * would overwrite it. */
+int vfork(void);
 int waitpid(int pid, int *status, int options);
 int spawn(const char *path);
 int execve(const char *path, char *const argv[], char *const envp[]);

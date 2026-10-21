@@ -10,6 +10,7 @@
  */
 #include "paging.h"
 #include "frame.h"
+#include "sync.h"
 
 #define DIR  ((uint32_t *)PAGING_DIR_PHYS)
 #define TAB  ((uint32_t *)PAGING_TABLE_PHYS)
@@ -29,6 +30,59 @@ static int alloc_page_table(void) {
     if (!frame) return 0;
     memset(PHYS_TO_VIRT(frame), 0, 4096);
     return (uint32_t)frame;
+}
+
+/* How many address spaces map each user frame. Zero means "not mapped by
+ * any user space", which is the state of every kernel-owned page (page
+ * tables, kernel stacks, heap) and of a frame that was just released, so
+ * the table only needs an entry per possible frame. Fork increments the
+ * count for every shared page and the last unmap or destroy frees it. */
+#define PAGING_FRAME_SLOTS (PAGING_PHYS_LIMIT / FRAME_SIZE)
+static uint8_t frame_refs[PAGING_FRAME_SLOTS];
+
+static uint32_t frame_slot(uint32_t phys) {
+    uint32_t slot = (phys & 0xFFFFF000u) / FRAME_SIZE;
+    return slot < PAGING_FRAME_SLOTS ? slot : PAGING_FRAME_SLOTS;
+}
+
+/* First mapping of a frame: user frames start life with one reference. */
+static void frame_ref_first(uint32_t phys) {
+    uint32_t slot = frame_slot(phys);
+    irqflags_t flags;
+    if (slot >= PAGING_FRAME_SLOTS) return;
+    flags = irq_lock();
+    if (frame_refs[slot] == 0) frame_refs[slot] = 1;
+    irq_unlock(flags);
+}
+
+/* One more address space maps the frame (fork). */
+static void frame_ref_hold(uint32_t phys) {
+    uint32_t slot = frame_slot(phys);
+    irqflags_t flags;
+    if (slot >= PAGING_FRAME_SLOTS) return;
+    flags = irq_lock();
+    if (frame_refs[slot] == 0)
+        frame_refs[slot] = 1;
+    else if (frame_refs[slot] != 0xFFu)
+        frame_refs[slot]++;
+    irq_unlock(flags);
+}
+
+/* One address space stopped mapping the frame; the last one frees it. */
+static void frame_ref_drop(uint32_t phys) {
+    uint32_t slot = frame_slot(phys);
+    irqflags_t flags;
+    int last = 0;
+    if (slot >= PAGING_FRAME_SLOTS) { frame_free((void *)phys); return; }
+    flags = irq_lock();
+    if (frame_refs[slot] == 0) {
+        /* Not counted (a kernel-owned frame): leave it alone. */
+        irq_unlock(flags);
+        return;
+    }
+    if (--frame_refs[slot] == 0) last = 1;
+    irq_unlock(flags);
+    if (last) frame_free((void *)(phys & 0xFFFFF000u));
 }
 
 void paging_init(void) {
@@ -152,6 +206,7 @@ int paging_create_user_space(address_space_t *space) {
     space->mapped_pages = 0;
     space->page_tables = 0;
     space->peak_mapped_pages = 0;
+    space->shared = 0;
     return 1;
 }
 
@@ -192,6 +247,7 @@ int paging_map_user_page(address_space_t *space, uint32_t virtual_addr,
     table = (uint32_t *)PHYS_TO_VIRT(table_phys);
     if (table[table_index] & PAGE_PRESENT) return 0;
     table[table_index] = (physical_addr & 0xFFFFF000u) | flags;
+    frame_ref_first(physical_addr);
     space->mapped_pages++;
     if (space->mapped_pages > space->peak_mapped_pages)
         space->peak_mapped_pages = space->mapped_pages;
@@ -235,7 +291,7 @@ int paging_unmap_user_page(address_space_t *space, uint32_t virtual_addr) {
     if (space->mapped_pages) space->mapped_pages--;
     current = (paging_get_cr3() & 0xFFFFF000u) == space->directory_phys;
     if (current) paging_invlpg(virtual_addr);
-    frame_free((void *)(pte & 0xFFFFF000u));
+    frame_ref_drop(pte);
 
     /* Drop a now-empty page table so release returns the whole 4 KiB. */
     for (uint32_t i = 0; i < PAGING_ENTRIES; i++) {
@@ -301,13 +357,15 @@ void paging_activate_kernel_space(void) {
     }
 }
 
-int paging_copy_user_space(const address_space_t *source,
-                           address_space_t *destination) {
+int paging_share_user_space(address_space_t *source,
+                            address_space_t *destination) {
     uint32_t *source_directory;
     uint32_t *destination_directory;
+    int source_current;
 
     if (!source || !destination || !source->directory_phys ||
-        !destination->directory_phys)
+        !destination->directory_phys ||
+        source->directory_phys == destination->directory_phys)
         return 0;
 
     source_directory = (uint32_t *)PHYS_TO_VIRT(source->directory_phys);
@@ -320,38 +378,111 @@ int paging_copy_user_space(const address_space_t *source,
         uint32_t pde = source_directory[di];
         uint32_t table_phys;
         uint32_t *table;
+        uint32_t new_table_phys;
+        uint32_t *new_table;
+        int any = 0;
+
         if ((pde & (PAGE_PRESENT | PAGE_USER)) != (PAGE_PRESENT | PAGE_USER))
             continue;
         table_phys = pde & 0xFFFFF000u;
         if (table_phys >= PAGING_PHYS_LIMIT) continue;
         table = (uint32_t *)PHYS_TO_VIRT(table_phys);
+
+        /* Allocate the destination table only for a non-empty range, so a
+         * sparse address space does not pay for gaps. */
         for (uint32_t ti = 0; ti < PAGING_ENTRIES; ti++) {
-            uint32_t pte = table[ti];
-            uint32_t source_phys;
-            uint32_t virtual_addr;
-            void *page;
-            if (!(pte & PAGE_PRESENT)) continue;
-            source_phys = pte & 0xFFFFF000u;
-            if (source_phys >= PAGING_PHYS_LIMIT) goto failed;
-            page = frame_alloc();
-            if (!page) goto failed;
-            memcpy(PHYS_TO_VIRT(page), PHYS_TO_VIRT(source_phys), FRAME_SIZE);
-            virtual_addr = (di << 22) | (ti << 12);
-            if (!paging_map_user_page(destination, virtual_addr,
-                                      (uint32_t)page,
-                                      (pte & PAGE_RW) ? 1 : 0)) {
-                frame_free(page);
-                goto failed;
+            if (table[ti] & PAGE_PRESENT) {
+                any = 1;
+                break;
             }
         }
+        if (!any) continue;
+
+        new_table_phys = alloc_page_table();
+        if (!new_table_phys) goto failed;
+        new_table = (uint32_t *)PHYS_TO_VIRT(new_table_phys);
+        destination_directory[di] = new_table_phys | PAGE_PRESENT |
+                                    PAGE_RW | PAGE_USER;
+        destination->page_tables++;
+
+        for (uint32_t ti = 0; ti < PAGING_ENTRIES; ti++) {
+            uint32_t pte = table[ti];
+            uint32_t frame;
+            if (!(pte & PAGE_PRESENT)) continue;
+            frame = pte & 0xFFFFF000u;
+            if (frame >= PAGING_PHYS_LIMIT) goto failed;
+            frame_ref_hold(frame);
+            if (pte & PAGE_RW) {
+                /* A writable page becomes read-only in both spaces and is
+                 * copied on the first write. A page that is already
+                 * read-only (code) is shared as-is: no copy can be
+                 * produced by a write, because a write is not allowed. */
+                pte &= ~PAGE_RW;
+                pte |= PAGE_COW;
+                table[ti] = pte;
+            }
+            new_table[ti] = pte;
+            destination->mapped_pages++;
+            if (destination->mapped_pages > destination->peak_mapped_pages)
+                destination->peak_mapped_pages = destination->mapped_pages;
+        }
     }
+
+    /* The source tables lost their write permissions: stale TLB entries
+     * would keep the pages writable and bypass copy-on-write. */
+    source_current = (paging_get_cr3() & 0xFFFFF000u) == source->directory_phys;
+    if (source_current) paging_flush_all();
     return 1;
 
 failed:
-    /* The destination space is discarded whole: a half-copied address
+    /* The destination space is discarded whole: a half-shared address
      * space must never be activated. */
     paging_destroy_user_space(destination);
     return 0;
+}
+
+int paging_break_cow(address_space_t *space, uint32_t virtual_addr) {
+    uint32_t *directory;
+    uint32_t *table;
+    uint32_t directory_index;
+    uint32_t table_index;
+    uint32_t table_phys;
+    uint32_t pte;
+    uint32_t frame;
+    void *copy;
+    int current;
+
+    if (!space || !space->directory_phys ||
+        virtual_addr < 0x40000000u || virtual_addr >= PAGING_USER_LIMIT)
+        return 0;
+
+    directory = (uint32_t *)PHYS_TO_VIRT(space->directory_phys);
+    directory_index = virtual_addr >> 22;
+    if ((directory[directory_index] & (PAGE_PRESENT | PAGE_USER)) !=
+        (PAGE_PRESENT | PAGE_USER))
+        return 0;
+    table_phys = directory[directory_index] & 0xFFFFF000u;
+    if (table_phys >= PAGING_PHYS_LIMIT) return 0;
+    table = (uint32_t *)PHYS_TO_VIRT(table_phys);
+    table_index = (virtual_addr >> 12) & 0x3FFu;
+    pte = table[table_index];
+    if ((pte & (PAGE_PRESENT | PAGE_COW)) != (PAGE_PRESENT | PAGE_COW))
+        return 0;
+    frame = pte & 0xFFFFF000u;
+
+    copy = frame_alloc();
+    if (!copy) return 0;
+    memcpy(PHYS_TO_VIRT(copy), PHYS_TO_VIRT(frame), FRAME_SIZE);
+    /* Install the private copy before dropping the old reference: the old
+     * frame must stay mapped (and alive) until the new PTE is in place. */
+    table[table_index] = ((uint32_t)copy & 0xFFFFF000u) |
+                         ((pte & 0x00000FFFu) & ~PAGE_COW) | PAGE_RW;
+    frame_ref_first((uint32_t)copy);
+
+    current = (paging_get_cr3() & 0xFFFFF000u) == space->directory_phys;
+    if (current) paging_invlpg(virtual_addr & 0xFFFFF000u);
+    frame_ref_drop(frame);
+    return 1;
 }
 
 void paging_destroy_user_space(address_space_t *space) {
@@ -359,6 +490,9 @@ void paging_destroy_user_space(address_space_t *space) {
     if (!space || !space->directory_phys ||
         space->directory_phys == PAGING_DIR_PHYS)
         return;
+    /* A vfork child borrows its parent's address space: the frames and the
+     * tables belong to the parent and must survive the child. */
+    if (space->shared) return;
 
     directory = (uint32_t *)PHYS_TO_VIRT(space->directory_phys);
     for (uint32_t di = 256; di < (PAGING_USER_LIMIT >> 22); di++) {
@@ -375,7 +509,7 @@ void paging_destroy_user_space(address_space_t *space) {
             table = (uint32_t *)PHYS_TO_VIRT(table_phys);
             for (uint32_t ti = 0; ti < PAGING_ENTRIES; ti++) {
                 if (table[ti] & PAGE_PRESENT)
-                    frame_free((void *)(table[ti] & 0xFFFFF000u));
+                    frame_ref_drop(table[ti]);
             }
             frame_free((void *)table_phys);
         }
@@ -422,7 +556,9 @@ int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
         if ((pte & (PAGE_PRESENT | PAGE_USER)) !=
             (PAGE_PRESENT | PAGE_USER))
             return 0;
-        if (write_access && !(pte & PAGE_RW)) return 0;
+        /* A copy-on-write page is writable in practice: the first write
+         * gets a private copy, so a write range check must accept it. */
+        if (write_access && !(pte & (PAGE_RW | PAGE_COW))) return 0;
 
         if (page_addr == (last_addr & 0xFFFFF000u)) break;
         page_addr += 0x1000u;
@@ -430,7 +566,7 @@ int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
     return 1;
 }
 
-int paging_copy_to_user_space(const address_space_t *space,
+int paging_copy_to_user_space(address_space_t *space,
                               uint32_t virtual_addr, const void *source,
                               uint32_t length) {
     const uint8_t *input = (const uint8_t *)source;
@@ -460,14 +596,24 @@ int paging_copy_to_user_space(const address_space_t *space,
 
         if ((pde & (PAGE_PRESENT | PAGE_USER | PAGE_RW)) !=
             (PAGE_PRESENT | PAGE_USER | PAGE_RW))
-            return 0;
+            goto fault;
         table_phys = pde & 0xFFFFF000u;
-        if (table_phys >= PAGING_PHYS_LIMIT) return 0;
+        if (table_phys >= PAGING_PHYS_LIMIT) goto fault;
         pte = ((uint32_t *)PHYS_TO_VIRT(table_phys))[
             (virtual_addr >> 12) & 0x3FFu];
-        if ((pte & (PAGE_PRESENT | PAGE_USER | PAGE_RW)) !=
-            (PAGE_PRESENT | PAGE_USER | PAGE_RW))
-            return 0;
+        if ((pte & (PAGE_PRESENT | PAGE_USER)) !=
+            (PAGE_PRESENT | PAGE_USER))
+            goto fault;
+        /* The kernel writes through the direct map, which bypasses the
+         * user PTE protection: a copy-on-write page must be broken first
+         * or the write would land in the frame the other process still
+         * shares. */
+        if (pte & PAGE_COW) {
+            if (!paging_break_cow(space, virtual_addr)) goto fault;
+            pte = ((uint32_t *)PHYS_TO_VIRT(table_phys))[
+                (virtual_addr >> 12) & 0x3FFu];
+        }
+        if (!(pte & PAGE_RW)) goto fault;
         if (amount > end - virtual_addr) amount = end - virtual_addr;
         memcpy((void *)((uint32_t)PHYS_TO_VIRT(pte & 0xFFFFF000u) +
                         page_offset),
@@ -476,4 +622,9 @@ int paging_copy_to_user_space(const address_space_t *space,
         copied += amount;
     }
     return 1;
+
+fault:
+    /* The caller sees a partial copy exactly like a faulting memcpy: the
+     * bytes already written stay, and the syscall reports EFAULT. */
+    return 0;
 }
