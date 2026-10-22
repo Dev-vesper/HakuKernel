@@ -12,6 +12,7 @@
 #define EBADF        HAKU_EBADF
 #define ECHILD       HAKU_ECHILD
 #define EAGAIN       HAKU_EAGAIN
+#define ETIMEDOUT    HAKU_ETIMEDOUT
 #define ENOMEM       HAKU_ENOMEM
 #define EFAULT       HAKU_EFAULT
 #define EEXIST       HAKU_EEXIST

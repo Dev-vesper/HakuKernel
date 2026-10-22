@@ -110,6 +110,7 @@
 #define HAKU_SYS_FCNTL64   221u
 #define HAKU_SYS_MADVISE   219u
 #define HAKU_SYS_FUTEX     240u
+#define HAKU_SYS_FUTEX_TIME64 422u
 #define HAKU_SYS_SET_THREAD_AREA 243u
 #define HAKU_SYS_GET_THREAD_AREA 244u
 #define HAKU_SYS_EPOLL_CREATE 254u
@@ -225,6 +226,29 @@
 #define HAKU_ENAMETOOLONG  36u
 #define HAKU_ENOSYS        38u
 #define HAKU_ENOTEMPTY     39u
+#define HAKU_ETIMEDOUT     110u
+
+/* futex(2) operations (Linux). The command is the operation without the
+ * private and clock flags. */
+#define HAKU_FUTEX_WAIT           0u
+#define HAKU_FUTEX_WAKE           1u
+#define HAKU_FUTEX_REQUEUE        3u
+#define HAKU_FUTEX_CMP_REQUEUE    4u
+#define HAKU_FUTEX_WAKE_OP        5u
+#define HAKU_FUTEX_LOCK_PI        6u
+#define HAKU_FUTEX_UNLOCK_PI      7u
+#define HAKU_FUTEX_TRYLOCK_PI     8u
+#define HAKU_FUTEX_WAIT_BITSET    9u
+#define HAKU_FUTEX_WAKE_BITSET    10u
+#define HAKU_FUTEX_WAIT_REQUEUE_PI 11u
+#define HAKU_FUTEX_CMP_REQUEUE_PI 12u
+/* The futex belongs to one process instead of a shared mapping. */
+#define HAKU_FUTEX_PRIVATE_FLAG   128u
+/* The timeout is an absolute CLOCK_REALTIME deadline, not a relative
+ * interval. */
+#define HAKU_FUTEX_CLOCK_REALTIME 256u
+#define HAKU_FUTEX_CMD_MASK \
+    (~(uint32_t)(HAKU_FUTEX_PRIVATE_FLAG | HAKU_FUTEX_CLOCK_REALTIME))
 
 /* open(2) flags accepted by the current VFS implementation. */
 #define HAKU_O_RDONLY  0x0000u

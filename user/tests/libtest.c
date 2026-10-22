@@ -417,12 +417,113 @@ int main(void) {
         expect(set_thread_area(&area) == 0, "set_thread_area reset");
     }
 
+    /* futex: a task parks on a word until another task wakes it. */
+    {
+        static volatile int futex_word;
+        haku_timespec_t timeout;
+
+        /* A word that does not carry the expected value is not waited on
+         * at all: the call reports EAGAIN. */
+        futex_word = 1;
+        expect(futex_wait(&futex_word, 0, NULL) == -1 && errno == EAGAIN,
+               "futex wait on a changed word");
+        futex_word = 0;
+        expect(futex_wake(&futex_word, 1) == 0, "futex wake without waiters");
+
+        /* A wait that runs out of time reports ETIMEDOUT. */
+        timeout.tv_sec = 0;
+        timeout.tv_nsec = 50000000u;
+        expect(futex_wait(&futex_word, 0, &timeout) == -1 &&
+                   errno == ETIMEDOUT,
+               "futex wait times out");
+
+        /* The child parks on the word and the parent wakes it. */
+        {
+            int child = fork();
+            if (child == 0) {
+                haku_timespec_t child_timeout;
+                child_timeout.tv_sec = 5;
+                child_timeout.tv_nsec = 0;
+                if (futex_wait(&futex_word, 0, &child_timeout) == 0)
+                    _exit(0);
+                _exit(1);
+            }
+            expect(child > 0, "fork for futex");
+            if (child > 0) {
+                haku_timespec_t nap;
+                int child_status = 0;
+                nap.tv_sec = 0;
+                nap.tv_nsec = 200000000u;
+                nanosleep(&nap, NULL);
+                futex_word = 1;
+                expect(futex_wake(&futex_word, 1) == 1, "futex wake");
+                expect(waitpid(child, &child_status, 0) == child,
+                       "waitpid futex child");
+                expect(child_status == 0, "the futex waiter woke up");
+            }
+        }
+
+        /* A signal ends a futex wait with EINTR. */
+        {
+            int child;
+            futex_word = 0;
+            child = fork();
+            if (child == 0) {
+                signal(SIGUSR1, on_signal);
+                if (futex_wait(&futex_word, 0, NULL) == -1 &&
+                    errno == EINTR)
+                    _exit(0);
+                _exit(1);
+            }
+            expect(child > 0, "fork for the interrupted futex");
+            if (child > 0) {
+                haku_timespec_t nap;
+                int child_status = 0;
+                nap.tv_sec = 0;
+                nap.tv_nsec = 200000000u;
+                nanosleep(&nap, NULL);
+                expect(kill(child, SIGUSR1) == 0, "signal the futex waiter");
+                expect(waitpid(child, &child_status, 0) == child,
+                       "waitpid interrupted waiter");
+                expect(child_status == 0, "the futex wait returned EINTR");
+            }
+        }
+
+        /* A task that dies while waiting leaves the queue behind: the
+         * wake finds nobody. */
+        {
+            int child;
+            futex_word = 0;
+            child = fork();
+            if (child == 0) {
+                futex_wait(&futex_word, 0, NULL);
+                _exit(1);
+            }
+            expect(child > 0, "fork for the killed futex waiter");
+            if (child > 0) {
+                haku_timespec_t nap;
+                int child_status = 0;
+                nap.tv_sec = 0;
+                nap.tv_nsec = 200000000u;
+                nanosleep(&nap, NULL);
+                expect(kill(child, SIGKILL) == 0, "kill the futex waiter");
+                expect(waitpid(child, &child_status, 0) == child,
+                       "waitpid killed waiter");
+                expect((child_status & 0x7F) == SIGKILL,
+                       "the killed waiter reports SIGKILL");
+                expect(futex_wake(&futex_word, 1) == 0,
+                       "the dead waiter left the queue");
+            }
+        }
+    }
+
     if (failures) {
         printf("USER-LIB-FAIL: %d checks failed\n", failures);
         return 1;
     }
     printf("USER-SIGNAL-OK: kill tkill tgkill sigaction sigprocmask\n");
     printf("USER-MMAP-OK: mmap2 mprotect mremap madvise set_thread_area\n");
+    printf("USER-FUTEX-OK: futex wait wake timeout\n");
     printf("USER-LIB-OK: syscalls strings memory file io errno (pid=%d)\n",
            getpid());
     return 0;

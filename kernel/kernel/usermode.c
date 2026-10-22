@@ -1010,6 +1010,79 @@ static uint32_t sys_set_thread_area(uint32_t user_area) {
     return scheduler_set_thread_area(area[1]);
 }
 
+/* futex(2): wait on a 32-bit user word or wake the waiters of one. The
+ * timeout is a relative timespec (the absolute CLOCK_REALTIME form is
+ * not supported: Haku has no wall clock). */
+static regs_t *sys_futex(regs_t *frame, uint32_t user_address, uint32_t op,
+                         uint32_t val, uint32_t user_timeout,
+                         uint32_t timeout_address, uint32_t value3) {
+    uint32_t command = op & HAKU_FUTEX_CMD_MASK;
+    uint32_t private_futex = (op & HAKU_FUTEX_PRIVATE_FLAG) ? 1u : 0u;
+    uint32_t current;
+    uint32_t word;
+
+    if (op & HAKU_FUTEX_CLOCK_REALTIME) {
+        frame->eax = copy_from_user_error(HAKU_EINVAL);
+        return frame;
+    }
+    current = scheduler_current_pid();
+
+    if (command == HAKU_FUTEX_WAIT || command == HAKU_FUTEX_WAIT_BITSET) {
+        uint32_t ticks = 0;
+        if (user_timeout) {
+            haku_timespec_t timeout;
+            uint32_t hz;
+            uint32_t ns_per_tick;
+            uint32_t subticks;
+            if (!copy_from_user(&timeout, user_timeout, sizeof(timeout))) {
+                frame->eax = copy_from_user_error(HAKU_EFAULT);
+                return frame;
+            }
+            if (timeout.tv_nsec >= HAKU_NSEC_PER_SEC) {
+                frame->eax = copy_from_user_error(HAKU_EINVAL);
+                return frame;
+            }
+            hz = pit_hz();
+            ns_per_tick = HAKU_NSEC_PER_SEC / hz;
+            subticks = (timeout.tv_nsec + ns_per_tick - 1u) / ns_per_tick;
+            ticks = timeout.tv_sec > 0x00FFFFFFu
+                        ? 0xFFFFFFFFu
+                        : timeout.tv_sec * hz + subticks;
+            if (!ticks) ticks = 1;
+        }
+        /* The value check happens here, in the syscall layer: a futex
+         * whose word does not carry the expected value is not waited on
+         * at all. The library repeats the check after every wake, so the
+         * race between the check and the park is harmless. */
+        if (!paging_user_range_valid(user_address, sizeof(word), 0)) {
+            frame->eax = copy_from_user_error(HAKU_EFAULT);
+            return frame;
+        }
+        memcpy(&word, (const void *)user_address, sizeof(word));
+        if (word != val) {
+            frame->eax = copy_from_user_error(HAKU_EAGAIN);
+            return frame;
+        }
+        return scheduler_futex_wait(user_address, current, private_futex,
+                                    ticks, frame);
+    }
+
+    if (command == HAKU_FUTEX_WAKE || command == HAKU_FUTEX_WAKE_BITSET) {
+        (void)timeout_address;
+        (void)value3;
+        frame->eax = scheduler_futex_wake(user_address, val, 0xFFFFFFFFu,
+                                          private_futex);
+        return frame;
+    }
+
+    /* The requeue and priority-inheritance operations are not implemented:
+     * a libc lock only needs wait and wake. */
+    (void)timeout_address;
+    (void)value3;
+    frame->eax = copy_from_user_error(HAKU_ENOSYS);
+    return frame;
+}
+
 regs_t *user_syscall(regs_t *r) {
     scheduler_note_syscall();
     switch (r->eax) {
@@ -1102,6 +1175,8 @@ regs_t *user_syscall(regs_t *r) {
     case HAKU_SYS_GET_THREAD_AREA:
         r->eax = scheduler_get_thread_area();
         return r;
+    case HAKU_SYS_FUTEX:
+        return sys_futex(r, r->ebx, r->ecx, r->edx, r->esi, r->edi, r->ebp);
     case HAKU_SYS_MUNMAP:
         r->eax = scheduler_munmap(r->ebx, r->ecx);
         return r;

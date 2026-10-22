@@ -6,6 +6,7 @@
 #include <haku/errno.h>
 #include <haku/fcntl.h>
 #include <haku/stat.h>
+#include <haku/futex.h>
 #include <haku/mman.h>
 #include <haku/signal.h>
 #include <haku/stdio.h>

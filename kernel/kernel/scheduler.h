@@ -69,6 +69,15 @@ uint32_t scheduler_madvise(uint32_t address, uint32_t length, uint32_t advice);
 /* The user FS base (the thread pointer) of the running task. */
 uint32_t scheduler_set_thread_area(uint32_t base);
 uint32_t scheduler_get_thread_area(void);
+/* futex(2): park the caller on a user word until it is woken, and the
+ * wake side. The wait returns the frame of the task that runs next, so
+ * the caller only continues when the futex is woken (or the timeout
+ * expires). */
+regs_t *scheduler_futex_wait(uint32_t address, uint32_t pid,
+                             uint32_t private_futex, uint32_t ticks,
+                             regs_t *frame);
+uint32_t scheduler_futex_wake(uint32_t address, uint32_t count,
+                              uint32_t mask, uint32_t private_futex);
 uint32_t scheduler_munmap(uint32_t address, uint32_t length);
 uint32_t scheduler_current_pid(void);
 uint32_t scheduler_parent_pid(void);

@@ -40,6 +40,8 @@ typedef struct {
     uint32_t heap_brk;    /* current program break (0 = not yet used) */
     uint32_t heap_top;    /* highest heap page ever mapped (grow only) */
     uint32_t fs_base;     /* user FS base: the thread pointer */
+    uint32_t futex_address;   /* the futex word the task waits on (0 = none) */
+    uint32_t futex_private;   /* the futex is process-private */
     uint32_t mmap_region_count;
     uint32_t user_ticks;          /* timer ticks spent in ring 3 */
     uint32_t kernel_ticks;        /* timer ticks spent in ring 0 */
@@ -76,6 +78,9 @@ static int waitq_marker_written;
  * passes the signal number the way Linux reports it. */
 static regs_t *exit_current_with_status(regs_t *frame, uint32_t wait_status);
 
+/* Drops a task from the futex it waits on (see the futex section). */
+static void futex_remove_waiter(task_t *task);
+
 int scheduler_user_tasks_done(void) {
     if (!scheduler_started) return 0;
     for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
@@ -91,14 +96,21 @@ int scheduler_user_tasks_done(void) {
 
 /* Wake every sleeper whose deadline has been reached. Called from the
  * timer IRQ so a sleeping task resumes once its wake tick passes. The
- * unsigned subtraction compares correctly across the 32-bit tick wrap. */
+ * unsigned subtraction compares correctly across the 32-bit tick wrap.
+ * A futex waiter that runs out of time leaves the queue and reports
+ * ETIMEDOUT. */
 static void wake_expired_sleepers(void) {
     uint32_t now = pit_ticks();
     for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
         task_t *task = &tasks[i];
         if (task->state == TASK_SLEEPING &&
-            (int32_t)(now - task->wake_tick) >= 0)
+            (int32_t)(now - task->wake_tick) >= 0) {
+            if (task->futex_address) {
+                futex_remove_waiter(task);
+                if (task->frame) task->frame->eax = 0u - HAKU_ETIMEDOUT;
+            }
             task->state = TASK_RUNNABLE;
+        }
     }
 }
 
@@ -415,6 +427,9 @@ static regs_t *exit_current_with_status(regs_t *frame, uint32_t wait_status) {
         return frame;
 
     exiting = &tasks[current_task];
+    /* A task that dies while waiting on a futex must not stay in the
+     * queue: a later wake would find a stale waiter. */
+    futex_remove_waiter(exiting);
     /* Closing descriptors takes the task-context VFS lock, so it must run
      * with interrupts enabled. The task-state transition below is then
      * committed under the scheduler's IRQ-save rule: interrupts stay off
@@ -573,6 +588,8 @@ static int32_t queue_signal(task_t *target, uint32_t sig) {
     if (target->state == TASK_SLEEPING || target->state == TASK_WAITING ||
         target->state == TASK_BLOCKED) {
         if (!target->vfork_child) {
+            /* A futex wait ends with EINTR and leaves the queue. */
+            if (target->futex_address) futex_remove_waiter(target);
             target->state = TASK_RUNNABLE;
             target->wait_pid = 0;
             target->wait_status_user = 0;
@@ -1394,6 +1411,166 @@ regs_t *scheduler_wait4(uint32_t pid, uint32_t user_status, uint32_t options,
     parent->wait_status_user = user_status;
     parent->wait_rusage_user = user_rusage;
     parent->frame = frame;
+    next = find_next_task();
+    activate_task(next);
+    return next == SCHEDULER_IDLE_INDEX ? idle_task.frame :
+                                          tasks[next].frame;
+}
+
+/* ------------------------------------------------------------------ */
+/* Futex                                                             */
+/* ------------------------------------------------------------------ */
+
+/* A futex is a 32-bit word in user memory that a task can wait on.
+ * Waiters are parked in the kernel and woken by FUTEX_WAKE. Haku has
+ * one thread per process and no shared memory between processes, so the
+ * number of distinct futexes in use at the same time is bounded by the
+ * number of tasks: a small table of queues is enough and needs no
+ * allocation.
+ *
+ * A private futex (FUTEX_PRIVATE_FLAG) belongs to one process, so its
+ * key carries the pid; a shared futex is keyed by its address alone. */
+#define FUTEX_MAX_QUEUES 8u
+
+typedef struct {
+    uint32_t address;   /* the futex word; 0 means the slot is free */
+    uint32_t pid;       /* the owner of a private futex */
+    uint32_t private_futex;
+    uint32_t waiters[SCHEDULER_MAX_PROCESSES];
+    uint32_t waiter_count;
+} futex_queue_t;
+
+static futex_queue_t futex_queues[FUTEX_MAX_QUEUES];
+
+/* The queue that holds the waiters of a futex, or 0 when there is none
+ * yet. */
+static futex_queue_t *futex_find_queue(uint32_t address, uint32_t pid,
+                                        uint32_t private_futex) {
+    for (uint32_t i = 0; i < FUTEX_MAX_QUEUES; i++) {
+        futex_queue_t *queue = &futex_queues[i];
+        if (!queue->address) continue;
+        if (queue->address != address) continue;
+        if (queue->private_futex != private_futex) continue;
+        if (private_futex && queue->pid != pid) continue;
+        return queue;
+    }
+    return 0;
+}
+
+/* The queue a new waiter joins: an existing one, or a free slot. */
+static futex_queue_t *futex_queue_for(uint32_t address, uint32_t pid,
+                                       uint32_t private_futex) {
+    futex_queue_t *queue = futex_find_queue(address, pid, private_futex);
+    if (queue) return queue;
+    for (uint32_t i = 0; i < FUTEX_MAX_QUEUES; i++) {
+        if (!futex_queues[i].address) {
+            futex_queues[i].address = address;
+            futex_queues[i].pid = pid;
+            futex_queues[i].private_futex = private_futex;
+            futex_queues[i].waiter_count = 0;
+            return &futex_queues[i];
+        }
+    }
+    return 0;
+}
+
+static void futex_queue_release(futex_queue_t *queue) {
+    queue->address = 0;
+    queue->pid = 0;
+    queue->private_futex = 0;
+    queue->waiter_count = 0;
+}
+
+/* Drop a task from the futex it waits on. Called when the wait ends for
+ * any reason: a wake, a timeout, a signal, or the task's exit. */
+static void futex_remove_waiter(task_t *task) {
+    futex_queue_t *queue;
+    uint32_t index;
+
+    if (!task->futex_address) return;
+    queue = futex_find_queue(task->futex_address, task->pid,
+                              task->futex_private);
+    task->futex_address = 0;
+    task->futex_private = 0;
+    if (!queue) return;
+    for (index = 0; index < queue->waiter_count; index++) {
+        if (queue->waiters[index] != (uint32_t)(task - tasks)) continue;
+        for (uint32_t i = index; i + 1u < queue->waiter_count; i++)
+            queue->waiters[i] = queue->waiters[i + 1u];
+        queue->waiter_count--;
+        break;
+    }
+    if (!queue->waiter_count) futex_queue_release(queue);
+}
+
+/* FUTEX_WAKE: release up to `count` waiters of a futex. The woken tasks
+ * see a return value of 0. */
+uint32_t scheduler_futex_wake(uint32_t address, uint32_t count,
+                              uint32_t mask, uint32_t private_futex) {
+    futex_queue_t *queue;
+    uint32_t woken = 0;
+    uint32_t pid = scheduler_current_pid();
+
+    if (count == 0) return 0;
+    queue = futex_find_queue(address, pid, private_futex);
+    if (!queue) return 0;
+    while (woken < count && queue->waiter_count) {
+        uint32_t slot = queue->waiters[0];
+        task_t *waiter;
+        if (slot >= SCHEDULER_MAX_PROCESSES) break;
+        waiter = &tasks[slot];
+        for (uint32_t i = 0; i + 1u < queue->waiter_count; i++)
+            queue->waiters[i] = queue->waiters[i + 1u];
+        queue->waiter_count--;
+        waiter->futex_address = 0;
+        waiter->futex_private = 0;
+        if (waiter->state != TASK_SLEEPING) continue;
+        waiter->state = TASK_RUNNABLE;
+        if (waiter->frame) waiter->frame->eax = 0;
+        woken++;
+    }
+    if (!queue->waiter_count) futex_queue_release(queue);
+    return woken;
+}
+
+/* FUTEX_WAIT: park the caller until the futex is woken. `ticks` is the
+ * timeout in timer ticks (0 means no timeout). The value check itself
+ * happens in the syscall layer, which reads the user word. */
+regs_t *scheduler_futex_wait(uint32_t address, uint32_t pid,
+                             uint32_t private_futex, uint32_t ticks,
+                             regs_t *frame) {
+    task_t *task;
+    futex_queue_t *queue;
+    int next;
+
+    if (!frame || current_task < 0 ||
+        current_task >= SCHEDULER_IDLE_INDEX)
+        return frame;
+
+    (void)irq_lock();
+    task = &tasks[current_task];
+    queue = futex_queue_for(address, pid, private_futex);
+    if (!queue) {
+        frame->eax = 0u - HAKU_EAGAIN;
+        return frame;
+    }
+    if (queue->waiter_count >= SCHEDULER_MAX_PROCESSES) {
+        frame->eax = 0u - HAKU_EAGAIN;
+        return frame;
+    }
+    queue->waiters[queue->waiter_count++] = (uint32_t)current_task;
+    task->futex_address = address;
+    task->futex_private = private_futex;
+    frame->eax = 0;
+    if (ticks) {
+        task->wake_tick = pit_ticks() + ticks;
+    } else {
+        /* No timeout: a deadline far in the future that the signed tick
+         * comparison never reaches. */
+        task->wake_tick = pit_ticks() + 0x3FFFFFFFu;
+    }
+    task->state = TASK_SLEEPING;
+    task->frame = frame;
     next = find_next_task();
     activate_task(next);
     return next == SCHEDULER_IDLE_INDEX ? idle_task.frame :
