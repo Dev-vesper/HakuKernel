@@ -29,6 +29,10 @@
  * frame is shared read-only between address spaces and the first write
  * fault gives the writer a private copy. */
 #define PAGE_COW      0x200u /* _PAGE_BIT_SOFTW1: copy-on-write */
+/* Bit 10 records that a copy-on-write page belongs to a writable
+ * mapping: the page itself is write-protected while it is shared, and
+ * the first write breaks the copy and restores the permission. */
+#define PAGE_COW_RW   0x400u
 
 /* CR0 / CR3 bits (Linux arch/x86/include/asm/cpufeatures + control regs). */
 #define CR0_PG_BIT 0x80000000u /* X86_CR0_PG: paging enable */
@@ -85,6 +89,16 @@ int paging_create_user_space(address_space_t *space);
 int paging_map_user_page(address_space_t *space, uint32_t virtual_addr,
                          uint32_t physical_addr, int writable);
 int paging_unmap_user_page(address_space_t *space, uint32_t virtual_addr);
+/* Change the protection of a user range: accessible (the user bit) and
+ * writable (the R/W bit). PROT_NONE clears the user bit, so any user
+ * access faults. Returns 1 when every page was updated. */
+int paging_protect_user_range(address_space_t *space, uint32_t virtual_addr,
+                              uint32_t length, int accessible, int writable);
+/* Physical address of a mapped user page, or 0 when the page is not
+ * present. The kernel uses it to move page contents without touching the
+ * user mapping (mremap). */
+uint32_t paging_user_page_physical(address_space_t *space,
+                                   uint32_t virtual_addr);
 /* Map the framebuffer's physical pages into PAGING_FB_WINDOW. Returns the
  * virtual base of the requested physical address, or 0 on failure. */
 uint32_t paging_map_framebuffer(uint32_t physical_base, uint32_t length);

@@ -1609,11 +1609,19 @@ _user_program_start:
     int 0x80
     cmp eax, -14
     jne .fail
-    mov esi, 95                 ; PROT_NONE reservations are unsupported
+    mov esi, 95                 ; a PROT_NONE reservation is allowed
     mov eax, SYS_MMAP
     mov ebx, USER_DATA_BASE + (mmap_prot_none - data_start)
     int 0x80
-    cmp eax, -22
+    test eax, eax
+    js .fail                    ; the mapping must be created
+    mov esi, 166
+    mov edi, eax
+    mov eax, SYS_MUNMAP
+    mov ebx, edi
+    mov ecx, 0x1000
+    int 0x80
+    test eax, eax
     jne .fail
     mov esi, 115                ; shrink the break and release the top page
     mov eax, SYS_BRK

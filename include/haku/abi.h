@@ -108,8 +108,10 @@
 #define HAKU_SYS_MMAP2     192u
 #define HAKU_SYS_GETDENTS64 220u
 #define HAKU_SYS_FCNTL64   221u
+#define HAKU_SYS_MADVISE   219u
 #define HAKU_SYS_FUTEX     240u
 #define HAKU_SYS_SET_THREAD_AREA 243u
+#define HAKU_SYS_GET_THREAD_AREA 244u
 #define HAKU_SYS_EPOLL_CREATE 254u
 #define HAKU_SYS_EPOLL_CTL 255u
 #define HAKU_SYS_EPOLL_WAIT 256u
@@ -295,6 +297,16 @@
 #define HAKU_MAP_PRIVATE   0x02u
 #define HAKU_MAP_FIXED     0x10u
 #define HAKU_MAP_ANONYMOUS 0x20u
+/* mremap(2) flags. */
+#define HAKU_MREMAP_MAYMOVE 0x1u
+#define HAKU_MREMAP_FIXED   0x2u
+/* madvise(2) advice values. */
+#define HAKU_MADV_NORMAL     0u
+#define HAKU_MADV_RANDOM     1u
+#define HAKU_MADV_SEQUENTIAL 2u
+#define HAKU_MADV_WILLNEED   3u
+#define HAKU_MADV_DONTNEED   4u
+#define HAKU_MADV_FREE       5u
 #define HAKU_MMAP_ARG_SIZE 24u
 
 typedef unsigned int haku_u32;

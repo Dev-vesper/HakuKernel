@@ -252,9 +252,11 @@ the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `unlink` (10), `execve` (11), `lseek` (19), `getpid` (20), `rename` (38),
 `mkdir` (39), `rmdir` (40), `dup` (41), `brk` (45), `dup2` (63),
 `gettimeofday` (78), `mmap` (90), `munmap` (91), `stat` (106), `lstat` (107),
-`fstat` (108), `wait4` (114), `clone` (120), `nanosleep` (162), `vfork` (190),
+`fstat` (108), `wait4` (114), `clone` (120), `mprotect` (125),
+`nanosleep` (162), `mremap` (163), `vfork` (190), `mmap2` (192),
 `stat64` (195), `lstat64` (196),
-`fstat64` (197), `exit_group` (252), `fstatat64` (300), `uname` (122),
+`fstat64` (197), `madvise` (219), `exit_group` (252), `set_thread_area` (243),
+`get_thread_area` (244), `fstatat64` (300), `uname` (122),
 `getrusage` (77), `times` (43), `getppid` (64), `getuid` (24), `geteuid` (49),
 `getgid` (47), `getegid` (50), and `statx` (383), with arguments in
 `ebx`, `ecx`, `edx`, `esi`, and `edi` and syscall number/result in `eax`.
@@ -283,16 +285,40 @@ is the 24-byte i386 `old_mmap` argument block.
 (`0x50000000`): the break is page-rounded and pages are mapped zero-filled as
 it rises; lowering it unmaps the released pages and returns their frames; a
 below-base break gives `EINVAL` and one past the heap limit gives `ENOMEM`.
-`mmap` takes a pointer to an `old_mmap` argument block in `ebx` and supports
-only anonymous private mappings (`MAP_PRIVATE | MAP_ANONYMOUS`) with a zero
-address hint, no execute bit, and offset 0; it places mappings in a second
-reserved region (`0x60000000`) using first-fit over a per-process table, so
-earlier releases are reused. `munmap` (91) releases a range that lies inside
+`mmap` takes a pointer to an `old_mmap` argument block in `ebx` and
+`mmap2` (192) takes the same values in registers; both map anonymous pages
+only (`MAP_ANONYMOUS` is required, because Haku has no page cache yet) and
+place mappings in a second reserved region (`0x60000000`) using first-fit over
+a per-process table, so earlier releases are reused. `MAP_FIXED` places a
+mapping at the given page-aligned address, which must be a free range inside
+the mmap window: the image, the stack, and the heap are never replaced.
+`MAP_SHARED` and `MAP_PRIVATE` are both accepted; a shared mapping is
+indistinguishable from a private one until a second task can map it.
+`munmap` (91) releases a range that lies inside
 one tracked anonymous mapping, trims or splits the region, and frees the pages
 (and any now-empty page tables). `PROT_WRITE` selects the PTE `R/W` bit, so a
-`PROT_READ` mapping is enforced read-only by the MMU; `PROT_NONE` reservations
-are rejected with `EINVAL`. Both regions are reclaimed with the rest of the
-address space at exit or `execve`.
+`PROT_READ` mapping is enforced read-only by the MMU, and `PROT_NONE` keeps
+the pages mapped but clears the user bit, so any access faults. Both regions
+are reclaimed with the rest of the address space at exit or `execve`.
+
+`mprotect` (125) changes the protection of a mapped range: `PROT_READ` clears
+the `R/W` bit, `PROT_WRITE` sets it, and `PROT_NONE` clears the user bit so
+the range faults on the next access. A copy-on-write page keeps its shared
+frame protected and remembers that its mapping is writable, so the first write
+still produces a private copy instead of writing through to the parent.
+`mremap` (163) grows, shrinks, or moves a mapping: without `MREMAP_MAYMOVE` a
+mapping may only grow in place, and with it the mapping moves to a free range
+and keeps its contents (the pages are copied through the direct map).
+`MADV_DONTNEED` (219) releases the pages of a range, so the next access sees
+zeroed memory again; the other advice values are hints and change nothing.
+`set_thread_area` (243) points the user `FS` segment at the thread block the
+program passes, which is the thread pointer a libc reads through `%fs:0`; the
+GDT entry carries the base and every task switch restores the base of the
+task that is about to run. `get_thread_area` (244) returns it again. The
+library wrappers live in `user/lib/mman.c` behind `include/haku/mman.h`, and
+the ring-3 self-test covers the fixed mapping, the protection changes, the
+fault on a read-only page, the move, the advice call, and the thread pointer
+(`USER-MMAP-OK`).
 
 The kernel sets `CR0.WP`, so ring-0 writes also honour `R/W=0`: read-only user
 pages can only be filled through their physical direct-map alias. ELF segments
@@ -515,6 +541,10 @@ syscall ABI, `types.h`, `errno.h`, `string.h`, `stdlib.h`, `unistd.h`,
   `sigprocmask`, and the `sigset` helpers (`sigemptyset`, `sigfillset`,
   `sigaddset`, `sigdelset`, `sigismember`) in `user/lib/signal.c`. The mask
   is a single word, so only signals 1..31 exist.
+- Memory mappings: `mmap`, `mmap2`, `mprotect`, `mremap`, `madvise`,
+  `munmap`, `set_thread_area`, and `get_thread_area` in `user/lib/mman.c`,
+  with the `PROT_*`, `MAP_*`, `MREMAP_*`, and `MADV_*` constants in
+  `include/haku/mman.h`.
 - Strings and memory: `mem*`, `str*`, `atoi`, `malloc`/`calloc`/`realloc`/
   `free` (a first-fit free list over `brk`), and `printf`/`puts`/`putchar`
   with a `%c/%s/%d/%u/%x/%X/%p` subset (no floats, 512-byte output buffer).
@@ -765,12 +795,12 @@ Haku/
                         crash.c/.h: register/MMU/stack crash reports
                         heap.c/.h: kernel kmalloc/kfree allocator
   user/
-    lib/              errno.c, memory.c, signal.c, stdio.c, string.c,
+    lib/              errno.c, memory.c, mman.c, signal.c, stdio.c, string.c,
                       unistd.c, crt0.asm, syscall.asm: user C library
     tests/            libtest.c: C library self-test installed as LIB.ELF
   include/haku/         abi.h + abi.inc: shared user/kernel ABI constants
                         types/errno/string/stdlib/unistd/fcntl/stat/stdio/
-                        signal.h: user library headers, plus haku.h
+                        signal/mman.h: user library headers, plus haku.h
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       boot floppy size/signature checks
   tools/mkfat12.py     FAT12 image builder for the user ELF

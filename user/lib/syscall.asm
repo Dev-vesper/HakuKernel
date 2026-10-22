@@ -92,7 +92,45 @@ _haku_syscall4:
     mov ecx, [esp + 24]
     mov edx, [esp + 28]
     mov esi, [esp + 32]
+    mov edi, [esp + 36]
     int 0x80
+    pop edi
+    pop esi
+    pop ebx
+    ret
+
+global _haku_syscall5
+_haku_syscall5:
+    push ebx
+    push esi
+    push edi
+    mov eax, [esp + 16]
+    mov ebx, [esp + 20]
+    mov ecx, [esp + 24]
+    mov edx, [esp + 28]
+    mov esi, [esp + 32]
+    mov edi, [esp + 36]
+    int 0x80
+    pop edi
+    pop esi
+    pop ebx
+    ret
+
+global _haku_syscall6
+_haku_syscall6:
+    push ebx
+    push esi
+    push edi
+    push ebp                ; the sixth argument travels in ebp
+    mov eax, [esp + 20]
+    mov ebx, [esp + 24]
+    mov ecx, [esp + 28]
+    mov edx, [esp + 32]
+    mov esi, [esp + 36]
+    mov edi, [esp + 40]
+    mov ebp, [esp + 44]
+    int 0x80
+    pop ebp
     pop edi
     pop esi
     pop ebx

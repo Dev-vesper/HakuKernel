@@ -36,7 +36,7 @@ typedef struct {
 } tss_t;
 #pragma pack(pop)
 
-static gdt_entry_t gdt[6];
+static gdt_entry_t gdt[7];
 static gdtr_t gdtr;
 static tss_t tss;
 
@@ -61,6 +61,10 @@ int gdt_init(void) {
     gdt_set(2, 0, 0xFFFFFu, 0x92u, 0xCFu); /* ring-0 data */
     gdt_set(3, 0, 0xFFFFFu, 0xFAu, 0xCFu); /* ring-3 code */
     gdt_set(4, 0, 0xFFFFFu, 0xF2u, 0xCFu); /* ring-3 data */
+    /* The user FS segment carries the thread pointer: set_thread_area
+     * changes its base, and every task switch restores the base of the
+     * task that is about to run. */
+    gdt_set(6, 0, 0xFFFFFu, 0xF2u, 0xCFu); /* ring-3 data with a base */
 
     tss.ss0 = KERNEL_DS;
     tss.esp0 = (uint32_t)PHYS_TO_VIRT(stack) + FRAME_SIZE;
@@ -76,4 +80,21 @@ int gdt_init(void) {
 
 void gdt_set_kernel_stack(uint32_t stack_top) {
     tss.esp0 = stack_top;
+}
+
+/* Move the user FS segment to a new base (the thread pointer). The
+ * segment register of the running task keeps its cached base until it is
+ * reloaded, which happens on the next iret into user mode, so the change
+ * takes effect for the caller without reloading the register here. */
+void gdt_set_user_fs_base(uint32_t base) {
+    /* The entry is only rewritten when the base really changes, so a task
+     * switch does not reload the GDT every time. */
+    if (gdt[6].base_low == (uint16_t)(base & 0xFFFFu) &&
+        gdt[6].base_mid == (uint8_t)((base >> 16) & 0xFFu) &&
+        gdt[6].base_high == (uint8_t)((base >> 24) & 0xFFu))
+        return;
+    gdt_set(6, base, 0xFFFFFu, 0xF2u, 0xCFu);
+    gdtr.limit = (uint16_t)(sizeof(gdt) - 1u);
+    gdtr.base = (uint32_t)&gdt;
+    gdt_load((uint32_t)&gdtr);
 }

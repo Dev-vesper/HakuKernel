@@ -156,11 +156,13 @@ address-space or descriptor sharing.
   address space; `USER-MEM-OK` covers shrink, release, and reuse).
 - [x] Improve page protections and test read-only, unmapped, and
   use-after-free access (the kernel sets `CR0.WP`, maps `mmap` pages from
-  `PROT_WRITE` so `PROT_READ` is enforced read-only, rejects `PROT_NONE`
-  reservations, and only tears down user PDEs/PTEs; `USER-PROT-OK` spawns a
+  `PROT_WRITE` so `PROT_READ` is enforced read-only, and only tears down user
+  PDEs/PTEs; `USER-PROT-OK` spawns a
   child per case: store into an `RX` segment, store into a `PROT_READ`
   mapping, read from unmapped memory, and store through a `munmap`ed page,
-  checked against `#PF` error codes 7, 7, 4, and 6).
+  checked against `#PF` error codes 7, 7, 4, and 6). A `PROT_NONE`
+  reservation was rejected at that point; the memory-syscall item below
+  accepts it and makes the range fault on access.
 - [x] Track memory and resource usage per process (paging maintains
   mapped-page, page-table, and peak counters per address space; the scheduler
   attributes timer ticks by CPL and counts syscalls plus voluntary and
@@ -276,11 +278,28 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   and the pending signals. Covered by `USER-SIGNAL-OK` in the C library
   self-test. Still missing: process groups, job control, `sigqueue`, and
   real-time signals.
-- [ ] Add the memory syscalls a libc needs: `mmap2` with
+- [x] Add the memory syscalls a libc needs: `mmap2` with
   `MAP_FIXED`/`MAP_ANONYMOUS`/`MAP_SHARED`, `mprotect`, `mremap`,
   `madvise`, and thread-local storage through `set_thread_area` (today
   `mmap` only accepts `MAP_PRIVATE|MAP_ANONYMOUS` and rejects fixed
   addresses).
+  `mmap` (the old argument block) and `mmap2` (the register form) now
+  share one path: anonymous pages with the full protection set, a
+  `MAP_FIXED` placement inside the mmap window, and the shared/private
+  flag. `mprotect` changes the `R/W` bit of a range or clears the user
+  bit for `PROT_NONE`; a copy-on-write page keeps its shared frame
+  protected and remembers that its mapping is writable, so the first
+  write still copies. `mremap` grows, shrinks, or moves a mapping
+  (`MREMAP_MAYMOVE` copies the contents through the direct map),
+  `MADV_DONTNEED` releases the pages so they come back zeroed, and
+  `set_thread_area` points the user `FS` segment at the thread block,
+  which is the thread pointer a libc reads through `%fs:0`. The library
+  gains `include/haku/mman.h` and `user/lib/mman.c`; the ring-3
+  self-test covers the fixed mapping, the protection changes, the fault
+  on a read-only page, the move, the advice call, and the thread pointer
+  (`USER-MMAP-OK`). Still missing: file-backed mappings (there is no
+  page cache yet), `mremap` with `MREMAP_DONTUNMAP`, and shared
+  mappings that a second task can observe.
 - [ ] Add `futex` so libc locks, and later threads, behave correctly.
 - [ ] Extend the filesystem ABI for libc and shell tooling: the `*at` family
   (`openat`, `unlinkat`, `renameat`, `mkdirat`, `fstatat`),

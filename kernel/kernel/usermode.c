@@ -873,23 +873,6 @@ static regs_t *sys_nanosleep(regs_t *frame, uint32_t user_req,
 /* Limited mmap(2) via the i386 old_mmap argument block. Only address 0
  * (kernel-chosen placement), read/write protection, anonymous private
  * mappings, and offset 0 are accepted; the file descriptor is ignored. */
-static uint32_t sys_mmap(uint32_t user_arg) {
-    uint32_t arg[HAKU_MMAP_ARG_SIZE / sizeof(uint32_t)];
-
-    if (!copy_from_user(arg, user_arg, sizeof(arg)))
-        return copy_from_user_error(HAKU_EFAULT);
-    /* PROT_NONE reservations are not implemented: a mapping is either
-     * read-only (PROT_READ) or read/write (PROT_READ|PROT_WRITE), so the
-     * PTE always reflects the requested access. */
-    if (arg[0] != 0u ||
-        (arg[2] & ~(uint32_t)(HAKU_PROT_READ | HAKU_PROT_WRITE)) != 0u ||
-        arg[2] == (uint32_t)HAKU_PROT_NONE ||
-        arg[3] != (uint32_t)(HAKU_MAP_PRIVATE | HAKU_MAP_ANONYMOUS) ||
-        arg[5] != 0u)
-        return copy_from_user_error(HAKU_EINVAL);
-    return scheduler_mmap(arg[1], (arg[2] & HAKU_PROT_WRITE) != 0u);
-}
-
 /* Signals. The kernel keeps the pending and blocked sets in one word
  * each, so a mask is four bytes; the i386 kernel sigset_t is eight, and
  * both sizes are accepted. */
@@ -967,6 +950,66 @@ static uint32_t sys_rt_sigprocmask(uint32_t how, uint32_t user_set,
     return 0u;
 }
 
+/* The memory syscalls. mmap(2) takes an argument block in user memory,
+ * mmap2(2) takes the same values in registers; both end up here. Haku
+ * maps anonymous pages only: a file-backed mapping would need a page
+ * cache, which does not exist yet. */
+static uint32_t sys_mmap_common(uint32_t address, uint32_t length,
+                                uint32_t prot, uint32_t flags,
+                                uint32_t offset) {
+    if (offset != 0u) return copy_from_user_error(HAKU_EINVAL);
+    return scheduler_mmap2(address, length, prot, flags);
+}
+
+static uint32_t sys_mmap(uint32_t user_arg) {
+    uint32_t arg[HAKU_MMAP_ARG_SIZE / sizeof(uint32_t)];
+
+    if (!copy_from_user(arg, user_arg, sizeof(arg)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return sys_mmap_common(arg[0], arg[1], arg[2], arg[3], arg[5]);
+}
+
+static uint32_t sys_mmap2(uint32_t address, uint32_t length, uint32_t prot,
+                          uint32_t flags, uint32_t fd, uint32_t offset) {
+    /* The descriptor is ignored for an anonymous mapping, exactly like
+     * Linux does, but the offset must be zero. */
+    (void)fd;
+    return sys_mmap_common(address, length, prot, flags, offset);
+}
+
+static uint32_t sys_mprotect(uint32_t address, uint32_t length,
+                             uint32_t prot) {
+    return scheduler_mprotect(address, length, prot);
+}
+
+static uint32_t sys_mremap(uint32_t old_address, uint32_t old_length,
+                           uint32_t new_length, uint32_t flags,
+                           uint32_t new_address) {
+    return scheduler_mremap(old_address, old_length, new_length, flags,
+                            new_address);
+}
+
+static uint32_t sys_madvise(uint32_t address, uint32_t length,
+                            uint32_t advice) {
+    return scheduler_madvise(address, length, advice);
+}
+
+/* set_thread_area(2): the user passes a pointer to the thread area
+ * descriptor { entry_number, base_addr }. The base becomes the user FS
+ * base (the thread pointer). */
+static uint32_t sys_set_thread_area(uint32_t user_area) {
+    uint32_t area[2];
+
+    if (!copy_from_user(area, user_area, sizeof(area)))
+        return copy_from_user_error(HAKU_EFAULT);
+    /* Only the first thread area exists; the kernel ignores the number
+     * when it is the "use the default slot" value. */
+    if (area[0] != 0u && area[0] != 0xFFFFFFFFu)
+        return copy_from_user_error(HAKU_EINVAL);
+    if (area[1] >= 0xC0000000u) return copy_from_user_error(HAKU_EINVAL);
+    return scheduler_set_thread_area(area[1]);
+}
+
 regs_t *user_syscall(regs_t *r) {
     scheduler_note_syscall();
     switch (r->eax) {
@@ -1040,6 +1083,24 @@ regs_t *user_syscall(regs_t *r) {
         return r;
     case HAKU_SYS_MMAP:
         r->eax = sys_mmap(r->ebx);
+        return r;
+    case HAKU_SYS_MMAP2:
+        r->eax = sys_mmap2(r->ebx, r->ecx, r->edx, r->esi, r->edi, r->ebp);
+        return r;
+    case HAKU_SYS_MPROTECT:
+        r->eax = sys_mprotect(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_MREMAP:
+        r->eax = sys_mremap(r->ebx, r->ecx, r->edx, r->esi, r->edi);
+        return r;
+    case HAKU_SYS_MADVISE:
+        r->eax = sys_madvise(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_SET_THREAD_AREA:
+        r->eax = sys_set_thread_area(r->ebx);
+        return r;
+    case HAKU_SYS_GET_THREAD_AREA:
+        r->eax = scheduler_get_thread_area();
         return r;
     case HAKU_SYS_MUNMAP:
         r->eax = scheduler_munmap(r->ebx, r->ecx);

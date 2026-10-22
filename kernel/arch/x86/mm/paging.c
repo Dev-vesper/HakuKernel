@@ -257,6 +257,93 @@ int paging_map_user_page(address_space_t *space, uint32_t virtual_addr,
     return 1;
 }
 
+int paging_protect_user_range(address_space_t *space, uint32_t virtual_addr,
+                              uint32_t length, int accessible, int writable) {
+    uint32_t last_addr;
+    uint32_t page_addr;
+    uint32_t *directory;
+    uint32_t *table;
+    uint32_t table_phys;
+    int current;
+
+    if (!space || !space->directory_phys || length == 0) return 0;
+    if (virtual_addr < 0x40000000u ||
+        virtual_addr >= PAGING_USER_LIMIT ||
+        length - 1u > 0xFFFFFFFFu - virtual_addr)
+        return 0;
+    last_addr = virtual_addr + length - 1u;
+    if (last_addr >= PAGING_USER_LIMIT) return 0;
+
+    directory = (uint32_t *)PHYS_TO_VIRT(space->directory_phys);
+    current = (paging_get_cr3() & 0xFFFFF000u) == space->directory_phys;
+
+    page_addr = virtual_addr & 0xFFFFF000u;
+    for (;;) {
+        uint32_t pde = directory[page_addr >> 22];
+        uint32_t pte;
+
+        if ((pde & (PAGE_PRESENT | PAGE_USER)) !=
+            (PAGE_PRESENT | PAGE_USER))
+            return 0;
+        table_phys = pde & 0xFFFFF000u;
+        if (table_phys >= PAGING_PHYS_LIMIT) return 0;
+        table = (uint32_t *)PHYS_TO_VIRT(table_phys);
+        pte = table[(page_addr >> 12) & 0x3FFu];
+        /* A PROT_NONE page is present but not user accessible, so it can
+         * be made accessible again. */
+        if (!(pte & PAGE_PRESENT)) return 0;
+
+        /* The user bit carries "accessible" (PROT_NONE clears it, so a
+         * user access faults) and the R/W bit carries writability. A
+         * copy-on-write page stays write-protected while it is shared,
+         * but PAGE_COW_RW remembers that the mapping itself allows
+         * writes, so the copy-on-write break can restore that. */
+        pte &= ~(uint32_t)(PAGE_USER | PAGE_RW | PAGE_COW_RW);
+        if (accessible) {
+            pte |= PAGE_USER;
+            if (writable) {
+                pte |= PAGE_RW;
+                if (pte & PAGE_COW) pte |= PAGE_COW_RW;
+            }
+        }
+        table[(page_addr >> 12) & 0x3FFu] = pte;
+
+        if (page_addr == (last_addr & 0xFFFFF000u)) break;
+        page_addr += 0x1000u;
+    }
+    if (current) paging_invlpg(virtual_addr);
+    return 1;
+}
+
+uint32_t paging_user_page_physical(address_space_t *space,
+                                   uint32_t virtual_addr) {
+    uint32_t *directory;
+    uint32_t *table;
+    uint32_t directory_index;
+    uint32_t table_index;
+    uint32_t table_phys;
+    uint32_t pte;
+
+    if (!space || !space->directory_phys ||
+        (virtual_addr & 0xFFFu) != 0 ||
+        virtual_addr < 0x40000000u ||
+        virtual_addr >= PAGING_USER_LIMIT)
+        return 0;
+
+    directory = (uint32_t *)PHYS_TO_VIRT(space->directory_phys);
+    directory_index = virtual_addr >> 22;
+    if ((directory[directory_index] & (PAGE_PRESENT | PAGE_USER)) !=
+        (PAGE_PRESENT | PAGE_USER))
+        return 0;
+    table_phys = directory[directory_index] & 0xFFFFF000u;
+    if (table_phys >= PAGING_PHYS_LIMIT) return 0;
+    table = (uint32_t *)PHYS_TO_VIRT(table_phys);
+    table_index = (virtual_addr >> 12) & 0x3FFu;
+    pte = table[table_index];
+    if ((pte & PAGE_PRESENT) != PAGE_PRESENT) return 0;
+    return pte & 0xFFFFF000u;
+}
+
 int paging_unmap_user_page(address_space_t *space, uint32_t virtual_addr) {
     uint32_t *directory;
     uint32_t *table;
@@ -284,8 +371,9 @@ int paging_unmap_user_page(address_space_t *space, uint32_t virtual_addr) {
     table = (uint32_t *)PHYS_TO_VIRT(table_phys);
     table_index = (virtual_addr >> 12) & 0x3FFu;
     pte = table[table_index];
-    if ((pte & (PAGE_PRESENT | PAGE_USER)) != (PAGE_PRESENT | PAGE_USER))
-        return 0;
+    /* A PROT_NONE page is present but not user accessible, so only the
+     * present bit is required here. */
+    if (!(pte & PAGE_PRESENT)) return 0;
 
     table[table_index] = 0;
     if (space->mapped_pages) space->mapped_pages--;
@@ -416,9 +504,13 @@ int paging_share_user_space(address_space_t *source,
                 /* A writable page becomes read-only in both spaces and is
                  * copied on the first write. A page that is already
                  * read-only (code) is shared as-is: no copy can be
-                 * produced by a write, because a write is not allowed. */
+                 * produced by a write, because a write is not allowed.
+                 * PAGE_COW_RW records that the mapping itself is
+                 * writable, so the copy-on-write break can restore that
+                 * permission (mprotect may have made the page
+                 * read-only in the meantime). */
                 pte &= ~PAGE_RW;
-                pte |= PAGE_COW;
+                pte |= PAGE_COW | PAGE_COW_RW;
                 table[ti] = pte;
             }
             new_table[ti] = pte;
@@ -468,6 +560,10 @@ int paging_break_cow(address_space_t *space, uint32_t virtual_addr) {
     pte = table[table_index];
     if ((pte & (PAGE_PRESENT | PAGE_COW)) != (PAGE_PRESENT | PAGE_COW))
         return 0;
+    /* A copy-on-write page whose mapping was made read-only (mprotect)
+     * must not be broken: the write is a protection fault, not a
+     * sharing fault. */
+    if (!(pte & PAGE_COW_RW)) return 0;
     frame = pte & 0xFFFFF000u;
 
     copy = frame_alloc();
@@ -476,7 +572,8 @@ int paging_break_cow(address_space_t *space, uint32_t virtual_addr) {
     /* Install the private copy before dropping the old reference: the old
      * frame must stay mapped (and alive) until the new PTE is in place. */
     table[table_index] = ((uint32_t)copy & 0xFFFFF000u) |
-                         ((pte & 0x00000FFFu) & ~PAGE_COW) | PAGE_RW;
+                         ((pte & 0x00000FFFu) &
+                          ~(PAGE_COW | PAGE_COW_RW)) | PAGE_RW;
     frame_ref_first((uint32_t)copy);
 
     current = (paging_get_cr3() & 0xFFFFF000u) == space->directory_phys;
@@ -557,8 +654,9 @@ int paging_user_range_valid(uint32_t virtual_addr, uint32_t length,
             (PAGE_PRESENT | PAGE_USER))
             return 0;
         /* A copy-on-write page is writable in practice: the first write
-         * gets a private copy, so a write range check must accept it. */
-        if (write_access && !(pte & (PAGE_RW | PAGE_COW))) return 0;
+         * gets a private copy, so a write range check must accept it.
+         * A copy-on-write page whose mapping is read-only does not. */
+        if (write_access && !(pte & (PAGE_RW | PAGE_COW_RW))) return 0;
 
         if (page_addr == (last_addr & 0xFFFFF000u)) break;
         page_addr += 0x1000u;

@@ -56,6 +56,19 @@ regs_t *scheduler_wait4(uint32_t pid, uint32_t user_status, uint32_t options,
 regs_t *scheduler_sleep_ticks(uint32_t ticks, regs_t *frame);
 uint32_t scheduler_brk(uint32_t requested);
 uint32_t scheduler_mmap(uint32_t length, int writable);
+/* The memory syscalls a libc needs: an anonymous mapping with the full
+ * protection set and MAP_FIXED placement, protection changes, moving or
+ * resizing a mapping, and the advice call. */
+uint32_t scheduler_mmap2(uint32_t address, uint32_t length, uint32_t prot,
+                         uint32_t flags);
+uint32_t scheduler_mprotect(uint32_t address, uint32_t length, uint32_t prot);
+uint32_t scheduler_mremap(uint32_t old_address, uint32_t old_length,
+                          uint32_t new_length, uint32_t flags,
+                          uint32_t new_address);
+uint32_t scheduler_madvise(uint32_t address, uint32_t length, uint32_t advice);
+/* The user FS base (the thread pointer) of the running task. */
+uint32_t scheduler_set_thread_area(uint32_t base);
+uint32_t scheduler_get_thread_area(void);
 uint32_t scheduler_munmap(uint32_t address, uint32_t length);
 uint32_t scheduler_current_pid(void);
 uint32_t scheduler_parent_pid(void);

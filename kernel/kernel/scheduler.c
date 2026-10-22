@@ -39,6 +39,7 @@ typedef struct {
     uint32_t wake_tick;
     uint32_t heap_brk;    /* current program break (0 = not yet used) */
     uint32_t heap_top;    /* highest heap page ever mapped (grow only) */
+    uint32_t fs_base;     /* user FS base: the thread pointer */
     uint32_t mmap_region_count;
     uint32_t user_ticks;          /* timer ticks spent in ring 3 */
     uint32_t kernel_ticks;        /* timer ticks spent in ring 0 */
@@ -57,6 +58,8 @@ typedef struct {
     struct {
         uint32_t base;
         uint32_t size;
+        uint32_t prot;   /* HAKU_PROT_* bits of the mapping */
+        uint32_t flags;  /* HAKU_MAP_SHARED / HAKU_MAP_PRIVATE */
     } mmap_regions[TASK_MAX_MMAP_REGIONS];
 } task_t;
 
@@ -134,7 +137,7 @@ static int initialize_stack(task_t *task, int user_mode) {
     frame = (regs_t *)(stack_top - sizeof(regs_t));
     memset(frame, 0, sizeof(*frame));
     frame->gs = user_mode ? USER_DS : KERNEL_DS;
-    frame->fs = user_mode ? USER_DS : KERNEL_DS;
+    frame->fs = user_mode ? USER_FS : KERNEL_DS;
     frame->es = user_mode ? USER_DS : KERNEL_DS;
     frame->ds = user_mode ? USER_DS : KERNEL_DS;
     frame->int_no = 0;
@@ -190,6 +193,10 @@ static void activate_task(int selected_index) {
     } else {
         task = &tasks[selected_index];
         paging_activate_user_space(&task->program.address_space);
+        /* The user FS segment carries the thread pointer: the GDT entry
+         * must match the task that is about to run before its iret
+         * reloads the segment. */
+        gdt_set_user_fs_base(task->fs_base);
     }
     gdt_set_kernel_stack((uint32_t)PHYS_TO_VIRT(task->kernel_stack) +
                          TASK_KERNEL_STACK_PAGES * FRAME_SIZE);
@@ -815,7 +822,7 @@ int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
     memset(task->sigactions, 0, sizeof(task->sigactions));
 
     frame->gs = USER_DS;
-    frame->fs = USER_DS;
+    frame->fs = USER_FS;
     frame->es = USER_DS;
     frame->ds = USER_DS;
     frame->edi = 0;
@@ -1501,7 +1508,10 @@ static uint32_t mmap_find_gap(const task_t *task, uint32_t size) {
     return candidate;
 }
 
-static void mmap_insert_region(task_t *task, uint32_t base, uint32_t size) {
+/* Insert a tracked region, keeping the table sorted by base. */
+static void mmap_insert_region_prot(task_t *task, uint32_t base,
+                                     uint32_t size, uint32_t prot,
+                                     uint32_t flags) {
     uint32_t index = 0;
     while (index < task->mmap_region_count &&
            task->mmap_regions[index].base < base)
@@ -1510,35 +1520,359 @@ static void mmap_insert_region(task_t *task, uint32_t base, uint32_t size) {
         task->mmap_regions[i] = task->mmap_regions[i - 1u];
     task->mmap_regions[index].base = base;
     task->mmap_regions[index].size = size;
+    task->mmap_regions[index].prot = prot;
+    task->mmap_regions[index].flags = flags;
     task->mmap_region_count++;
+}
+
+static void mmap_insert_region(task_t *task, uint32_t base, uint32_t size) {
+    mmap_insert_region_prot(task, base, size, HAKU_PROT_READ | HAKU_PROT_WRITE,
+                            HAKU_MAP_PRIVATE);
+}
+
+/* The tracked region that fully contains [start, end), or
+ * TASK_MAX_MMAP_REGIONS when there is none. */
+static uint32_t mmap_find_region(const task_t *task, uint32_t start,
+                                  uint32_t end) {
+    for (uint32_t i = 0; i < task->mmap_region_count; i++) {
+        uint32_t base = task->mmap_regions[i].base;
+        uint32_t size = task->mmap_regions[i].size;
+        if (start >= base && end <= base + size) return i;
+    }
+    return TASK_MAX_MMAP_REGIONS;
+}
+
+/* True when no tracked region overlaps [start, end). */
+static int mmap_range_free(const task_t *task, uint32_t start, uint32_t end) {
+    for (uint32_t i = 0; i < task->mmap_region_count; i++) {
+        uint32_t base = task->mmap_regions[i].base;
+        uint32_t size = task->mmap_regions[i].size;
+        if (start < base + size && end > base) return 0;
+    }
+    return 1;
+}
+
+/* mmap2(2) and the old mmap(2): anonymous mappings with the full
+ * protection set, MAP_FIXED placement, and the shared/private flag.
+ * File-backed mappings are not supported (Haku has no page cache), so
+ * MAP_ANONYMOUS is required. Returns the mapped base or -errno. */
+uint32_t scheduler_mmap2(uint32_t address, uint32_t length, uint32_t prot,
+                         uint32_t flags) {
+    task_t *task;
+    address_space_t *space;
+    uint32_t rounded;
+    uint32_t base;
+    uint32_t map_flags;
+
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0u - HAKU_EINVAL;
+    if (length == 0) return 0u - HAKU_EINVAL;
+    if (prot & ~(uint32_t)(HAKU_PROT_READ | HAKU_PROT_WRITE | HAKU_PROT_EXEC))
+        return 0u - HAKU_EINVAL;
+    if (flags & ~(uint32_t)(HAKU_MAP_SHARED | HAKU_MAP_PRIVATE |
+                            HAKU_MAP_FIXED | HAKU_MAP_ANONYMOUS))
+        return 0u - HAKU_EINVAL;
+    /* One of the two sharing modes must be given, and they are mutually
+     * exclusive. */
+    if ((flags & (HAKU_MAP_SHARED | HAKU_MAP_PRIVATE)) != HAKU_MAP_SHARED &&
+        (flags & (HAKU_MAP_SHARED | HAKU_MAP_PRIVATE)) != HAKU_MAP_PRIVATE)
+        return 0u - HAKU_EINVAL;
+    if (!(flags & HAKU_MAP_ANONYMOUS)) return 0u - HAKU_EINVAL;
+
+    task = &tasks[current_task];
+    space = &task->program.address_space;
+    if (!space->directory_phys) return 0u - HAKU_EINVAL;
+    if (length > USER_MMAP_LIMIT - USER_MMAP_BASE) return 0u - HAKU_ENOMEM;
+    if (task->mmap_region_count >= TASK_MAX_MMAP_REGIONS)
+        return 0u - HAKU_ENOMEM;
+
+    rounded = (length + USER_PAGE_SIZE - 1u) & 0xFFFFF000u;
+    if (flags & HAKU_MAP_FIXED) {
+        /* A fixed mapping must land on a free, page-aligned range inside
+         * the mmap window: the image, the stack, and the heap are never
+         * replaced. */
+        if ((address & 0xFFFu) != 0u) return 0u - HAKU_EINVAL;
+        if (address < USER_MMAP_BASE || address > USER_MMAP_LIMIT - rounded)
+            return 0u - HAKU_EINVAL;
+        if (!mmap_range_free(task, address, address + rounded))
+            return 0u - HAKU_EINVAL;
+        base = address;
+    } else {
+        base = mmap_find_gap(task, rounded);
+        if (!base) return 0u - HAKU_ENOMEM;
+    }
+
+    if (!map_user_zero_pages(space, base, base + rounded, 1))
+        return 0u - HAKU_ENOMEM;
+    /* The requested protection is applied after the pages exist: PROT_NONE
+     * keeps the pages mapped but unreachable from user mode. */
+    if (!paging_protect_user_range(space, base, rounded,
+                                   prot != (uint32_t)HAKU_PROT_NONE,
+                                   (prot & HAKU_PROT_WRITE) != 0u)) {
+        for (uint32_t page = base; page < base + rounded;
+             page += USER_PAGE_SIZE)
+            paging_unmap_user_page(space, page);
+        return 0u - HAKU_ENOMEM;
+    }
+    map_flags = flags & (uint32_t)(HAKU_MAP_SHARED | HAKU_MAP_PRIVATE);
+    mmap_insert_region_prot(task, base, rounded, prot, map_flags);
+    return base;
+}
+
+/* mprotect(2): change the protection of a mapped range. The range must
+ * lie inside one tracked region. Returns 0 or -errno. */
+uint32_t scheduler_mprotect(uint32_t address, uint32_t length, uint32_t prot) {
+    task_t *task;
+    address_space_t *space;
+    uint32_t start;
+    uint32_t end;
+    uint32_t index;
+
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0u - HAKU_EINVAL;
+    if (length == 0 || address > 0xFFFFFFFFu - length) return 0u - HAKU_EINVAL;
+    if (prot & ~(uint32_t)(HAKU_PROT_READ | HAKU_PROT_WRITE | HAKU_PROT_EXEC))
+        return 0u - HAKU_EINVAL;
+    task = &tasks[current_task];
+    space = &task->program.address_space;
+    if (!space->directory_phys) return 0u - HAKU_EINVAL;
+
+    start = address & 0xFFFFF000u;
+    end = address + length;
+    if ((end & 0xFFFu) != 0) {
+        if (end > 0xFFFFF000u) return 0u - HAKU_EINVAL;
+        end = (end + USER_PAGE_SIZE - 1u) & 0xFFFFF000u;
+    }
+    if (end <= start || start < USER_MMAP_BASE || end > USER_MMAP_LIMIT)
+        return 0u - HAKU_EINVAL;
+
+    index = mmap_find_region(task, start, end);
+    if (index == TASK_MAX_MMAP_REGIONS) return 0u - HAKU_EINVAL;
+    if (!paging_protect_user_range(space, start, end - start,
+                                   prot != (uint32_t)HAKU_PROT_NONE,
+                                   (prot & HAKU_PROT_WRITE) != 0u))
+        return 0u - HAKU_EINVAL;
+    task->mmap_regions[index].prot = prot;
+    return 0;
+}
+
+/* Copy the contents of a mapped range into freshly mapped pages (the
+ * mremap move path). The frames are read and written through the direct
+ * map, so the user protection of the source does not matter. */
+static int mmap_copy_range(address_space_t *space, uint32_t from,
+                            uint32_t to, uint32_t length) {
+    for (uint32_t offset = 0; offset < length; offset += USER_PAGE_SIZE) {
+        uint32_t source = paging_user_page_physical(space, from + offset);
+        uint32_t target = paging_user_page_physical(space, to + offset);
+        if (!source || !target) return 0;
+        memcpy(PHYS_TO_VIRT(target), PHYS_TO_VIRT(source), USER_PAGE_SIZE);
+    }
+    return 1;
+}
+
+/* mremap(2): grow, shrink, or move a mapping. Without MREMAP_MAYMOVE a
+ * mapping may only grow in place; with it the mapping moves to a free
+ * range and its contents are preserved. MREMAP_FIXED places it at the
+ * given address. Returns the new base or -errno. */
+uint32_t scheduler_mremap(uint32_t old_address, uint32_t old_length,
+                          uint32_t new_length, uint32_t flags,
+                          uint32_t new_address) {
+    task_t *task;
+    address_space_t *space;
+    uint32_t index;
+    uint32_t base;
+    uint32_t size;
+    uint32_t prot;
+    uint32_t map_flags;
+    uint32_t old_rounded;
+    uint32_t new_rounded;
+    uint32_t target;
+
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0u - HAKU_EINVAL;
+    if (old_length == 0 || new_length == 0) return 0u - HAKU_EINVAL;
+    if (old_address > 0xFFFFFFFFu - old_length) return 0u - HAKU_EINVAL;
+    if (flags & ~(uint32_t)(HAKU_MREMAP_MAYMOVE | HAKU_MREMAP_FIXED))
+        return 0u - HAKU_EINVAL;
+    task = &tasks[current_task];
+    space = &task->program.address_space;
+    if (!space->directory_phys) return 0u - HAKU_EINVAL;
+
+    old_rounded = (old_length + USER_PAGE_SIZE - 1u) & 0xFFFFF000u;
+    new_rounded = (new_length + USER_PAGE_SIZE - 1u) & 0xFFFFF000u;
+    if (new_rounded > USER_MMAP_LIMIT - USER_MMAP_BASE) return 0u - HAKU_ENOMEM;
+
+    index = mmap_find_region(task, old_address & 0xFFFFF000u,
+                              (old_address & 0xFFFFF000u) + old_rounded);
+    if (index == TASK_MAX_MMAP_REGIONS) return 0u - HAKU_EINVAL;
+    base = task->mmap_regions[index].base;
+    size = task->mmap_regions[index].size;
+    prot = task->mmap_regions[index].prot;
+    map_flags = task->mmap_regions[index].flags;
+
+    if (new_rounded <= size) {
+        /* Shrink (or keep the size): release the tail and keep the base. */
+        for (uint32_t page = base + new_rounded; page < base + size;
+             page += USER_PAGE_SIZE)
+            paging_unmap_user_page(space, page);
+        task->mmap_regions[index].size = new_rounded;
+        return base;
+    }
+
+    /* Growth: in place when the pages above the region are free. */
+    if (base + new_rounded <= USER_MMAP_LIMIT &&
+        mmap_range_free(task, base + size, base + new_rounded) &&
+        map_user_zero_pages(space, base + size, base + new_rounded, 1)) {
+        if (!paging_protect_user_range(space, base + size,
+                                       new_rounded - size,
+                                       prot != (uint32_t)HAKU_PROT_NONE,
+                                       (prot & HAKU_PROT_WRITE) != 0u)) {
+            for (uint32_t page = base + size; page < base + new_rounded;
+                 page += USER_PAGE_SIZE)
+                paging_unmap_user_page(space, page);
+            return 0u - HAKU_ENOMEM;
+        }
+        task->mmap_regions[index].size = new_rounded;
+        return base;
+    }
+
+    if (!(flags & HAKU_MREMAP_MAYMOVE) && !(flags & HAKU_MREMAP_FIXED))
+        return 0u - HAKU_EINVAL;
+    if (flags & HAKU_MREMAP_FIXED) {
+        if ((new_address & 0xFFFu) != 0u) return 0u - HAKU_EINVAL;
+        if (new_address < USER_MMAP_BASE ||
+            new_address > USER_MMAP_LIMIT - new_rounded)
+            return 0u - HAKU_EINVAL;
+        target = new_address;
+    } else {
+        target = mmap_find_gap(task, new_rounded);
+        if (!target) return 0u - HAKU_ENOMEM;
+    }
+    if (!mmap_range_free(task, target, target + new_rounded))
+        return 0u - HAKU_EINVAL;
+
+    /* Move: map the new pages, copy the contents, then release the old
+     * ones. The old mapping stays valid until the copy is complete. */
+    if (!map_user_zero_pages(space, target, target + new_rounded, 1))
+        return 0u - HAKU_ENOMEM;
+    if (!mmap_copy_range(space, base, target, size)) {
+        for (uint32_t page = target; page < target + new_rounded;
+             page += USER_PAGE_SIZE)
+            paging_unmap_user_page(space, page);
+        return 0u - HAKU_ENOMEM;
+    }
+    if (!paging_protect_user_range(space, target, new_rounded,
+                                   prot != (uint32_t)HAKU_PROT_NONE,
+                                   (prot & HAKU_PROT_WRITE) != 0u)) {
+        for (uint32_t page = target; page < target + new_rounded;
+             page += USER_PAGE_SIZE)
+            paging_unmap_user_page(space, page);
+        return 0u - HAKU_ENOMEM;
+    }
+    for (uint32_t page = base; page < base + size; page += USER_PAGE_SIZE)
+        paging_unmap_user_page(space, page);
+    /* The moved region replaces the old one in the table. */
+    task->mmap_regions[index].base = target;
+    task->mmap_regions[index].size = new_rounded;
+    /* Keep the table sorted by base. */
+    for (uint32_t i = index; i > 0 && task->mmap_regions[i].base <
+                                   task->mmap_regions[i - 1u].base; i--) {
+        uint32_t swap = task->mmap_regions[i].base;
+        task->mmap_regions[i].base = task->mmap_regions[i - 1u].base;
+        task->mmap_regions[i - 1u].base = swap;
+        swap = task->mmap_regions[i].size;
+        task->mmap_regions[i].size = task->mmap_regions[i - 1u].size;
+        task->mmap_regions[i - 1u].size = swap;
+        swap = task->mmap_regions[i].prot;
+        task->mmap_regions[i].prot = task->mmap_regions[i - 1u].prot;
+        task->mmap_regions[i - 1u].prot = swap;
+        swap = task->mmap_regions[i].flags;
+        task->mmap_regions[i].flags = task->mmap_regions[i - 1u].flags;
+        task->mmap_regions[i - 1u].flags = swap;
+    }
+    return target;
+}
+
+/* madvise(2): MADV_DONTNEED releases the pages of a range, which come
+ * back zero-filled on the next access (an anonymous mapping has no file
+ * behind it). The other advice values are hints and change nothing.
+ * Returns 0 or -errno. */
+uint32_t scheduler_madvise(uint32_t address, uint32_t length, uint32_t advice) {
+    task_t *task;
+    address_space_t *space;
+    uint32_t start;
+    uint32_t end;
+    uint32_t index;
+    uint32_t prot;
+
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0u - HAKU_EINVAL;
+    if (length == 0 || address > 0xFFFFFFFFu - length) return 0u - HAKU_EINVAL;
+    if (advice > HAKU_MADV_FREE) return 0u - HAKU_EINVAL;
+    task = &tasks[current_task];
+    space = &task->program.address_space;
+    if (!space->directory_phys) return 0u - HAKU_EINVAL;
+
+    start = address & 0xFFFFF000u;
+    end = address + length;
+    if ((end & 0xFFFu) != 0) {
+        if (end > 0xFFFFF000u) return 0u - HAKU_EINVAL;
+        end = (end + USER_PAGE_SIZE - 1u) & 0xFFFFF000u;
+    }
+    if (end <= start || start < USER_MMAP_BASE || end > USER_MMAP_LIMIT)
+        return 0u - HAKU_EINVAL;
+    index = mmap_find_region(task, start, end);
+    if (index == TASK_MAX_MMAP_REGIONS) return 0u - HAKU_EINVAL;
+    if (advice != HAKU_MADV_DONTNEED) return 0;
+
+    prot = task->mmap_regions[index].prot;
+    for (uint32_t page = start; page < end; page += USER_PAGE_SIZE) {
+        void *fresh = frame_alloc();
+        uint32_t physical;
+        if (!fresh) break;
+        physical = (uint32_t)fresh;
+        memset(PHYS_TO_VIRT(physical), 0, USER_PAGE_SIZE);
+        paging_unmap_user_page(space, page);
+        if (!paging_map_user_page(space, page, physical,
+                                  (prot & HAKU_PROT_WRITE) != 0u)) {
+            frame_free(fresh);
+            break;
+        }
+        paging_protect_user_range(space, page, USER_PAGE_SIZE,
+                                  prot != (uint32_t)HAKU_PROT_NONE,
+                                  (prot & HAKU_PROT_WRITE) != 0u);
+    }
+    return 0;
+}
+
+/* set_thread_area(2): the user FS base is the thread pointer. The GDT
+ * entry is updated so the next iret into user mode loads the segment
+ * with the new base. */
+uint32_t scheduler_set_thread_area(uint32_t base) {
+    task_t *task;
+
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0u - HAKU_EINVAL;
+    task = &tasks[current_task];
+    task->fs_base = base;
+    gdt_set_user_fs_base(base);
+    return 0;
+}
+
+uint32_t scheduler_get_thread_area(void) {
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return 0u - HAKU_EINVAL;
+    return tasks[current_task].fs_base;
 }
 
 /* Limited mmap(2): anonymous private pages from the per-process mmap
  * region, always zero-filled; PROT_WRITE decides whether the PTEs carry
  * R/W. Returns the mapped base address or -errno. */
 uint32_t scheduler_mmap(uint32_t length, int writable) {
-    task_t *task;
-    address_space_t *space;
-    uint32_t rounded;
-    uint32_t base;
-
-    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
-        return 0u - HAKU_EINVAL;
-    if (length == 0 || length > USER_MMAP_LIMIT - USER_MMAP_BASE)
-        return 0u - (length == 0 ? HAKU_EINVAL : HAKU_ENOMEM);
-    task = &tasks[current_task];
-    space = &task->program.address_space;
-    if (!space->directory_phys) return 0u - HAKU_EINVAL;
-    if (task->mmap_region_count >= TASK_MAX_MMAP_REGIONS)
-        return 0u - HAKU_ENOMEM;
-
-    rounded = (length + USER_PAGE_SIZE - 1u) & 0xFFFFF000u;
-    base = mmap_find_gap(task, rounded);
-    if (!base) return 0u - HAKU_ENOMEM;
-    if (!map_user_zero_pages(space, base, base + rounded, writable))
-        return 0u - HAKU_ENOMEM;
-    mmap_insert_region(task, base, rounded);
-    return base;
+    uint32_t prot = HAKU_PROT_READ;
+    if (writable) prot |= HAKU_PROT_WRITE;
+    return scheduler_mmap2(0u, length, prot,
+                           HAKU_MAP_PRIVATE | HAKU_MAP_ANONYMOUS);
 }
 
 /* munmap(2) for anonymous mappings: the range must lie inside exactly one
@@ -1603,7 +1937,9 @@ uint32_t scheduler_munmap(uint32_t address, uint32_t length) {
     } else {
         uint32_t old_end = base + size;
         task->mmap_regions[index].size = start - base;
-        mmap_insert_region(task, end, old_end - end);
+        mmap_insert_region_prot(task, end, old_end - end,
+                                task->mmap_regions[index].prot,
+                                task->mmap_regions[index].flags);
     }
     return 0;
 }

@@ -569,6 +569,7 @@ def main():
             "EXECVE-OK pid=1", # exec replaced the image and preserved descriptors
             "USER-EXEC-TARGET-OK", # argv/envp stack and image replacement passed
             "USER-SIGNAL-OK", # kill/tkill/tgkill/sigaction/sigprocmask delivery
+            "USER-MMAP-OK",  # mmap2/mprotect/mremap/madvise/set_thread_area
             "USER-LIB-OK",   # C library syscalls/strings/malloc/file I/O
             "USER-EXIT-OK status=0 pid=1",
             "SCHED-REAP-OK",

@@ -313,11 +313,116 @@ int main(void) {
         }
     }
 
+    /* The memory syscalls a libc needs: a fixed anonymous mapping, the
+     * protection changes, moving a mapping, the advice call, and the
+     * thread pointer. */
+    {
+        unsigned char *fixed = (unsigned char *)0x64000000u;
+        unsigned char *first;
+        unsigned char *second;
+        unsigned char *grown;
+        int i;
+
+        /* mmap2 with MAP_FIXED places the mapping at the given address;
+         * the pages come back zero-filled. */
+        expect(mmap2(fixed, 0x2000u, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) ==
+                   (void *)fixed,
+               "mmap2 MAP_FIXED");
+        for (i = 0; i < 0x2000; i++) {
+            if (fixed[i] != 0) break;
+        }
+        expect(i == 0x2000, "fixed mapping is zero filled");
+        fixed[0] = 0x5Au;
+        fixed[0x1FFF] = 0xA5u;
+        expect(fixed[0] == 0x5Au && fixed[0x1FFF] == 0xA5u,
+               "fixed mapping is writable");
+
+        /* mprotect to read-only keeps the contents readable. */
+        expect(mprotect(fixed, 0x2000u, PROT_READ) == 0, "mprotect read");
+        expect(fixed[0] == 0x5Au, "read-only mapping is readable");
+
+        /* A write to a read-only mapping faults, which ends the process:
+         * the child does it and the parent sees the fault status. */
+        {
+            int child = fork();
+            if (child == 0) {
+                fixed[0] = 1u;
+                _exit(0);
+            }
+            expect(child > 0, "fork for protection fault");
+            if (child > 0) {
+                int child_status = 0;
+                expect(waitpid(child, &child_status, 0) == child,
+                       "waitpid protection fault");
+                expect(((child_status >> 8) & 0x80u) != 0u,
+                       "write to a read-only mapping faults");
+            }
+        }
+
+        /* Back to read/write, then madvise releases the pages: the next
+         * access sees zeroed memory again. */
+        expect(mprotect(fixed, 0x2000u, PROT_READ | PROT_WRITE) == 0,
+               "mprotect write");
+        expect(madvise(fixed, 0x2000u, MADV_DONTNEED) == 0, "madvise");
+        expect(fixed[0] == 0 && fixed[0x1FFF] == 0,
+               "madvise releases the pages");
+        expect(madvise(fixed, 0x2000u, 99) == -1 && errno == EINVAL,
+               "madvise rejects an unknown advice");
+
+        /* mremap: without MAYMOVE a mapping cannot grow into a taken
+         * address, and with it the mapping moves and keeps its contents. */
+        first = (unsigned char *)mmap2(NULL, 0x1000u, PROT_READ | PROT_WRITE,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        second = (unsigned char *)mmap2(NULL, 0x1000u, PROT_READ | PROT_WRITE,
+                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        expect(first != MAP_FAILED && second != MAP_FAILED, "mmap2 pair");
+        first[0] = 0x11u;
+        expect(mremap(first, 0x1000u, 0x2000u, 0, NULL) == MAP_FAILED &&
+                   errno == EINVAL,
+               "mremap without MAYMOVE cannot grow");
+        grown = (unsigned char *)mremap(first, 0x1000u, 0x2000u,
+                                        MREMAP_MAYMOVE, NULL);
+        expect(grown != MAP_FAILED, "mremap");
+        if (grown != MAP_FAILED) {
+            expect(grown[0] == 0x11u, "mremap keeps the contents");
+            grown[0x1000] = 0x33u;
+            expect(grown[0x1000] == 0x33u, "mremap grows the mapping");
+        }
+        expect(munmap(second, 0x1000u) == 0, "munmap second");
+        expect(munmap(fixed, 0x2000u) == 0, "munmap");
+        expect(munmap(fixed, 0x2000u) == -1 && errno == EINVAL,
+               "munmap of a released range");
+    }
+
+    /* The thread pointer: set_thread_area moves the user FS base, so
+     * %fs:0 points at the thread block the program set up. */
+    {
+        static unsigned int thread_block[4];
+        haku_thread_area_t area;
+        unsigned int seen = 0;
+
+        thread_block[0] = (unsigned int)&thread_block[0];
+        area.entry_number = 0;
+        area.base_addr = (unsigned int)&thread_block[0];
+        expect(set_thread_area(&area) == 0, "set_thread_area");
+        __asm {
+            mov eax, 0
+            mov ebx, fs:[eax]
+            mov seen, ebx
+        }
+        expect(seen == (unsigned int)&thread_block[0],
+               "the FS base is the thread pointer");
+        area.base_addr = 0;
+        expect(set_thread_area(&area) == 0, "set_thread_area reset");
+    }
+
     if (failures) {
         printf("USER-LIB-FAIL: %d checks failed\n", failures);
         return 1;
     }
     printf("USER-SIGNAL-OK: kill tkill tgkill sigaction sigprocmask\n");
+    printf("USER-MMAP-OK: mmap2 mprotect mremap madvise set_thread_area\n");
     printf("USER-LIB-OK: syscalls strings memory file io errno (pid=%d)\n",
            getpid());
     return 0;
