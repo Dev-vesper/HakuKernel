@@ -85,7 +85,8 @@ ring-3 process entry, per-process kernel stacks,
 syscall handling, `spawn`/`waitpid` and exit-status reporting, page-protection
 faults (`USER-PROT-OK`), `execve` image replacement, process exit/reaping,
 copy-on-write `fork` and `vfork` (`USER-COW-OK`, `USER-VFORK-OK`,
-`VFORK-EXEC-RAN`), the user C library (`USER-LIB-OK`), and timer IRQs
+`VFORK-EXEC-RAN`), signal delivery and dispositions (`USER-SIGNAL-OK`),
+the user C library (`USER-LIB-OK`), and timer IRQs
 through the serial log.
 
 ### Data image lifecycle
@@ -257,6 +258,9 @@ the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `getrusage` (77), `times` (43), `getppid` (64), `getuid` (24), `geteuid` (49),
 `getgid` (47), `getegid` (50), and `statx` (383), with arguments in
 `ebx`, `ecx`, `edx`, `esi`, and `edi` and syscall number/result in `eax`.
+The signal calls use the same numbers: `kill` (37), `rt_sigreturn` (173),
+`rt_sigaction` (174), `rt_sigprocmask` (175), `tkill` (238), and `tgkill`
+(270).
 The Haku-specific `spawn` and `getusage` syscalls use `0x1000` and `0x1001`.
 The public ABI definitions are in `include/haku/abi.h` for C and
 `include/haku/abi.inc` for NASM; the build checks that their numeric
@@ -367,8 +371,8 @@ an unmapped one gives `EFAULT`, and the unused timezone argument is ignored.
 the calling task `TASK_SLEEPING`, switches away, and lets the timer IRQ wake
 it when its deadline passes, so it does not busy-wait. A zero interval
 succeeds immediately; `tv_nsec` outside `[0, 1e9)` gives `EINVAL` and a NULL
-request gives `EFAULT`. There are no signals, so a sleep is never
-interrupted. The number of sleeping tasks is not counted against idle, so a
+request gives `EFAULT`. A pending signal interrupts a sleep: the task
+wakes with `EINTR`. The number of sleeping tasks is not counted against idle, so a
 sleeping process keeps the idle loop in the scheduler.
 
 Blocking events use wait queues (`kernel/kernel/scheduler.h`). A queue is a
@@ -386,6 +390,42 @@ for a key left the run queue and let idle run. `nanosleep` and `waitpid` keep
 their existing `TASK_SLEEPING`/`TASK_WAITING` states; the blocked state is
 deliberately separate so a child exiting cannot wake a task that is waiting
 for console input.
+
+Signals are implemented for the standard range 1..31 (`kill`, `tkill`,
+`tgkill`, `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`). Each task keeps
+a pending set, a blocked set, and one disposition per signal; the sets are
+single words, so the mask fits in 32 bits (the real-time range 32..64 is
+rejected with `EINVAL`). `rt_sigaction` takes the i386 kernel layout
+(handler, flags, restorer, mask) and accepts a `sigsetsize` of 4 or 8, so
+musl's eight-byte `sigset_t` call works unchanged. `SA_SIGINFO` handlers
+receive the `siginfo` block and the `ucontext` the kernel saved;
+`SA_RESTORER` uses the program's own restorer, and without one the kernel
+installs a stub that calls `rt_sigreturn`. `SIGKILL` and `SIGSTOP` cannot be
+caught or ignored (`EINVAL`).
+
+A queued signal is delivered when the task returns to user mode, which
+happens on the next syscall, interrupt, or timer tick. The kernel builds a
+frame on the user stack (restorer, three handler arguments, the saved
+registers, the `siginfo` block, and the `ucontext`), rewrites the return
+context to enter the handler, and restores it in `rt_sigreturn`. The signal
+is blocked while its handler runs unless `SA_NODEFER` says otherwise, and
+the blocked set is restored when the handler returns. `SIG_IGN` discards the
+signal, `SIG_DFL` ends the process for every signal except `SIGCHLD`,
+`SIGURG`, `SIGWINCH`, and `SIGCONT` (which are ignored); a parent then sees
+the signal number in the wait status the way Linux reports it. A signal
+queued for a task blocked in a syscall wakes it with `EINTR` (the console
+read loop re-checks the input ring instead of returning `EINTR`). `kill`
+with pid 0 targets the caller and pid -1 targets every other process,
+because Haku has no process groups; any other negative pid gives `ESRCH`.
+`fork` and
+`vfork` reset the dispositions to the default and keep the blocked set;
+`execve` resets the dispositions and keeps both the blocked set and the
+pending signals. The C library wrappers live in `user/lib/signal.c` behind
+`include/haku/signal.h`, and the ring-3 self-test covers delivery, blocking,
+`SIG_IGN`, `SA_SIGINFO`, `SA_RESTORER`, the pid/tid forms, the default
+fatal disposition, and the `EINTR` wake-up (`USER-SIGNAL-OK`). Haku has no
+process groups, no job control (the stop signals end the process), no
+`sigqueue`, and one thread per process, so a thread id is a process id.
 
 Writes are not atomic: there is no journal, so a failing multi-sector
 write leaves exactly its durable prefix (a short count means those bytes
@@ -455,7 +495,7 @@ the injected key arrives.
 
 `include/haku/` doubles as a freestanding C SDK: `<haku/haku.h>` includes the
 syscall ABI, `types.h`, `errno.h`, `string.h`, `stdlib.h`, `unistd.h`,
-`fcntl.h`, `stat.h`, and `stdio.h`.
+`fcntl.h`, `stat.h`, `stdio.h`, and `signal.h`.
 
 - Raw syscalls: `haku_syscall0`..`haku_syscall4` in `user/lib/syscall.asm`
   (i386 `int 0x80`, arguments in `ebx`/`ecx`/`edx`/`esi`, result in `eax`).
@@ -471,6 +511,10 @@ syscall ABI, `types.h`, `errno.h`, `string.h`, `stdlib.h`, `unistd.h`,
   `stat`/`lstat` use the Linux `fstatat64` (300) call with `AT_FDCWD` and
   `fstat` uses `fstat64` (197), so the library and a musl program read the
   same 96-byte `struct stat64` layout.
+- Signals: `kill`, `tkill`, `tgkill`, `raise`, `signal`, `sigaction`,
+  `sigprocmask`, and the `sigset` helpers (`sigemptyset`, `sigfillset`,
+  `sigaddset`, `sigdelset`, `sigismember`) in `user/lib/signal.c`. The mask
+  is a single word, so only signals 1..31 exist.
 - Strings and memory: `mem*`, `str*`, `atoi`, `malloc`/`calloc`/`realloc`/
   `free` (a first-fit free list over `brk`), and `printf`/`puts`/`putchar`
   with a `%c/%s/%d/%u/%x/%X/%p` subset (no floats, 512-byte output buffer).
@@ -492,7 +536,13 @@ remain 8.3. The user ELFs are regenerated on every build, but an existing
 `kernel/drivers/terminal.c` is the text-I/O layer. Output paths (`klog`, the
 exception handlers, and the console device) call `terminal_putc` /
 `terminal_write`, which render to the active display backend and mirror every
-byte to COM1 with CRLF line endings. Input is a 128-byte single-producer /
+byte to COM1 with CRLF line endings. A group of bytes is written under one
+hold of the serial port's IRQ-save lock, and the klog assembles a whole log
+line before handing it over, so a kernel log line and a user write never land
+inside each other: the markers the headless check looks for stay contiguous
+in `build/serial.log`. The console device writes in 256-byte chunks so the
+interrupt-off window stays short (the UART runs at 38400 baud, so a chunk
+takes about 70 ms). Input is a 128-byte single-producer /
 single-consumer ring owned by the terminal: `kbd.c` translates set-1 scancodes
 and calls `terminal_input_push`, while `terminal_getchar`/`terminal_read` park
 on the terminal's wait queue until IRQ1 wakes them. Neither the keyboard
@@ -715,12 +765,12 @@ Haku/
                         crash.c/.h: register/MMU/stack crash reports
                         heap.c/.h: kernel kmalloc/kfree allocator
   user/
-    lib/              errno.c, memory.c, stdio.c, string.c, unistd.c,
-                      crt0.asm, syscall.asm: user C library
+    lib/              errno.c, memory.c, signal.c, stdio.c, string.c,
+                      unistd.c, crt0.asm, syscall.asm: user C library
     tests/            libtest.c: C library self-test installed as LIB.ELF
   include/haku/         abi.h + abi.inc: shared user/kernel ABI constants
-                        types/errno/string/stdlib/unistd/fcntl/stat/stdio.h:
-                        user library headers, plus haku.h
+                        types/errno/string/stdlib/unistd/fcntl/stat/stdio/
+                        signal.h: user library headers, plus haku.h
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       boot floppy size/signature checks
   tools/mkfat12.py     FAT12 image builder for the user ELF

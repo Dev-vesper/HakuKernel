@@ -7,6 +7,8 @@
 #define ENOENT       HAKU_ENOENT
 #define EIO          HAKU_EIO
 #define ENOEXEC      HAKU_ENOEXEC
+#define ESRCH        HAKU_ESRCH
+#define EINTR        HAKU_EINTR
 #define EBADF        HAKU_EBADF
 #define ECHILD       HAKU_ECHILD
 #define EAGAIN       HAKU_EAGAIN

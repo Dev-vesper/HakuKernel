@@ -14,6 +14,7 @@
 global _idt_load, _cpu_sti, _cpu_cli
 global _syscall128
 extern _isr_handler, _irq_handler, _syscall_handler
+extern _scheduler_signal_deliver
 
 section .text
 
@@ -169,6 +170,17 @@ _syscall128:
     popa
 %endmacro
 
+; Deliver any pending signal before the interrupted context resumes. The
+; frame sits at the top of this kernel stack, so pushing the argument
+; below it cannot clobber anything, and the call may switch tasks (a
+; fatal default disposition ends the process), so it returns the frame
+; to resume.
+%macro DELIVER_SIGNALS 0
+    push eax
+    call _scheduler_signal_deliver
+    add esp, 4
+%endmacro
+
 _scheduler_enter_frame:         ; void scheduler_enter_frame(regs_t *frame)
     mov eax, [esp+4]
     mov esp, eax
@@ -181,6 +193,7 @@ isr_common:
     push esp                      ; regs_t* argument
     call _isr_handler
     add esp, 4                    ; drop argument
+    DELIVER_SIGNALS
     mov esp, eax                 ; user exception may terminate its task
     RESTORE_SEGMENTS
     add esp, 8                    ; drop vector number + error code
@@ -191,6 +204,7 @@ irq_common:
     push esp
     call _irq_handler
     add esp, 4
+    DELIVER_SIGNALS
     mov esp, eax                 ; IRQ dispatcher may select another task
     RESTORE_SEGMENTS
     add esp, 8
@@ -203,6 +217,7 @@ syscall_common:
     call _syscall_handler
     cli
     add esp, 4
+    DELIVER_SIGNALS
     mov esp, eax                 ; exit may switch directly to another task
     RESTORE_SEGMENTS
     add esp, 8

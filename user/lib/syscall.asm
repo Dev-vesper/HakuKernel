@@ -20,6 +20,14 @@ _vfork:
     push edx
     ret
 
+global _haku_sigreturn_trampoline
+_haku_sigreturn_trampoline:
+    ; A signal handler's restorer: esp still points just above the frame
+    ; the kernel built, which is where rt_sigreturn looks for it.
+    mov eax, HAKU_SYS_RT_SIGRETURN
+    int 0x80
+    hlt
+
 global _haku_syscall0
 _haku_syscall0:
     push ebx

@@ -6,6 +6,9 @@
 #include "idt.h"
 
 #define SCHEDULER_MAX_PROCESSES 4u
+/* Signals: Haku implements the standard range 1..31, so a mask fits in a
+ * single word with bit (sig - 1) set. */
+#define SCHEDULER_NSIG 31u
 
 /* Event wait queue. A task that cannot make progress parks itself on a
  * queue and is woken by whoever satisfies the event (an IRQ handler or
@@ -56,6 +59,21 @@ uint32_t scheduler_mmap(uint32_t length, int writable);
 uint32_t scheduler_munmap(uint32_t address, uint32_t length);
 uint32_t scheduler_current_pid(void);
 uint32_t scheduler_parent_pid(void);
+/* Signals. kill(2) takes a pid, 0 for the caller, or -1 for every other
+ * process; Haku has no process groups. tkill/tgkill take thread ids, and
+ * a thread id is a process id here. */
+int32_t scheduler_kill_pid(uint32_t pid, uint32_t sig);
+int32_t scheduler_kill_all(uint32_t sig);
+int32_t scheduler_tkill(uint32_t tid, uint32_t sig);
+int32_t scheduler_tgkill(uint32_t tgid, uint32_t tid, uint32_t sig);
+int32_t scheduler_sigaction(uint32_t sig, const haku_sigaction_t *action,
+                             haku_sigaction_t *previous);
+uint32_t scheduler_sigprocmask(uint32_t how, uint32_t mask,
+                               uint32_t *previous);
+/* Deliver a pending signal before returning to user mode. */
+regs_t *scheduler_signal_deliver(regs_t *frame);
+/* rt_sigreturn(2): restore the context the signal interrupted. */
+regs_t *scheduler_sigreturn(regs_t *frame);
 /* Address space of the running task (0 outside a user process), for the
  * #PF handler and for copy_to_user. */
 address_space_t *scheduler_current_space(void);

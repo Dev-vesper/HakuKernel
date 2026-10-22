@@ -19,8 +19,6 @@ void terminal_init(void);
 /* Output. Safe from task and interrupt context. */
 void terminal_putc(char c);
 void terminal_write(const char *s);
-void terminal_hex(uint32_t v);
-void terminal_dec(uint32_t v);
 void terminal_corner(const char *s);
 
 /* Console device operations (VFS fd 0/1/2). read() returns after a newline

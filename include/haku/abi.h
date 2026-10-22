@@ -61,6 +61,13 @@
 #define HAKU_SYS_FSTATAT64 300u
 /* The call musl's stat() makes first on i386. */
 #define HAKU_SYS_STATX   383u
+/* Signals: the rt_* forms are what a modern libc uses on i386. */
+#define HAKU_SYS_KILL    37u
+#define HAKU_SYS_RT_SIGRETURN 173u
+#define HAKU_SYS_RT_SIGACTION 174u
+#define HAKU_SYS_RT_SIGPROCMASK 175u
+#define HAKU_SYS_TKILL   238u
+#define HAKU_SYS_TGKILL  270u
 
 /* i386 Linux syscall numbers reserved for the upcoming milestones: they
  * are listed so the ABI stays a single, Linux-shaped table, but the kernel
@@ -76,7 +83,6 @@
 #define HAKU_SYS_FCNTL     55u
 #define HAKU_SYS_SETUID    23u
 #define HAKU_SYS_ACCESS    33u
-#define HAKU_SYS_KILL      37u
 #define HAKU_SYS_PIPE      42u
 #define HAKU_SYS_SETGID    46u
 #define HAKU_SYS_SETRLIMIT 75u
@@ -96,16 +102,12 @@
 #define HAKU_SYS_MREMAP    163u
 #define HAKU_SYS_POLL      168u
 #define HAKU_SYS_PRCTL     172u
-#define HAKU_SYS_RT_SIGRETURN 173u
-#define HAKU_SYS_RT_SIGACTION 174u
-#define HAKU_SYS_RT_SIGPROCMASK 175u
 #define HAKU_SYS_CHOWN     182u
 #define HAKU_SYS_GETCWD    183u
 #define HAKU_SYS_GETRLIMIT 191u
 #define HAKU_SYS_MMAP2     192u
 #define HAKU_SYS_GETDENTS64 220u
 #define HAKU_SYS_FCNTL64   221u
-#define HAKU_SYS_TKILL     238u
 #define HAKU_SYS_FUTEX     240u
 #define HAKU_SYS_SET_THREAD_AREA 243u
 #define HAKU_SYS_EPOLL_CREATE 254u
@@ -113,7 +115,6 @@
 #define HAKU_SYS_EPOLL_WAIT 256u
 #define HAKU_SYS_SET_TID_ADDRESS 258u
 #define HAKU_SYS_CLOCK_GETTIME 265u
-#define HAKU_SYS_TGKILL    270u
 #define HAKU_SYS_WAITID    284u
 #define HAKU_SYS_OPENAT    295u
 #define HAKU_SYS_MKDIRAT   296u
@@ -145,6 +146,54 @@
 /* wait4(2) options. */
 #define HAKU_WNOHANG       0x1u
 
+/* Signals (Linux i386 numbering). Haku implements the standard range
+ * 1..31: real-time signals (32..64) are rejected with EINVAL, and the
+ * *at variants of the older calls are not provided, because a modern libc
+ * uses the rt_* forms below. */
+#define HAKU_SIGHUP     1u
+#define HAKU_SIGINT     2u
+#define HAKU_SIGQUIT    3u
+#define HAKU_SIGILL     4u
+#define HAKU_SIGTRAP    5u
+#define HAKU_SIGABRT    6u
+#define HAKU_SIGBUS     7u
+#define HAKU_SIGFPE     8u
+#define HAKU_SIGKILL    9u
+#define HAKU_SIGUSR1    10u
+#define HAKU_SIGSEGV    11u
+#define HAKU_SIGUSR2    12u
+#define HAKU_SIGPIPE    13u
+#define HAKU_SIGALRM    14u
+#define HAKU_SIGTERM    15u
+#define HAKU_SIGSTKFLT  16u
+#define HAKU_SIGCONT    18u
+#define HAKU_SIGSTOP    19u
+#define HAKU_SIGTSTP    20u
+#define HAKU_SIGTTIN    21u
+#define HAKU_SIGTTOU    22u
+#define HAKU_SIGURG     23u
+#define HAKU_SIGXCPU    24u
+#define HAKU_SIGXFSZ    25u
+#define HAKU_SIGVTALRM  26u
+#define HAKU_SIGPROF    27u
+#define HAKU_SIGWINCH   28u
+#define HAKU_SIGIO      29u
+#define HAKU_SIGPWR     30u
+#define HAKU_SIGSYS     31u
+/* rt_sigaction(2) handler values and rt_sigprocmask(2) operations. */
+#define HAKU_SIG_DFL    0u
+#define HAKU_SIG_IGN    1u
+#define HAKU_SIG_BLOCK  0u
+#define HAKU_SIG_UNBLOCK 1u
+#define HAKU_SIG_SETMASK 2u
+/* sigaction flags. Haku honours SIGINFO, NODEFER and RESTORER; the others
+ * are stored unchanged and ignored. */
+#define HAKU_SA_NOCLDSTOP 0x00000001u
+#define HAKU_SA_SIGINFO 0x00000004u
+#define HAKU_SA_RESTORER 0x04000000u
+#define HAKU_SA_RESTART 0x10000000u
+#define HAKU_SA_NODEFER 0x40000000u
+
 /* Haku-specific syscalls for starting a child ELF from a pathname and for
  * reading the calling process's memory/resource usage. They live outside
  * the Linux range so a Linux binary never collides with them. */
@@ -155,6 +204,8 @@
 /* Raw syscall errors are returned as -errno. */
 #define HAKU_E2BIG         7u
 #define HAKU_ENOENT        2u
+#define HAKU_ESRCH         3u
+#define HAKU_EINTR         4u
 #define HAKU_EIO           5u
 #define HAKU_ENOEXEC       8u
 #define HAKU_EBADF          9u
@@ -316,6 +367,19 @@ typedef struct {
     haku_u32 tv_sec;
     haku_u32 tv_nsec;
 } haku_timespec_t;
+
+/* rt_sigaction(2) argument layout on i386: handler, flags, restorer, then
+ * the signal set to block while the handler runs. The kernel sigset_t is
+ * 64 bits there; Haku uses the low 32 bits (signals 1..31) and ignores the
+ * rest. A restorer is only used when SA_RESTORER is set: otherwise the
+ * kernel plants its own stub in the signal frame. */
+typedef struct {
+    haku_u32 handler;
+    haku_u32 flags;
+    haku_u32 restorer;
+    haku_u32 mask;
+    haku_u32 mask_high;
+} haku_sigaction_t;
 
 /* mmap(2) argument block (i386 old_mmap ABI). */
 typedef struct {

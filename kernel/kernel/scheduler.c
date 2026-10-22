@@ -45,6 +45,15 @@ typedef struct {
     uint32_t syscall_count;
     uint32_t voluntary_switches;  /* blocked, slept, or waited */
     uint32_t involuntary_switches;/* preempted while runnable */
+    /* Signals: bit (sig - 1) marks a queued or blocked signal. */
+    uint32_t signal_pending;
+    uint32_t signal_blocked;
+    struct {
+        uint32_t handler;   /* HAKU_SIG_DFL, HAKU_SIG_IGN, or user code */
+        uint32_t flags;
+        uint32_t restorer;
+        uint32_t mask;      /* signals blocked while the handler runs */
+    } sigactions[SCHEDULER_NSIG];
     struct {
         uint32_t base;
         uint32_t size;
@@ -58,6 +67,11 @@ static int current_task = -1;
 static int scheduler_started;
 static int timer_marker_written;
 static int waitq_marker_written;
+
+/* Ends the current task with an explicit wait status (the value a parent
+ * sees in wait4). A normal exit passes the shifted exit code; a signal
+ * passes the signal number the way Linux reports it. */
+static regs_t *exit_current_with_status(regs_t *frame, uint32_t wait_status);
 
 int scheduler_user_tasks_done(void) {
     if (!scheduler_started) return 0;
@@ -382,6 +396,10 @@ address_space_t *scheduler_current_space(void) {
 }
 
 regs_t *scheduler_exit_current(regs_t *frame) {
+    return exit_current_with_status(frame, (frame->ebx & 0xFFu) << 8);
+}
+
+static regs_t *exit_current_with_status(regs_t *frame, uint32_t wait_status) {
     int next;
     task_t *exiting;
     uint32_t status;
@@ -396,7 +414,7 @@ regs_t *scheduler_exit_current(regs_t *frame) {
      * through the context switch, and iret restores the next task's IF. */
     vfs_close_all(exiting->pid);
     (void)irq_lock();
-    exiting->exit_status = (frame->ebx & 0xFFu) << 8;
+    exiting->exit_status = wait_status;
     exiting->state = TASK_ZOMBIE;
     exiting->frame = frame;
     status = exiting->exit_status;
@@ -443,6 +461,328 @@ regs_t *scheduler_exit_current(regs_t *frame) {
                                           tasks[next].frame;
 }
 
+/* ------------------------------------------------------------------ */
+/* Signals                                                            */
+/* ------------------------------------------------------------------ */
+
+/* The frame the kernel builds on the user stack when a handler runs:
+ *
+ *   +0x00  restorer    the handler's return address
+ *   +0x04  argument 1  the signal number
+ *   +0x08  argument 2  the siginfo pointer (SA_SIGINFO only)
+ *   +0x0c  argument 3  the ucontext pointer (SA_SIGINFO only)
+ *   +0x10  stub        "mov eax, 173; int 0x80", used when the program
+ *                       did not ask for its own restorer
+ *   +0x18  magic       identifies the frame for rt_sigreturn
+ *   +0x1c  blocked     the blocked mask that was in effect
+ *   +0x20  registers   the interrupted context
+ *   +0x6c  siginfo     the signal information block
+ *   +0xec  ucontext    the context a SA_SIGINFO handler may inspect
+ *
+ * The handler is entered with esp at the restorer, so the arguments sit
+ * where the C calling convention expects them. The restorer runs with esp
+ * just above the return address, which is where rt_sigreturn looks for
+ * the frame. */
+#define HAKU_SIGFRAME_MAGIC 0x48414B55u
+#define HAKU_SIGINFO_SIZE 128u
+/* Fixed offsets inside the frame (the layout is part of the ABI between
+ * the kernel and the restorer that comes back with rt_sigreturn). */
+#define HAKU_SIGFRAME_STUB 0x10u
+#define HAKU_SIGFRAME_SIGINFO 0x6Cu
+#define HAKU_SIGFRAME_UCONTEXT 0xECu
+
+typedef struct {
+    uint32_t flags;
+    uint32_t link;
+    uint32_t esp;
+    uint32_t eip;
+    uint32_t eax, ebx, ecx, edx, esi, edi, ebp;
+    uint32_t cs;
+    uint32_t eflags;
+} haku_ucontext_t;
+
+typedef struct {
+    uint32_t restorer;
+    uint32_t argument1;
+    uint32_t argument2;
+    uint32_t argument3;
+    uint8_t stub[8];
+    uint32_t magic;
+    uint32_t blocked;
+    regs_t registers;
+    uint8_t siginfo[HAKU_SIGINFO_SIZE];
+    haku_ucontext_t ucontext;
+} haku_sigframe_t;
+
+/* The offsets above must match the layout. */
+typedef char haku_sigframe_layout_check[
+    (sizeof(haku_sigframe_t) == 0x120u &&
+     sizeof(haku_sigframe_t) == (HAKU_SIGFRAME_UCONTEXT +
+                                 sizeof(haku_ucontext_t))) ? 1 : -1];
+
+/* The default disposition of these signals is to ignore them. The stop
+ * signals (SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU) have no job control in
+ * Haku, so they end the process like any other fatal signal. */
+static int signal_default_ignored(uint32_t sig) {
+    return sig == HAKU_SIGCHLD || sig == HAKU_SIGURG ||
+           sig == HAKU_SIGWINCH || sig == HAKU_SIGCONT;
+}
+
+/* End the current task because of a signal. The delivery hook runs with
+ * interrupts off (it is called from the interrupt and syscall stubs), but
+ * closing the descriptors takes the task-context VFS lock, whose holder
+ * may be preempted: the exit path therefore runs with interrupts on. An
+ * interrupt taken from kernel mode is ignored by the delivery hook, so
+ * nothing can observe the switch halfway through. */
+static regs_t *exit_current_for_signal(regs_t *frame, uint32_t sig) {
+    regs_t *next;
+    __asm {
+        sti
+    }
+    next = exit_current_with_status(frame, sig & 0x7Fu);
+    __asm {
+        cli
+    }
+    return next;
+}
+
+static task_t *signal_find_task(uint32_t pid) {
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        if (tasks[i].state == TASK_UNUSED) continue;
+        if (tasks[i].pid == pid) return &tasks[i];
+    }
+    return 0;
+}
+
+/* Queue a signal for a task. A task that is blocked in a syscall is woken
+ * so the signal reaches it when it returns to user mode, and the
+ * interrupted call then reports EINTR. A parent parked in vfork stays
+ * parked: it shares the child's address space and must not run until the
+ * child is done. */
+static int32_t queue_signal(task_t *target, uint32_t sig) {
+    if (!target) return -(int32_t)HAKU_ESRCH;
+    if (sig < 1u || sig > SCHEDULER_NSIG) return -(int32_t)HAKU_EINVAL;
+    target->signal_pending |= 1u << (sig - 1u);
+    if (target->state == TASK_SLEEPING || target->state == TASK_WAITING ||
+        target->state == TASK_BLOCKED) {
+        if (!target->vfork_child) {
+            target->state = TASK_RUNNABLE;
+            target->wait_pid = 0;
+            target->wait_status_user = 0;
+            target->wait_rusage_user = 0;
+            if (target->frame) target->frame->eax = 0u - HAKU_EINTR;
+        }
+    }
+    return 0;
+}
+
+int32_t scheduler_kill_pid(uint32_t pid, uint32_t sig) {
+    task_t *target = signal_find_task(pid);
+    if (!target) return -(int32_t)HAKU_ESRCH;
+    /* Signal 0 only checks that the target exists. */
+    if (sig == 0u) return 0;
+    return queue_signal(target, sig);
+}
+
+int32_t scheduler_kill_all(uint32_t sig) {
+    int32_t result = 0;
+    for (uint32_t i = 0; i < SCHEDULER_MAX_PROCESSES; i++) {
+        task_t *task = &tasks[i];
+        if (task->state == TASK_UNUSED) continue;
+        if (current_task >= 0 && (int)i == current_task) continue;
+        if (sig == 0u) continue;
+        result = queue_signal(task, sig);
+        if (result < 0) return result;
+    }
+    return 0;
+}
+
+int32_t scheduler_tkill(uint32_t tid, uint32_t sig) {
+    /* Haku runs one thread per process, so a thread id is a process id. */
+    return scheduler_kill_pid(tid, sig);
+}
+
+int32_t scheduler_tgkill(uint32_t tgid, uint32_t tid, uint32_t sig) {
+    if (tgid != tid) return -(int32_t)HAKU_ESRCH;
+    return scheduler_kill_pid(tid, sig);
+}
+
+int32_t scheduler_sigaction(uint32_t sig, const haku_sigaction_t *action,
+                             haku_sigaction_t *previous) {
+    task_t *task;
+    if (sig < 1u || sig > SCHEDULER_NSIG)
+        return -(int32_t)HAKU_EINVAL;
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX)
+        return -(int32_t)HAKU_ESRCH;
+    task = &tasks[current_task];
+    /* SIGKILL and SIGSTOP cannot be caught or ignored. */
+    if (action && (sig == HAKU_SIGKILL || sig == HAKU_SIGSTOP))
+        return -(int32_t)HAKU_EINVAL;
+    if (previous) {
+        previous->handler = task->sigactions[sig - 1u].handler;
+        previous->flags = task->sigactions[sig - 1u].flags;
+        previous->restorer = task->sigactions[sig - 1u].restorer;
+        previous->mask = task->sigactions[sig - 1u].mask;
+        previous->mask_high = 0u;
+    }
+    if (action) {
+        task->sigactions[sig - 1u].handler = action->handler;
+        task->sigactions[sig - 1u].flags = action->flags;
+        task->sigactions[sig - 1u].restorer = action->restorer;
+        task->sigactions[sig - 1u].mask =
+            action->mask & ~((1u << (HAKU_SIGKILL - 1u)) |
+                             (1u << (HAKU_SIGSTOP - 1u)));
+    }
+    return 0;
+}
+
+uint32_t scheduler_sigprocmask(uint32_t how, uint32_t mask,
+                               uint32_t *previous) {
+    task_t *task;
+    uint32_t blocked;
+    uint32_t old;
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX) return 0u;
+    task = &tasks[current_task];
+    old = task->signal_blocked;
+    if (previous) *previous = old;
+    blocked = mask & ~((1u << (HAKU_SIGKILL - 1u)) |
+                       (1u << (HAKU_SIGSTOP - 1u)));
+    if (how == HAKU_SIG_BLOCK)
+        task->signal_blocked = old | blocked;
+    else if (how == HAKU_SIG_UNBLOCK)
+        task->signal_blocked = old & ~blocked;
+    else
+        task->signal_blocked = blocked;
+    return old;
+}
+
+/* rt_sigreturn(2): restore the context the signal interrupted. The
+ * restorer leaves esp just above the frame's return address, so the
+ * frame starts one word below the user stack pointer. */
+regs_t *scheduler_sigreturn(regs_t *frame) {
+    uint32_t base;
+    haku_sigframe_t saved;
+    task_t *task;
+    if (!frame || (frame->cs & 3u) != 3u) return frame;
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX) return frame;
+    task = &tasks[current_task];
+    base = frame->user_esp;
+    if (base < 8u) return exit_current_for_signal(frame, HAKU_SIGSEGV);
+    base -= 4u;
+    if (!paging_user_range_valid(base, sizeof(saved), 0))
+        return exit_current_for_signal(frame, HAKU_SIGSEGV);
+    memcpy(&saved, (const void *)base, sizeof(saved));
+    if (saved.magic != HAKU_SIGFRAME_MAGIC)
+        return exit_current_for_signal(frame, HAKU_SIGSEGV);
+    task->signal_blocked = saved.blocked;
+    *frame = saved.registers;
+    return frame;
+}
+
+/* Deliver a pending signal, if any, before the task returns to user
+ * mode. The frame is rewritten so the task resumes inside the handler
+ * instead of the interrupted instruction. Called from the interrupt and
+ * syscall stubs with the frame they are about to restore. */
+regs_t *scheduler_signal_deliver(regs_t *frame) {
+    task_t *task;
+    haku_sigframe_t signal_frame;
+    uint32_t pending;
+    uint32_t sig = 0u;
+    uint32_t base;
+    uint32_t handler;
+    uint32_t flags;
+    uint32_t restorer;
+    uint32_t mask;
+
+    if (!frame || (frame->cs & 3u) != 3u) return frame;
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX) return frame;
+    task = &tasks[current_task];
+    if (task->state != TASK_RUNNABLE) return frame;
+    pending = task->signal_pending & ~task->signal_blocked;
+    if (!pending) return frame;
+    for (uint32_t candidate = 1u; candidate <= SCHEDULER_NSIG; candidate++) {
+        if (pending & (1u << (candidate - 1u))) {
+            sig = candidate;
+            break;
+        }
+    }
+    if (!sig) return frame;
+
+    task->signal_pending &= ~(1u << (sig - 1u));
+    handler = task->sigactions[sig - 1u].handler;
+    flags = task->sigactions[sig - 1u].flags;
+    restorer = task->sigactions[sig - 1u].restorer;
+    mask = task->sigactions[sig - 1u].mask;
+
+    if (handler == HAKU_SIG_IGN) return frame;
+    if (handler == HAKU_SIG_DFL) {
+        /* The default disposition of most signals ends the process; the
+         * wait status carries the signal number the way Linux does. */
+        if (signal_default_ignored(sig)) return frame;
+        return exit_current_for_signal(frame, sig);
+    }
+
+    memset(&signal_frame, 0, sizeof(signal_frame));
+    signal_frame.registers = *frame;
+    signal_frame.blocked = task->signal_blocked;
+    signal_frame.magic = HAKU_SIGFRAME_MAGIC;
+    signal_frame.argument1 = sig;
+    /* "mov eax, 173; int 0x80" - the kernel's own restorer. */
+    signal_frame.stub[0] = 0xB8u;
+    signal_frame.stub[1] = 0xADu;
+    signal_frame.stub[2] = 0x00u;
+    signal_frame.stub[3] = 0x00u;
+    signal_frame.stub[4] = 0x00u;
+    signal_frame.stub[5] = 0xCDu;
+    signal_frame.stub[6] = 0x80u;
+    signal_frame.siginfo[0] = sig & 0xFFu;      /* si_signo */
+    signal_frame.siginfo[4] = 0u;               /* si_errno */
+    signal_frame.siginfo[8] = 0u;               /* si_code: SI_USER */
+    signal_frame.ucontext.flags = 0u;
+    signal_frame.ucontext.link = 0u;
+    signal_frame.ucontext.esp = frame->user_esp;
+    signal_frame.ucontext.eip = frame->eip;
+    signal_frame.ucontext.eax = frame->eax;
+    signal_frame.ucontext.ebx = frame->ebx;
+    signal_frame.ucontext.ecx = frame->ecx;
+    signal_frame.ucontext.edx = frame->edx;
+    signal_frame.ucontext.esi = frame->esi;
+    signal_frame.ucontext.edi = frame->edi;
+    signal_frame.ucontext.ebp = frame->ebp;
+    signal_frame.ucontext.cs = frame->cs;
+    signal_frame.ucontext.eflags = frame->eflags;
+
+    /* The frame sits below the interrupted stack pointer so the handler's
+     * own calls cannot touch it. */
+    base = (frame->user_esp - sizeof(signal_frame)) & ~0xFu;
+    if (base < 0x40000000u)
+        return exit_current_for_signal(frame, HAKU_SIGSEGV);
+
+    signal_frame.restorer = (flags & HAKU_SA_RESTORER) && restorer ?
+                            restorer :
+                            (base + HAKU_SIGFRAME_STUB);
+    signal_frame.argument2 = (flags & HAKU_SA_SIGINFO) ?
+                             (base + HAKU_SIGFRAME_SIGINFO) : 0u;
+    signal_frame.argument3 = (flags & HAKU_SA_SIGINFO) ?
+                             (base + HAKU_SIGFRAME_UCONTEXT) : 0u;
+    if (!paging_copy_to_user_space(&task->program.address_space, base,
+                                   &signal_frame, sizeof(signal_frame)))
+        return exit_current_for_signal(frame, HAKU_SIGSEGV);
+
+    /* The handler runs with the signal blocked, plus whatever the
+     * program asked for, unless SA_NODEFER says otherwise. */
+    if (!(flags & HAKU_SA_NODEFER))
+        task->signal_blocked |= 1u << (sig - 1u);
+    task->signal_blocked |= mask;
+
+    /* Resume in the handler with the interrupted context underneath. */
+    *frame = signal_frame.registers;
+    frame->eip = handler;
+    frame->eax = sig;
+    frame->user_esp = base;
+    return frame;
+}
+
 int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
     task_t *task;
     loaded_elf_t previous;
@@ -470,6 +810,9 @@ int scheduler_exec_current(loaded_elf_t *replacement, regs_t *frame) {
     task->heap_brk = 0;
     task->heap_top = 0;
     task->mmap_region_count = 0;
+    /* execve resets the signal dispositions to the default, but the
+     * blocked mask and the pending signals survive. */
+    memset(task->sigactions, 0, sizeof(task->sigactions));
 
     frame->gs = USER_DS;
     frame->fs = USER_DS;
@@ -769,6 +1112,10 @@ int32_t scheduler_fork(regs_t *frame) {
     memcpy(child->mmap_regions, parent->mmap_regions,
            sizeof(child->mmap_regions));
 
+    /* A forked child starts with the default signal dispositions and an
+     * empty pending set, but it keeps the parent's blocked mask. */
+    child->signal_blocked = parent->signal_blocked;
+
     flags = irq_lock();
     child->state = TASK_RUNNABLE;
     irq_unlock(flags);
@@ -849,6 +1196,8 @@ regs_t *scheduler_vfork(regs_t *frame) {
     child->mmap_region_count = parent->mmap_region_count;
     memcpy(child->mmap_regions, parent->mmap_regions,
            sizeof(child->mmap_regions));
+    /* Like fork, the vfork child gets the default dispositions. */
+    child->signal_blocked = parent->signal_blocked;
 
     klog_prefix();
     klog_write("sched: VFORK-OK parent=");

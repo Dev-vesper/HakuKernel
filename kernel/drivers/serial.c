@@ -28,7 +28,19 @@ void serial_init(void) {
 
 void serial_putc(char c) {
     irqflags_t flags = spin_lock_irqsave(&serial_lock);
+    serial_putc_locked(c);
+    spin_unlock_irqrestore(&serial_lock, flags);
+}
+
+irqflags_t serial_output_begin(void) {
+    return spin_lock_irqsave(&serial_lock);
+}
+
+void serial_output_end(irqflags_t flags) {
+    spin_unlock_irqrestore(&serial_lock, flags);
+}
+
+void serial_putc_locked(char c) {
     while (!serial_ready()) { /* spin */ }
     outb(COM1, (uint8_t)c);
-    spin_unlock_irqrestore(&serial_lock, flags);
 }

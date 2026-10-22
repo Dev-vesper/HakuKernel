@@ -1,6 +1,10 @@
 /* Haku klog implementation: serial-mirrored terminal emit with PIT
  * timestamps. The terminal sends each byte to the active display and COM1,
- * so there is a single output path. */
+ * so there is a single output path.
+ *
+ * A log line is assembled here and handed to the terminal in one piece, so
+ * a kernel log line and a user write never land inside each other: the
+ * markers the headless check looks for stay contiguous in the serial log. */
 #include "klog.h"
 #include "pit.h"
 #include "terminal.h"
@@ -11,27 +15,52 @@ static const char *const level_names[] = {
     "DEBUG", "INFO", "WARN", "ERROR", "CRIT"
 };
 
+#define KLOG_LINE_MAX 512u
+static char line_buffer[KLOG_LINE_MAX];
+static uint32_t line_used;
+
+static void line_append_char(char c) {
+    if (line_used + 1u < KLOG_LINE_MAX) line_buffer[line_used++] = c;
+    if (c == '\n') {
+        line_buffer[line_used] = '\0';
+        terminal_write(line_buffer);
+        line_used = 0;
+    }
+}
+
+static void line_append(const char *s) {
+    while (*s) line_append_char(*s++);
+}
+
 void klog_putc(char c) {
-    terminal_putc(c);
+    line_append_char(c);
 }
 
 void klog_write(const char *s) {
-    terminal_write(s);
+    line_append(s);
 }
 
 void klog_dec(uint32_t v) {
-    terminal_dec(v);
+    char rev[10];
+    int n = 0;
+    do {
+        rev[n++] = (char)('0' + (v % 10));
+        v /= 10;
+    } while (v && n < 10);
+    while (n--) line_append_char(rev[n]);
 }
 
 void klog_hex(uint32_t v) {
-    terminal_hex(v);
+    static const char digits[] = "0123456789ABCDEF";
+    line_append("0x");
+    for (int shift = 28; shift >= 0; shift -= 4)
+        line_append_char(digits[(v >> shift) & 0xF]);
 }
 
 void klog_hex_raw(uint32_t v) {
-    for (int shift = 28; shift >= 0; shift -= 4) {
-        static const char digits[] = "0123456789ABCDEF";
-        terminal_putc(digits[(v >> shift) & 0xF]);
-    }
+    static const char digits[] = "0123456789ABCDEF";
+    for (int shift = 28; shift >= 0; shift -= 4)
+        line_append_char(digits[(v >> shift) & 0xF]);
 }
 
 static void emit_padded(uint32_t v, int width, char pad) {
@@ -42,8 +71,8 @@ static void emit_padded(uint32_t v, int width, char pad) {
         v /= 10;
     } while (v && n < 10);
     for (int i = n; i < width; i++)
-        terminal_putc(pad);
-    while (n--) terminal_putc(rev[n]);
+        line_append_char(pad);
+    while (n--) line_append_char(rev[n]);
 }
 
 void klog_prefix(void) {

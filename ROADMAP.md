@@ -258,9 +258,24 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   `vfork` case in the C library self-test. `clone` still rejects the
   thread-creating flags, stack pointers, and parent-tid arguments with
   `EINVAL`.
-- [ ] Add signals: `kill`/`tkill`/`tgkill`, `rt_sigaction`,
+- [x] Add signals: `kill`/`tkill`/`tgkill`, `rt_sigaction`,
   `rt_sigprocmask`, `rt_sigreturn`, pending-signal delivery, and default
-  dispositions (the kernel currently has no signal state at all).
+  dispositions. Each task keeps a pending set, a blocked set, and one
+  disposition per signal (a single word each, so signals 1..31 exist and
+  the real-time range is rejected with `EINVAL`). Delivery happens on the
+  way back to user mode: the kernel builds a frame on the user stack
+  (restorer, handler arguments, saved registers, `siginfo`, `ucontext`),
+  enters the handler, and `rt_sigreturn` restores the interrupted context.
+  `SA_SIGINFO` and `SA_RESTORER` are honored (without a program restorer
+  the kernel installs a stub that calls `rt_sigreturn`); `SIG_IGN`
+  discards, `SIG_DFL` ends the process for every signal except `SIGCHLD`,
+  `SIGURG`, `SIGWINCH`, and `SIGCONT`, and a parent sees the signal number
+  in the wait status. A signal queued for a task blocked in a syscall
+  wakes it with `EINTR`. `fork`/`vfork` reset the dispositions and keep the
+  blocked set; `execve` resets the dispositions and keeps the blocked set
+  and the pending signals. Covered by `USER-SIGNAL-OK` in the C library
+  self-test. Still missing: process groups, job control, `sigqueue`, and
+  real-time signals.
 - [ ] Add the memory syscalls a libc needs: `mmap2` with
   `MAP_FIXED`/`MAP_ANONYMOUS`/`MAP_SHARED`, `mprotect`, `mremap`,
   `madvise`, and thread-local storage through `set_thread_area` (today

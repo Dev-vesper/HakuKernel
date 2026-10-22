@@ -15,36 +15,35 @@ static wait_queue_t input_waiters = WAIT_QUEUE_INIT;
 
 /* --- output ----------------------------------------------------------- */
 
+/* One chunk of console output. The UART runs at 38400 baud, so the lock
+ * is held for about 70 ms at most; the timer IRQ waits that long. */
+#define TERMINAL_WRITE_CHUNK 256u
+
 void terminal_putc(char c) {
     display_putc(c);
     if (c == '\n') serial_putc('\r'); /* serial is CRLF */
     serial_putc(c);
 }
 
+/* Write a group of bytes to the display and the serial under one hold of
+ * the serial lock, so a kernel log line and a user write cannot land
+ * inside each other: the test markers in the serial log stay contiguous
+ * and the headless check sees them whole. */
+static void terminal_emit(const char *data, uint32_t count) {
+    irqflags_t flags = serial_output_begin();
+    for (uint32_t i = 0; i < count; i++) {
+        char c = data[i];
+        display_putc(c);
+        if (c == '\n') serial_putc_locked('\r');
+        serial_putc_locked(c);
+    }
+    serial_output_end(flags);
+}
+
 void terminal_write(const char *s) {
-    while (*s) terminal_putc(*s++);
-}
-
-static void put_hex(uint32_t v) {
-    static const char digits[] = "0123456789ABCDEF";
-    terminal_putc('0');
-    terminal_putc('x');
-    for (int shift = 28; shift >= 0; shift -= 4)
-        terminal_putc(digits[(v >> shift) & 0xF]);
-}
-
-void terminal_hex(uint32_t v) {
-    put_hex(v);
-}
-
-void terminal_dec(uint32_t v) {
-    char rev[10];
-    int n = 0;
-    do {
-        rev[n++] = (char)('0' + (v % 10));
-        v /= 10;
-    } while (v && n < 10);
-    while (n--) terminal_putc(rev[n]);
+    uint32_t count = 0;
+    while (s[count]) count++;
+    terminal_emit(s, count);
 }
 
 void terminal_corner(const char *s) {
@@ -54,8 +53,15 @@ void terminal_corner(const char *s) {
 int32_t terminal_write_bytes(const void *buffer, uint32_t count,
                              uint32_t *out_count) {
     const uint8_t *bytes = (const uint8_t *)buffer;
-    for (uint32_t i = 0; i < count; i++)
-        terminal_putc((char)bytes[i]);
+    uint32_t offset = 0;
+    /* The output is written in chunks so the interrupt-off window stays
+     * short; a chunk never splits a marker line on its own. */
+    while (offset < count) {
+        uint32_t chunk = count - offset;
+        if (chunk > TERMINAL_WRITE_CHUNK) chunk = TERMINAL_WRITE_CHUNK;
+        terminal_emit((const char *)bytes + offset, chunk);
+        offset += chunk;
+    }
     *out_count = count;
     return 1;
 }

@@ -9,6 +9,38 @@ static void expect(int condition, const char *what) {
     }
 }
 
+/* Signal handlers: a plain one, and one that asks for the siginfo and
+ * ucontext arguments. Delivery builds them on the user stack. */
+static volatile int handler_runs;
+static volatile int handler_signal;
+static volatile int handler_si_signo;
+static volatile int handler_info_code;
+static volatile void *handler_context;
+
+static void on_signal(int sig) {
+    handler_signal = sig;
+    handler_runs++;
+}
+
+static void on_signal_info(int sig, void *info, void *context) {
+    handler_signal = sig;
+    handler_si_signo = ((int *)info)[0];
+    handler_info_code = ((int *)info)[2];
+    handler_context = context;
+    handler_runs++;
+}
+
+static void install(int sig, unsigned int handler, unsigned int flags,
+                    unsigned int restorer) {
+    haku_sigaction_t action;
+    action.handler = handler;
+    action.flags = flags;
+    action.restorer = restorer;
+    action.mask = 0;
+    action.mask_high = 0;
+    expect(sigaction(sig, &action, NULL) == 0, "sigaction");
+}
+
 int main(void) {
     char buffer[64];
     char copy[32];
@@ -17,6 +49,8 @@ int main(void) {
     haku_timeval_t before;
     haku_timeval_t after;
     haku_timespec_t pause;
+    sigset_t signal_set;
+    sigset_t signal_old;
     void *blocks[8];
     int fd;
     int i;
@@ -171,10 +205,119 @@ int main(void) {
 
     expect(atoi("-123") == -123, "atoi");
 
+    /* Signals: install a handler, raise, and check that the kernel
+     * delivered the signal number and resumed after the handler. */
+    sigemptyset(&signal_set);
+    expect(signal(SIGUSR1, on_signal) == SIG_DFL, "signal returns SIG_DFL");
+    expect(raise(SIGUSR1) == 0, "raise SIGUSR1");
+    expect(handler_runs == 1 && handler_signal == SIGUSR1, "handler ran");
+
+    expect(signal(SIGUSR2, SIG_IGN) == SIG_DFL, "signal SIG_IGN");
+    expect(raise(SIGUSR2) == 0, "raise ignored signal");
+    expect(handler_runs == 1, "ignored signal not delivered");
+
+    expect(signal(SIGKILL, on_signal) == SIG_ERR && errno == EINVAL,
+           "SIGKILL cannot be caught");
+    expect(signal(SIGSTOP, on_signal) == SIG_ERR && errno == EINVAL,
+           "SIGSTOP cannot be caught");
+
+    /* A blocked signal stays pending and is delivered on the unblocking
+     * syscall's return. */
+    sigaddset(&signal_set, SIGUSR1);
+    expect(sigismember(&signal_set, SIGUSR1) == 1, "sigismember");
+    expect(sigprocmask(SIG_BLOCK, &signal_set, &signal_old) == 0,
+           "sigprocmask block");
+    expect(sigismember(&signal_old, SIGUSR1) == 0, "previous mask empty");
+    expect(raise(SIGUSR1) == 0, "raise while blocked");
+    expect(handler_runs == 1, "blocked signal not delivered");
+    expect(sigprocmask(SIG_UNBLOCK, &signal_set, NULL) == 0,
+           "sigprocmask unblock");
+    expect(handler_runs == 2 && handler_signal == SIGUSR1,
+           "unblock delivers pending signal");
+
+    /* SA_SIGINFO handlers see si_signo and a ucontext. A restorer supplied
+     * by the program (musl's convention) also returns through the kernel. */
+    install(SIGUSR2, (unsigned int)on_signal_info, SA_SIGINFO, 0);
+    expect(raise(SIGUSR2) == 0, "raise SA_SIGINFO");
+    expect(handler_runs == 3 && handler_signal == SIGUSR2 &&
+               handler_si_signo == SIGUSR2 && handler_info_code == 0 &&
+               handler_context != NULL,
+           "SA_SIGINFO arguments");
+    install(SIGUSR2, (unsigned int)on_signal, SA_RESTORER | SA_NODEFER,
+            (unsigned int)haku_sigreturn_trampoline);
+    expect(raise(SIGUSR2) == 0, "raise SA_RESTORER");
+    expect(handler_runs == 4 && handler_signal == SIGUSR2,
+           "SA_RESTORER restorer returns");
+
+    /* The pid/tid forms. Haku has one thread per process. */
+    expect(kill(getpid(), 0) == 0, "kill sig 0 self");
+    expect(kill(999, 0) == -1 && errno == ESRCH, "kill ESRCH");
+    expect(tkill(getpid(), 0) == 0, "tkill sig 0 self");
+    expect(tgkill(getpid(), getpid(), 0) == 0, "tgkill sig 0 self");
+    expect(tgkill(999, getpid(), 0) == -1 && errno == ESRCH,
+           "tgkill wrong thread group");
+    expect(tgkill(getpid(), 999, 0) == -1 && errno == ESRCH,
+           "tgkill unknown thread");
+    expect(kill(getpid(), 32) == -1 && errno == EINVAL, "kill bad signal");
+    expect(kill(-2, 0) == -1 && errno == ESRCH, "kill bad group");
+    expect(kill(-1, 0) == 0, "kill every other process");
+
+    /* The default disposition of SIGUSR1 ends a process; the parent sees
+     * the signal in the wait status. */
+    {
+        int child = fork();
+        if (child == 0) {
+            signal(SIGUSR1, SIG_DFL);
+            raise(SIGUSR1);
+            _exit(9);
+        }
+        expect(child > 0, "fork for signal");
+        if (child > 0) {
+            int child_status = 0;
+            expect(waitpid(child, &child_status, 0) == child,
+                   "waitpid signalled child");
+            expect((child_status & 0x7F) == SIGUSR1,
+                   "wait status carries SIGUSR1");
+        }
+    }
+
+    /* A signal wakes a task blocked in a syscall: nanosleep reports EINTR
+     * and the handler runs once the task is dispatched again. */
+    {
+        int child = fork();
+        if (child == 0) {
+            haku_timespec_t nap;
+            sigemptyset(&signal_set);
+            handler_runs = 0;
+            expect(signal(SIGUSR1, on_signal) == SIG_DFL, "child signal");
+            nap.tv_sec = 2;
+            nap.tv_nsec = 0;
+            expect(nanosleep(&nap, NULL) == -1 && errno == EINTR,
+                   "signal interrupts nanosleep");
+            nap.tv_sec = 0;
+            nap.tv_nsec = 50000000u;
+            nanosleep(&nap, NULL);
+            _exit(handler_runs == 1 ? 0 : 1);
+        }
+        expect(child > 0, "fork for EINTR");
+        if (child > 0) {
+            haku_timespec_t nap_short;
+            int child_status = 0;
+            nap_short.tv_sec = 0;
+            nap_short.tv_nsec = 100000000u;
+            nanosleep(&nap_short, NULL);
+            expect(kill(child, SIGUSR1) == 0, "kill sleeping child");
+            expect(waitpid(child, &child_status, 0) == child,
+                   "waitpid interrupted child");
+            expect(child_status == 0, "EINTR handler ran in child");
+        }
+    }
+
     if (failures) {
         printf("USER-LIB-FAIL: %d checks failed\n", failures);
         return 1;
     }
+    printf("USER-SIGNAL-OK: kill tkill tgkill sigaction sigprocmask\n");
     printf("USER-LIB-OK: syscalls strings memory file io errno (pid=%d)\n",
            getpid());
     return 0;

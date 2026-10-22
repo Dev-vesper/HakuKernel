@@ -890,6 +890,83 @@ static uint32_t sys_mmap(uint32_t user_arg) {
     return scheduler_mmap(arg[1], (arg[2] & HAKU_PROT_WRITE) != 0u);
 }
 
+/* Signals. The kernel keeps the pending and blocked sets in one word
+ * each, so a mask is four bytes; the i386 kernel sigset_t is eight, and
+ * both sizes are accepted. */
+#define HAKU_SIGSET_WORDS 2u
+
+static uint32_t sys_kill(uint32_t pid, uint32_t sig) {
+    if (sig > SCHEDULER_NSIG) return copy_from_user_error(HAKU_EINVAL);
+    if (pid == 0u)
+        return (uint32_t)scheduler_kill_pid(scheduler_current_pid(), sig);
+    /* Haku has no process groups, so -1 means every other process and any
+     * other negative value is not a group Haku knows about. */
+    if (pid == 0xFFFFFFFFu) return (uint32_t)scheduler_kill_all(sig);
+    if (pid & 0x80000000u) return copy_from_user_error(HAKU_ESRCH);
+    return (uint32_t)scheduler_kill_pid(pid, sig);
+}
+
+static uint32_t sys_tkill(uint32_t tid, uint32_t sig) {
+    if (sig > SCHEDULER_NSIG) return copy_from_user_error(HAKU_EINVAL);
+    return (uint32_t)scheduler_tkill(tid, sig);
+}
+
+static uint32_t sys_tgkill(uint32_t tgid, uint32_t tid, uint32_t sig) {
+    if (sig > SCHEDULER_NSIG) return copy_from_user_error(HAKU_EINVAL);
+    return (uint32_t)scheduler_tgkill(tgid, tid, sig);
+}
+
+static uint32_t sys_rt_sigaction(uint32_t sig, uint32_t user_action,
+                                 uint32_t user_previous,
+                                 uint32_t sigsetsize) {
+    haku_sigaction_t action;
+    haku_sigaction_t previous;
+    int32_t result;
+
+    if (sigsetsize != sizeof(uint32_t) &&
+        sigsetsize != HAKU_SIGSET_WORDS * sizeof(uint32_t))
+        return copy_from_user_error(HAKU_EINVAL);
+    if (sig < 1u || sig > SCHEDULER_NSIG)
+        return copy_from_user_error(HAKU_EINVAL);
+    memset(&action, 0, sizeof(action));
+    if (user_action) {
+        if (!copy_from_user(&action, user_action, sizeof(action)))
+            return copy_from_user_error(HAKU_EFAULT);
+    }
+    memset(&previous, 0, sizeof(previous));
+    result = scheduler_sigaction(sig, user_action ? &action : 0, &previous);
+    if (result < 0) return (uint32_t)result;
+    if (user_previous) {
+        if (!copy_to_user(user_previous, &previous, sizeof(previous)))
+            return copy_from_user_error(HAKU_EFAULT);
+    }
+    return 0u;
+}
+
+static uint32_t sys_rt_sigprocmask(uint32_t how, uint32_t user_set,
+                                   uint32_t user_previous,
+                                   uint32_t sigsetsize) {
+    uint32_t mask = 0u;
+    uint32_t previous = 0u;
+
+    if (sigsetsize != sizeof(uint32_t) &&
+        sigsetsize != HAKU_SIGSET_WORDS * sizeof(uint32_t))
+        return copy_from_user_error(HAKU_EINVAL);
+    if (how != HAKU_SIG_BLOCK && how != HAKU_SIG_UNBLOCK &&
+        how != HAKU_SIG_SETMASK)
+        return copy_from_user_error(HAKU_EINVAL);
+    if (user_set) {
+        if (!copy_from_user(&mask, user_set, sizeof(mask)))
+            return copy_from_user_error(HAKU_EFAULT);
+    }
+    scheduler_sigprocmask(how, mask, &previous);
+    if (user_previous) {
+        if (!copy_to_user(user_previous, &previous, sizeof(previous)))
+            return copy_from_user_error(HAKU_EFAULT);
+    }
+    return 0u;
+}
+
 regs_t *user_syscall(regs_t *r) {
     scheduler_note_syscall();
     switch (r->eax) {
@@ -1024,6 +1101,23 @@ regs_t *user_syscall(regs_t *r) {
         return r;
     case HAKU_SYS_NANOSLEEP:
         return sys_nanosleep(r, r->ebx, r->ecx);
+    case HAKU_SYS_KILL:
+        r->eax = sys_kill(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_TKILL:
+        r->eax = sys_tkill(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_TGKILL:
+        r->eax = sys_tgkill(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_RT_SIGACTION:
+        r->eax = sys_rt_sigaction(r->ebx, r->ecx, r->edx, r->esi);
+        return r;
+    case HAKU_SYS_RT_SIGPROCMASK:
+        r->eax = sys_rt_sigprocmask(r->ebx, r->ecx, r->edx, r->esi);
+        return r;
+    case HAKU_SYS_RT_SIGRETURN:
+        return scheduler_sigreturn(r);
     default:
         r->eax = copy_from_user_error(HAKU_ENOSYS);
         return r;
