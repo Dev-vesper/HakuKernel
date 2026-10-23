@@ -12,6 +12,11 @@
 #define TASK_KERNEL_STACK_PAGES 2u
 #define TASK_MAX_MMAP_REGIONS 8u
 
+/* The task keeps its working directory inline; the two limits must agree so
+ * a validated path always fits. */
+typedef char scheduler_path_must_match_vfs[
+    (SCHEDULER_PATH_MAX == VFS_PATH_MAX) ? 1 : -1];
+
 typedef enum {
     TASK_UNUSED,
     TASK_STARTING,
@@ -40,6 +45,8 @@ typedef struct {
     uint32_t heap_brk;    /* current program break (0 = not yet used) */
     uint32_t heap_top;    /* highest heap page ever mapped (grow only) */
     uint32_t fs_base;     /* user FS base: the thread pointer */
+    char cwd[SCHEDULER_PATH_MAX];   /* canonical root-relative path */
+    char comm[SCHEDULER_COMM_MAX];  /* prctl(PR_SET_NAME) name */
     uint32_t futex_address;   /* the futex word the task waits on (0 = none) */
     uint32_t futex_private;   /* the futex is process-private */
     uint32_t mmap_region_count;
@@ -72,6 +79,18 @@ static int current_task = -1;
 static int scheduler_started;
 static int timer_marker_written;
 static int waitq_marker_written;
+
+/* A fresh task starts at the volume root with the kernel's default name. */
+static void init_task_identity(task_t *task) {
+    memset(task->cwd, 0, sizeof(task->cwd));
+    memcpy(task->comm, "haku", 5);
+}
+
+/* fork(2)/vfork(2): the child inherits the parent's directory and name. */
+static void inherit_task_identity(task_t *child, const task_t *parent) {
+    memcpy(child->cwd, parent->cwd, sizeof(child->cwd));
+    memcpy(child->comm, parent->comm, sizeof(child->comm));
+}
 
 /* Ends the current task with an explicit wait status (the value a parent
  * sees in wait4). A normal exit passes the shifted exit code; a signal
@@ -273,6 +292,7 @@ int scheduler_init(loaded_elf_t *initial_program) {
     tasks[0].parent_pid = 0;
     tasks[0].state = TASK_RUNNABLE;
     tasks[0].program = *initial_program;
+    init_task_identity(&tasks[0]);
     if (!initialize_stack(&tasks[0], 1)) goto fail;
     /* The initial process owns the standard descriptors; every spawned
      * child inherits them from its parent. */
@@ -889,6 +909,64 @@ uint32_t scheduler_parent_pid(void) {
     return tasks[current_task].parent_pid;
 }
 
+int32_t scheduler_get_cwd(char *path, uint32_t size) {
+    uint32_t length;
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX || !path)
+        return -(int32_t)HAKU_EINVAL;
+    length = (uint32_t)strlen(tasks[current_task].cwd);
+    if (size <= length) return -(int32_t)HAKU_ERANGE;
+    memcpy(path, tasks[current_task].cwd,
+           length + 1u);
+    return (int32_t)length;
+}
+
+int32_t scheduler_set_cwd(const char *path) {
+    uint32_t length;
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX || !path)
+        return -(int32_t)HAKU_EINVAL;
+    length = (uint32_t)strlen(path);
+    if (length >= SCHEDULER_PATH_MAX) return -(int32_t)HAKU_ENAMETOOLONG;
+    memcpy(tasks[current_task].cwd, path, length + 1u);
+    return 1;
+}
+
+int32_t scheduler_get_comm(char *name, uint32_t size) {
+    uint32_t length;
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX || !name)
+        return -(int32_t)HAKU_EINVAL;
+    length = (uint32_t)strlen(tasks[current_task].comm);
+    if (size <= length) return -(int32_t)HAKU_ERANGE;
+    memcpy(name, tasks[current_task].comm, length + 1u);
+    return (int32_t)length;
+}
+
+int32_t scheduler_set_comm(const char *name) {
+    uint32_t length;
+    if (current_task < 0 || current_task >= SCHEDULER_IDLE_INDEX || !name)
+        return -(int32_t)HAKU_EINVAL;
+    length = (uint32_t)strlen(name);
+    if (length >= SCHEDULER_COMM_MAX) length = SCHEDULER_COMM_MAX - 1u;
+    memset(tasks[current_task].comm, 0, sizeof(tasks[current_task].comm));
+    memcpy(tasks[current_task].comm, name, length);
+    return 1;
+}
+
+regs_t *scheduler_yield(regs_t *frame) {
+    int next;
+    if (!scheduler_started || !frame || current_task < 0 ||
+        current_task >= SCHEDULER_IDLE_INDEX)
+        return frame;
+    /* The caller stays runnable: a yield only hands the CPU to another
+     * ready task. Remember its frame so the switch can come straight back
+     * to it when it is selected again. */
+    tasks[current_task].frame = frame;
+    next = find_next_task();
+    if (next == current_task)
+        return frame;
+    activate_task(next);
+    return next == SCHEDULER_IDLE_INDEX ? idle_task.frame : tasks[next].frame;
+}
+
 void scheduler_note_syscall(void) {
     if (current_task >= 0 && current_task < SCHEDULER_IDLE_INDEX)
         tasks[current_task].syscall_count++;
@@ -1016,6 +1094,7 @@ int32_t scheduler_spawn(loaded_elf_t *program) {
     child->pid = slot + 1u;
     child->parent_pid = parent_pid;
     child->state = TASK_STARTING;
+    init_task_identity(child);
     irq_unlock(flags);
 
     child->program = *program;
@@ -1109,6 +1188,7 @@ int32_t scheduler_fork(regs_t *frame) {
     child->pid = slot + 1u;
     child->parent_pid = parent_pid;
     child->state = TASK_STARTING;
+    inherit_task_identity(child, parent);
     irq_unlock(flags);
 
     /* The child gets its own address space that shares the parent's frames
@@ -1202,6 +1282,7 @@ regs_t *scheduler_vfork(regs_t *frame) {
     child->parent_pid = parent_pid;
     child->state = TASK_STARTING;
     child->vfork_parent = parent_pid;
+    inherit_task_identity(child, parent);
     irq_unlock(flags);
 
     /* Borrow the parent's address space: same CR3, same frames, no copy.

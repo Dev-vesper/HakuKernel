@@ -205,27 +205,44 @@
 
 
 /* Raw syscall errors are returned as -errno. */
+#define HAKU_EPERM         1u
 #define HAKU_E2BIG         7u
 #define HAKU_ENOENT        2u
 #define HAKU_ESRCH         3u
 #define HAKU_EINTR         4u
 #define HAKU_EIO           5u
+#define HAKU_ENXIO         6u
 #define HAKU_ENOEXEC       8u
 #define HAKU_EBADF          9u
 #define HAKU_ECHILD        10u
 #define HAKU_EAGAIN        11u
 #define HAKU_ENOMEM        12u
+#define HAKU_EACCES        13u
 #define HAKU_EFAULT        14u
+#define HAKU_EBUSY         16u
 #define HAKU_EEXIST        17u
+#define HAKU_EXDEV         18u
+#define HAKU_ENODEV        19u
 #define HAKU_ENOTDIR       20u
 #define HAKU_EISDIR        21u
 #define HAKU_EINVAL        22u
+#define HAKU_ENFILE        23u
 #define HAKU_EMFILE        24u
+#define HAKU_ENOTTY        25u
+#define HAKU_EFBIG         27u
 #define HAKU_ENOSPC        28u
+#define HAKU_ESPIPE        29u
 #define HAKU_EROFS         30u
+#define HAKU_EPIPE         32u
+#define HAKU_ERANGE        34u
 #define HAKU_ENAMETOOLONG  36u
+#define HAKU_ENOLCK        37u
 #define HAKU_ENOSYS        38u
 #define HAKU_ENOTEMPTY     39u
+#define HAKU_ELOOP         40u
+#define HAKU_EOVERFLOW     75u
+#define HAKU_EOPNOTSUPP    95u
+#define HAKU_ENOTSUP       HAKU_EOPNOTSUPP
 #define HAKU_ETIMEDOUT     110u
 
 /* futex(2) operations (Linux). The command is the operation without the
@@ -250,15 +267,111 @@
 #define HAKU_FUTEX_CMD_MASK \
     (~(uint32_t)(HAKU_FUTEX_PRIVATE_FLAG | HAKU_FUTEX_CLOCK_REALTIME))
 
-/* open(2) flags accepted by the current VFS implementation. */
+/* open(2)/openat(2) flags accepted by the current VFS implementation. The
+ * remaining Linux flags are accepted where Haku can honour them: O_CLOEXEC
+ * and O_NOCTTY have no effect (one thread per process, no controlling
+ * terminal), O_DIRECTORY opens a directory for getdents64, and O_NONBLOCK
+ * is remembered by fcntl but does not change console behaviour. */
 #define HAKU_O_RDONLY  0x0000u
 #define HAKU_O_WRONLY  0x0001u
 #define HAKU_O_RDWR    0x0002u
 #define HAKU_O_ACCMODE 0x0003u
 #define HAKU_O_CREAT   0x0040u
 #define HAKU_O_EXCL    0x0080u
+#define HAKU_O_NOCTTY  0x0100u
 #define HAKU_O_TRUNC   0x0200u
 #define HAKU_O_APPEND  0x0400u
+#define HAKU_O_NONBLOCK 0x0800u
+#define HAKU_O_DIRECTORY 0x10000u
+#define HAKU_O_NOFOLLOW 0x20000u
+#define HAKU_O_CLOEXEC  0x80000u
+/* The flags the VFS itself understands (the rest are handled in the
+ * syscall layer). */
+#define HAKU_O_VFS_MASK (HAKU_O_ACCMODE | HAKU_O_CREAT | HAKU_O_EXCL | \
+                         HAKU_O_TRUNC | HAKU_O_APPEND | HAKU_O_DIRECTORY)
+
+/* access(2) modes and the *at flags. */
+#define HAKU_F_OK 0u
+#define HAKU_X_OK 1u
+#define HAKU_W_OK 2u
+#define HAKU_R_OK 4u
+#define HAKU_AT_REMOVEDIR 0x200u
+
+/* fcntl(2) commands and the descriptor flags. */
+#define HAKU_F_DUPFD          0u
+#define HAKU_F_GETFD          1u
+#define HAKU_F_SETFD          2u
+#define HAKU_F_GETFL          3u
+#define HAKU_F_SETFL          4u
+#define HAKU_F_GETLK          5u
+#define HAKU_F_SETLK          6u
+#define HAKU_F_SETLKW         7u
+#define HAKU_F_DUPFD_CLOEXEC  1030u
+#define HAKU_FD_CLOEXEC       1u
+#define HAKU_F_RDLCK          0u
+#define HAKU_F_WRLCK          1u
+#define HAKU_F_UNLCK          2u
+
+/* getrlimit(2)/setrlimit(2). Haku reports fixed limits: the descriptor
+ * table is 8 entries, the process table 4 tasks, and the address space is
+ * bounded only by physical memory. */
+#define HAKU_RLIMIT_CPU     0u
+#define HAKU_RLIMIT_FSIZE   1u
+#define HAKU_RLIMIT_DATA    2u
+#define HAKU_RLIMIT_STACK   3u
+#define HAKU_RLIMIT_CORE    4u
+#define HAKU_RLIMIT_RSS     5u
+#define HAKU_RLIMIT_NPROC   6u
+#define HAKU_RLIMIT_NOFILE  7u
+#define HAKU_RLIMIT_MEMLOCK 8u
+#define HAKU_RLIMIT_AS      9u
+#define HAKU_RLIMIT_LOCKS   10u
+#define HAKU_RLIMIT_SIGPENDING 11u
+#define HAKU_RLIMIT_MSGQUEUE 12u
+#define HAKU_RLIMIT_NICE    13u
+#define HAKU_RLIMIT_RTPRIO  14u
+#define HAKU_RLIMIT_RTTIME  15u
+#define HAKU_RLIMIT_NLIMITS 16u
+#define HAKU_RLIM_INFINITY  0xFFFFFFFFu
+#define HAKU_RLIMIT_SIZE    8u
+
+/* getrandom(2) flags. */
+#define HAKU_GRND_NONBLOCK 0x1u
+#define HAKU_GRND_RANDOM   0x2u
+
+/* poll(2) events. */
+#define HAKU_POLLIN     0x001u
+#define HAKU_POLLOUT    0x004u
+#define HAKU_POLLERR    0x008u
+#define HAKU_POLLHUP    0x010u
+#define HAKU_POLLNVAL   0x020u
+#define HAKU_POLLFD_SIZE 8u
+#define HAKU_FD_SETSIZE 64u
+
+/* prctl(2) options Haku accepts. Process names are stored per task; the
+ * remaining options are accepted as no-ops because their Linux effects
+ * (dumpability, parent-death signals, privilege escalation guards) do not
+ * exist in a single-user kernel. */
+#define HAKU_PR_SET_PDEATHSIG   1u
+#define HAKU_PR_GET_PDEATHSIG   2u
+#define HAKU_PR_GET_DUMPABLE    3u
+#define HAKU_PR_SET_DUMPABLE    4u
+#define HAKU_PR_SET_NAME        15u
+#define HAKU_PR_GET_NAME        16u
+#define HAKU_PR_SET_SECCOMP     22u
+#define HAKU_PR_CAPBSET_READ    23u
+#define HAKU_PR_SET_NO_NEW_PRIVS 38u
+#define HAKU_PR_GET_NO_NEW_PRIVS 39u
+#define HAKU_PR_SET_CHILD_SUBREAPER 36u
+#define HAKU_PR_GET_CHILD_SUBREAPER 37u
+#define HAKU_PR_SET_VMA          0x53564d41u
+
+/* personality(2). Haku is always PER_LINUX. */
+#define HAKU_PER_LINUX        0x0000000u
+#define HAKU_PER_LINUX_32BIT  0x0008000u
+#define HAKU_PER_MASK         0x00000FFu
+#define HAKU_PER_QUERY        0xFFFFFFFFu
+#define HAKU_ADDR_NO_RANDOMIZE 0x0040000u
 
 #define HAKU_STDIN_FILENO  0u
 #define HAKU_STDOUT_FILENO 1u
@@ -536,6 +649,106 @@ typedef struct {
     char domainname[65];
 } haku_utsname_t;
 
+/* getrlimit(2)/setrlimit(2): two 32-bit limits. prlimit64(340) uses the
+ * 64-bit form below. */
+typedef struct {
+    haku_u32 rlim_cur;
+    haku_u32 rlim_max;
+} haku_rlimit_t;
+
+typedef struct {
+    haku_u64 rlim_cur;
+    haku_u64 rlim_max;
+} haku_rlimit64_t;
+
+/* poll(2): one entry per descriptor of interest. */
+typedef struct {
+    haku_i32 fd;
+    haku_u16 events;
+    haku_u16 revents;
+} haku_pollfd_t;
+
+/* Linux i386 "struct termios" (36 bytes) and "struct winsize" (8 bytes).
+ * The console answers TCGETS/TCSETS* and TIOCGWINSZ. */
+typedef struct {
+    haku_u32 c_iflag;
+    haku_u32 c_oflag;
+    haku_u32 c_cflag;
+    haku_u32 c_lflag;
+    haku_u8  c_line;
+    haku_u8  c_cc[19];
+} haku_termios_t;
+
+typedef struct {
+    haku_u16 ws_row;
+    haku_u16 ws_col;
+    haku_u16 ws_xpixel;
+    haku_u16 ws_ypixel;
+} haku_winsize_t;
+
+#define HAKU_TERMIOS_SIZE 36u
+#define HAKU_WINSIZE_SIZE 8u
+
+/* ioctl(2) requests for the console. */
+#define HAKU_TCGETS     0x5401u
+#define HAKU_TCSETS     0x5402u
+#define HAKU_TCSETSW    0x5403u
+#define HAKU_TCSETSF    0x5404u
+#define HAKU_TCSBRK     0x5409u
+#define HAKU_TCFLSH     0x540Bu
+#define HAKU_TIOCGWINSZ 0x5413u
+#define HAKU_FIONREAD   0x541Bu
+
+/* termios flag bits Haku honours (the rest are stored and reported back
+ * unchanged). */
+#define HAKU_IGNBRK  0x0001u
+#define HAKU_BRKINT  0x0002u
+#define HAKU_IGNPAR  0x0004u
+#define HAKU_PARMRK  0x0008u
+#define HAKU_INPCK   0x0010u
+#define HAKU_ISTRIP  0x0020u
+#define HAKU_INLCR   0x0040u
+#define HAKU_IGNCR   0x0080u
+#define HAKU_ICRNL   0x0100u
+#define HAKU_IXON    0x0400u
+#define HAKU_OPOST   0x0001u
+#define HAKU_ONLCR   0x0004u
+#define HAKU_ISIG    0x0001u
+#define HAKU_ICANON  0x0002u
+#define HAKU_ECHO    0x0008u
+#define HAKU_ECHOE   0x0010u
+#define HAKU_ECHOK   0x0020u
+#define HAKU_ECHONL  0x0040u
+
+/* c_cc[] indexes. */
+#define HAKU_VINTR   0u
+#define HAKU_VQUIT   1u
+#define HAKU_VERASE  2u
+#define HAKU_VKILL   3u
+#define HAKU_VEOF    4u
+#define HAKU_VTIME   5u
+#define HAKU_VMIN    6u
+#define HAKU_VSTART  7u
+#define HAKU_VSTOP   8u
+#define HAKU_VSUSP   9u
+#define HAKU_VEOL    10u
+#define HAKU_VREPRINT 12u
+#define HAKU_VDISCARD 13u
+#define HAKU_VWERASE  14u
+#define HAKU_VLNEXT   15u
+
+/* getdents64(2) record: the Linux i386 layout, where the inode and offset
+ * are 64-bit but the whole record is 8-byte aligned. */
+#define HAKU_DIRENT64_HEADER 19u
+#define HAKU_DT_UNKNOWN 0u
+#define HAKU_DT_FIFO 1u
+#define HAKU_DT_CHR  2u
+#define HAKU_DT_DIR  4u
+#define HAKU_DT_BLK  6u
+#define HAKU_DT_REG  8u
+#define HAKU_DT_LNK  10u
+#define HAKU_DT_SOCK 12u
+
 typedef char haku_u32_must_be_32_bits[(sizeof(haku_u32) == 4u) ? 1 : -1];
 typedef char haku_u64_must_be_64_bits[(sizeof(haku_u64) == 8u) ? 1 : -1];
 typedef char haku_stat_must_be_64_bytes[
@@ -560,5 +773,13 @@ typedef char haku_mmap_arg_must_be_24_bytes[
     (sizeof(haku_mmap_arg_t) == HAKU_MMAP_ARG_SIZE) ? 1 : -1];
 typedef char haku_usage_must_be_64_bytes[
     (sizeof(haku_usage_t) == HAKU_USAGE_SIZE) ? 1 : -1];
+typedef char haku_rlimit_must_be_8_bytes[
+    (sizeof(haku_rlimit_t) == HAKU_RLIMIT_SIZE) ? 1 : -1];
+typedef char haku_termios_must_be_36_bytes[
+    (sizeof(haku_termios_t) == HAKU_TERMIOS_SIZE) ? 1 : -1];
+typedef char haku_winsize_must_be_8_bytes[
+    (sizeof(haku_winsize_t) == HAKU_WINSIZE_SIZE) ? 1 : -1];
+typedef char haku_pollfd_must_be_8_bytes[
+    (sizeof(haku_pollfd_t) == HAKU_POLLFD_SIZE) ? 1 : -1];
 
 #endif

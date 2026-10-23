@@ -41,6 +41,7 @@ static const vfs_device_ops_t console_device = {
     "console",
     console_read,
     console_write,
+    terminal_input_available,
 };
 
 static int elf_rejection_self_test(const uint8_t *image,
@@ -152,6 +153,19 @@ void usermode_run(void) {
 static uint32_t copy_from_user_error(uint32_t error) {
     return 0u - error;
 }
+
+/* Defined with the *at family below; the plain path syscalls resolve
+ * through them so a working directory applies everywhere. */
+static int32_t resolve_at(uint32_t dirfd, uint32_t user_path,
+                          char out[VFS_PATH_MAX]);
+static uint32_t sys_open_common(uint32_t dirfd, uint32_t user_path,
+                                uint32_t flags);
+static uint32_t sys_unlinkat(uint32_t dirfd, uint32_t user_path,
+                             uint32_t flags);
+static uint32_t sys_mkdirat(uint32_t dirfd, uint32_t user_path);
+static uint32_t sys_renameat(uint32_t olddirfd, uint32_t user_old,
+                             uint32_t newdirfd, uint32_t user_new);
+static uint32_t sys_access(uint32_t dirfd, uint32_t user_path, uint32_t mode);
 
 static int copy_from_user(void *destination, uint32_t source,
                           uint32_t length) {
@@ -336,18 +350,7 @@ static uint32_t sys_read(uint32_t fd, uint32_t user_buffer,
 }
 
 static uint32_t sys_open(uint32_t user_path, uint32_t flags) {
-    char path[VFS_PATH_MAX];
-    for (uint32_t i = 0; i < sizeof(path); i++) {
-        if (user_path > 0xFFFFFFFFu - i ||
-            !paging_user_range_valid(user_path + i, 1, 0))
-            return copy_from_user_error(HAKU_EFAULT);
-        path[i] = *(const char *)(user_path + i);
-        if (!path[i]) {
-            int32_t result = vfs_open(scheduler_current_pid(), path, flags);
-            return (uint32_t)result;
-        }
-    }
-    return copy_from_user_error(HAKU_ENAMETOOLONG);
+    return sys_open_common(HAKU_AT_FDCWD, user_path, flags);
 }
 
 /* Copy a user path into a VFS_PATH_MAX kernel buffer. Returns 1 on
@@ -363,9 +366,22 @@ static int copy_user_path(uint32_t user_path, char out[VFS_PATH_MAX]) {
     return -(int32_t)HAKU_ENAMETOOLONG;
 }
 
+/* Copy a bounded user string into a fixed kernel buffer. The result is
+ * always NUL-terminated; a longer name is truncated. Returns 1 or a
+ * negative -HAKU_E* errno. */
+static int copy_user_string(uint32_t user_string, char *out, uint32_t size) {
+    if (!size) return -(int32_t)HAKU_EINVAL;
+    for (uint32_t i = 0; i < size; i++) {
+        if (!copy_from_user(&out[i], user_string + i, 1))
+            return -(int32_t)HAKU_EFAULT;
+        if (!out[i]) return 1;
+    }
+    out[size - 1u] = 0;
+    return 1;
+}
+
 static int32_t load_elf_file(uint32_t pid, const char *path,
-                             loaded_elf_t *program) {
-    vfs_stat_t stat;
+                             loaded_elf_t *program) {    vfs_stat_t stat;
     uint8_t *image;
     uint32_t offset = 0;
     int32_t result;
@@ -421,7 +437,7 @@ static uint32_t sys_execve(uint32_t user_path, uint32_t user_argv,
     exec_arguments_t arguments;
     int32_t result;
 
-    result = copy_user_path(user_path, path);
+    result = resolve_at(HAKU_AT_FDCWD, user_path, path);
     if (result != 1) return (uint32_t)result;
     memset(&arguments, 0, sizeof(arguments));
     arguments.strings = (uint8_t *)kmalloc(USER_EXEC_MAX_BYTES);
@@ -461,8 +477,8 @@ static uint32_t sys_spawn(uint32_t user_path) {
     loaded_elf_t program;
     exec_arguments_t arguments;
     int32_t result;
-    int copied = copy_user_path(user_path, path);
-    if (copied != 1) return (uint32_t)copied;
+    int32_t resolved = resolve_at(HAKU_AT_FDCWD, user_path, path);
+    if (resolved != 1) return (uint32_t)resolved;
 
     memset(&arguments, 0, sizeof(arguments));
     result = load_elf_file(scheduler_current_pid(), path, &program);
@@ -496,42 +512,19 @@ static regs_t *sys_waitpid(regs_t *frame, uint32_t pid, uint32_t user_status,
 
 /* POSIX returns 0 on success here: translate the VFS-internal 1. */
 static uint32_t sys_unlink(uint32_t user_path) {
-    char path[VFS_PATH_MAX];
-    int32_t result;
-    int copied = copy_user_path(user_path, path);
-    if (copied != 1) return (uint32_t)copied;
-    result = vfs_unlink(scheduler_current_pid(), path);
-    return result == 1 ? 0u : (uint32_t)result;
+    return sys_unlinkat(HAKU_AT_FDCWD, user_path, 0);
 }
 
 static uint32_t sys_rename(uint32_t user_old, uint32_t user_new) {
-    char oldpath[VFS_PATH_MAX];
-    char newpath[VFS_PATH_MAX];
-    int32_t result;
-    int copied_old = copy_user_path(user_old, oldpath);
-    int copied_new = copy_user_path(user_new, newpath);
-    if (copied_old != 1) return (uint32_t)copied_old;
-    if (copied_new != 1) return (uint32_t)copied_new;
-    result = vfs_rename(scheduler_current_pid(), oldpath, newpath);
-    return result == 1 ? 0u : (uint32_t)result;
+    return sys_renameat(HAKU_AT_FDCWD, user_old, HAKU_AT_FDCWD, user_new);
 }
 
 static uint32_t sys_mkdir(uint32_t user_path) {
-    char path[VFS_PATH_MAX];
-    int32_t result;
-    int copied = copy_user_path(user_path, path);
-    if (copied != 1) return (uint32_t)copied;
-    result = vfs_mkdir(scheduler_current_pid(), path);
-    return result == 1 ? 0u : (uint32_t)result;
+    return sys_mkdirat(HAKU_AT_FDCWD, user_path);
 }
 
 static uint32_t sys_rmdir(uint32_t user_path) {
-    char path[VFS_PATH_MAX];
-    int32_t result;
-    int copied = copy_user_path(user_path, path);
-    if (copied != 1) return (uint32_t)copied;
-    result = vfs_rmdir(scheduler_current_pid(), path);
-    return result == 1 ? 0u : (uint32_t)result;
+    return sys_unlinkat(HAKU_AT_FDCWD, user_path, HAKU_AT_REMOVEDIR);
 }
 
 /* Convert the VFS metadata into the two Linux i386 stat layouts. */
@@ -591,8 +584,8 @@ static uint32_t sys_stat(uint32_t user_path, uint32_t user_buf) {
     vfs_stat_t st;
     haku_stat_t out;
     int32_t result;
-    int copied = copy_user_path(user_path, path);
-    if (copied != 1) return (uint32_t)copied;
+    int resolved = resolve_at(HAKU_AT_FDCWD, user_path, path);
+    if (resolved != 1) return (uint32_t)resolved;
     if (!paging_user_range_valid(user_buf, sizeof(out), 1))
         return copy_from_user_error(HAKU_EFAULT);
     result = vfs_stat(scheduler_current_pid(), path, &st);
@@ -610,8 +603,8 @@ static uint32_t sys_stat64(uint32_t user_path, uint32_t user_buf) {
     vfs_stat_t st;
     haku_stat64_t out;
     int32_t result;
-    int copied = copy_user_path(user_path, path);
-    if (copied != 1) return (uint32_t)copied;
+    int resolved = resolve_at(HAKU_AT_FDCWD, user_path, path);
+    if (resolved != 1) return (uint32_t)resolved;
     if (!paging_user_range_valid(user_buf, sizeof(out), 1))
         return copy_from_user_error(HAKU_EFAULT);
     result = vfs_stat(scheduler_current_pid(), path, &st);
@@ -708,23 +701,20 @@ static uint32_t sys_times(uint32_t user_buf) {
     return 0;
 }
 
-/* fstatat64(300): the path/dirfd form musl's stat() uses. Only
- * AT_FDCWD is supported because Haku has no per-process working
- * directory; Haku paths always resolve from the root. */
+/* fstatat64(300): the path/dirfd form musl's stat() uses. A relative name
+ * is resolved against dirfd (or the working directory for AT_FDCWD). */
 static uint32_t sys_fstatat64(uint32_t dirfd, uint32_t user_path,
                               uint32_t user_buf, uint32_t flags) {
     char path[VFS_PATH_MAX];
     vfs_stat_t st;
     haku_stat64_t out;
     int32_t result;
-    int copied;
+    int32_t resolved;
 
-    if ((int32_t)dirfd != HAKU_AT_FDCWD)
-        return copy_from_user_error(HAKU_ENOSYS);
     if (flags & ~(haku_u32)HAKU_AT_SYMLINK_NOFOLLOW)
         return copy_from_user_error(HAKU_EINVAL);
-    copied = copy_user_path(user_path, path);
-    if (copied != 1) return (uint32_t)copied;
+    resolved = resolve_at(dirfd, user_path, path);
+    if (resolved != 1) return (uint32_t)resolved;
     if (!paging_user_range_valid(user_buf, sizeof(out), 1))
         return copy_from_user_error(HAKU_EFAULT);
     result = vfs_stat(scheduler_current_pid(), path, &st);
@@ -745,15 +735,13 @@ static uint32_t sys_statx(uint32_t dirfd, uint32_t user_path, uint32_t flags,
     vfs_stat_t st;
     haku_statx_t out;
     int32_t result;
-    int copied;
+    int32_t resolved;
 
-    if ((int32_t)dirfd != HAKU_AT_FDCWD)
-        return copy_from_user_error(HAKU_ENOSYS);
     if (flags & ~(haku_u32)(HAKU_AT_SYMLINK_NOFOLLOW |
                             HAKU_AT_NO_AUTOMOUNT))
         return copy_from_user_error(HAKU_EINVAL);
-    copied = copy_user_path(user_path, path);
-    if (copied != 1) return (uint32_t)copied;
+    resolved = resolve_at(dirfd, user_path, path);
+    if (resolved != 1) return (uint32_t)resolved;
     if (!paging_user_range_valid(user_buf, sizeof(out), 1))
         return copy_from_user_error(HAKU_EFAULT);
     result = vfs_stat(scheduler_current_pid(), path, &st);
@@ -1083,6 +1071,576 @@ static regs_t *sys_futex(regs_t *frame, uint32_t user_address, uint32_t op,
     return frame;
 }
 
+/* --- working directory and the *at family ----------------------------- */
+
+/* Collapse "base/relative" (or an absolute path) into a canonical
+ * root-relative path: no leading slash, no "." or ".." components, and
+ * the empty string for the volume root. Returns 1 or a negative
+ * -HAKU_E* errno. */
+static int path_normalize(const char *base, const char *path,
+                          char out[VFS_PATH_MAX]) {
+    char work[VFS_PATH_MAX];
+    uint32_t length = 0;
+    uint32_t out_length = 0;
+    const char *cursor;
+
+    if (!path) return -(int32_t)HAKU_EINVAL;
+    if (path[0] != '/' && base && base[0]) {
+        uint32_t base_length = (uint32_t)strlen(base);
+        if (base_length + 2u >= VFS_PATH_MAX)
+            return -(int32_t)HAKU_ENAMETOOLONG;
+        memcpy(work, base, base_length);
+        length = base_length;
+        if (work[length - 1u] != '/') work[length++] = '/';
+    }
+    for (const char *p = path; *p; p++) {
+        if (length + 1u >= VFS_PATH_MAX)
+            return -(int32_t)HAKU_ENAMETOOLONG;
+        work[length++] = *p;
+    }
+    work[length] = 0;
+
+    out[0] = 0;
+    cursor = work;
+    while (*cursor) {
+        const char *start;
+        uint32_t component;
+        while (*cursor == '/') cursor++;
+        if (!*cursor) break;
+        start = cursor;
+        while (*cursor && *cursor != '/') cursor++;
+        component = (uint32_t)(cursor - start);
+        if (component == 1u && start[0] == '.') continue;
+        if (component == 2u && start[0] == '.' && start[1] == '.') {
+            while (out_length && out[out_length - 1u] != '/') out_length--;
+            if (out_length) out_length--;
+            out[out_length] = 0;
+            continue;
+        }
+        if (out_length + component + 2u > VFS_PATH_MAX)
+            return -(int32_t)HAKU_ENAMETOOLONG;
+        if (out_length) out[out_length++] = '/';
+        memcpy(out + out_length, start, component);
+        out_length += component;
+        out[out_length] = 0;
+    }
+    return 1;
+}
+
+/* Resolve a user path the way openat(2) does: an absolute name stands on
+ * its own, a relative one is joined to the dirfd (or to the process
+ * working directory when dirfd is AT_FDCWD). */
+static int32_t resolve_at(uint32_t dirfd, uint32_t user_path,
+                          char out[VFS_PATH_MAX]) {
+    char raw[VFS_PATH_MAX];
+    char base[VFS_PATH_MAX];
+    int32_t joined;
+    int copied = copy_user_path(user_path, raw);
+    if (copied != 1) return copied;
+    if (raw[0] == 0) return -(int32_t)HAKU_ENOENT;
+    base[0] = 0;
+    if (raw[0] != '/') {
+        if ((int32_t)dirfd == HAKU_AT_FDCWD) {
+            if (scheduler_get_cwd(base, sizeof(base)) < 0) base[0] = 0;
+        } else {
+            joined = vfs_dir_path(scheduler_current_pid(), dirfd, base);
+            if (joined != 1) return joined;
+        }
+    }
+    joined = path_normalize(base, raw, out);
+    if (joined != 1) return joined;
+    /* "/" (or any name that walks back to the root) canonicalizes to the
+     * empty string, which the VFS has no name for: "." is the root. */
+    if (out[0] == 0) {
+        out[0] = '.';
+        out[1] = 0;
+    }
+    return 1;
+}
+
+/* The flags the VFS itself handles; the rest are either accepted as
+ * no-ops (O_CLOEXEC, O_NOCTTY, O_NOFOLLOW without symlinks) or applied to
+ * the description after the open (O_NONBLOCK). */
+#define USER_OPEN_PASS_FLAGS \
+    (HAKU_O_ACCMODE | HAKU_O_CREAT | HAKU_O_EXCL | HAKU_O_TRUNC | \
+     HAKU_O_APPEND | HAKU_O_DIRECTORY)
+#define USER_OPEN_IGNORED_FLAGS \
+    (HAKU_O_CLOEXEC | HAKU_O_NOCTTY | HAKU_O_NOFOLLOW | HAKU_O_NONBLOCK)
+
+static uint32_t sys_open_common(uint32_t dirfd, uint32_t user_path,
+                                uint32_t flags) {
+    char path[VFS_PATH_MAX];
+    int32_t resolved;
+    int32_t fd;
+    if (flags & ~(uint32_t)(USER_OPEN_PASS_FLAGS | USER_OPEN_IGNORED_FLAGS))
+        return copy_from_user_error(HAKU_EINVAL);
+    resolved = resolve_at(dirfd, user_path, path);
+    if (resolved != 1) return (uint32_t)resolved;
+    fd = vfs_open(scheduler_current_pid(), path,
+                  flags & USER_OPEN_PASS_FLAGS);
+    if (fd < 0) return (uint32_t)fd;
+    if (flags & HAKU_O_NONBLOCK)
+        vfs_set_status_flags(scheduler_current_pid(), (uint32_t)fd,
+                             HAKU_O_NONBLOCK);
+    return (uint32_t)fd;
+}
+
+static uint32_t sys_unlinkat(uint32_t dirfd, uint32_t user_path,
+                             uint32_t flags) {
+    char path[VFS_PATH_MAX];
+    int32_t resolved;
+    int32_t result;
+    if (flags & ~(uint32_t)HAKU_AT_REMOVEDIR)
+        return copy_from_user_error(HAKU_EINVAL);
+    resolved = resolve_at(dirfd, user_path, path);
+    if (resolved != 1) return (uint32_t)resolved;
+    result = (flags & HAKU_AT_REMOVEDIR)
+                 ? vfs_rmdir(scheduler_current_pid(), path)
+                 : vfs_unlink(scheduler_current_pid(), path);
+    return result == 1 ? 0u : (uint32_t)result;
+}
+
+static uint32_t sys_mkdirat(uint32_t dirfd, uint32_t user_path) {
+    char path[VFS_PATH_MAX];
+    int32_t resolved = resolve_at(dirfd, user_path, path);
+    int32_t result;
+    if (resolved != 1) return (uint32_t)resolved;
+    result = vfs_mkdir(scheduler_current_pid(), path);
+    return result == 1 ? 0u : (uint32_t)result;
+}
+
+static uint32_t sys_renameat(uint32_t olddirfd, uint32_t user_old,
+                             uint32_t newdirfd, uint32_t user_new) {
+    char oldpath[VFS_PATH_MAX];
+    char newpath[VFS_PATH_MAX];
+    int32_t resolved;
+    int32_t result;
+    resolved = resolve_at(olddirfd, user_old, oldpath);
+    if (resolved != 1) return (uint32_t)resolved;
+    resolved = resolve_at(newdirfd, user_new, newpath);
+    if (resolved != 1) return (uint32_t)resolved;
+    result = vfs_rename(scheduler_current_pid(), oldpath, newpath);
+    return result == 1 ? 0u : (uint32_t)result;
+}
+
+/* truncate(92): open the file for writing and cut it to length. */
+static uint32_t sys_truncate(uint32_t user_path, uint32_t length) {
+    char path[VFS_PATH_MAX];
+    int32_t resolved = resolve_at(HAKU_AT_FDCWD, user_path, path);
+    int32_t fd;
+    int32_t result;
+    if (resolved != 1) return (uint32_t)resolved;
+    fd = vfs_open(scheduler_current_pid(), path, VFS_O_WRONLY);
+    if (fd < 0) return (uint32_t)fd;
+    result = vfs_ftruncate(scheduler_current_pid(), (uint32_t)fd, length);
+    vfs_close(scheduler_current_pid(), (uint32_t)fd);
+    return result == 1 ? 0u : (uint32_t)result;
+}
+
+/* access(33)/faccessat(307): existence and permission probing. FAT12 has
+ * no permission bits, so only execution is refused (nothing is marked
+ * executable) and everything else that resolves is allowed. */
+static uint32_t sys_access(uint32_t dirfd, uint32_t user_path,
+                           uint32_t mode) {
+    char path[VFS_PATH_MAX];
+    vfs_stat_t st;
+    int32_t resolved;
+    int32_t result;
+    if (mode & ~(uint32_t)(HAKU_R_OK | HAKU_W_OK | HAKU_X_OK))
+        return copy_from_user_error(HAKU_EINVAL);
+    resolved = resolve_at(dirfd, user_path, path);
+    if (resolved != 1) return (uint32_t)resolved;
+    result = vfs_stat(scheduler_current_pid(), path, &st);
+    if (result != 1) return (uint32_t)result;
+    if ((mode & HAKU_X_OK) && !(st.st_mode & HAKU_S_IFDIR))
+        return copy_from_user_error(HAKU_EACCES);
+    return 0u;
+}
+
+/* getdents64(220): pack linux_dirent64 records into the user buffer. The
+ * kernel side builds them in a small staging buffer and copies each batch
+ * out, so no VFS write ever touches a user pointer. */
+static uint32_t sys_getdents64(uint32_t fd, uint32_t user_buffer,
+                               uint32_t count) {
+    uint8_t buffer[256];
+    uint32_t chunk;
+    uint32_t copied = 0;
+    if (count < VFS_DIRENT_RECORD_MAX)
+        return copy_from_user_error(HAKU_EINVAL);
+    if (!paging_user_range_valid(user_buffer, count, 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    chunk = count < sizeof(buffer) ? count : sizeof(buffer);
+    for (;;) {
+        int32_t got = vfs_getdents(scheduler_current_pid(), fd, buffer, chunk);
+        if (got < 0) return copied ? copied : (uint32_t)got;
+        if (got == 0) break;
+        if (!copy_to_user(user_buffer + copied, buffer, (uint32_t)got))
+            return copied ? copied : copy_from_user_error(HAKU_EFAULT);
+        copied += (uint32_t)got;
+        if ((uint32_t)got < chunk || copied >= count) break;
+    }
+    return copied;
+}
+
+/* chdir(12)/getcwd(183): the working directory lives in the task and is
+ * stored canonically, so getcwd can hand back "/" plus that path. */
+static uint32_t sys_chdir(uint32_t user_path) {
+    char path[VFS_PATH_MAX];
+    vfs_stat_t st;
+    int32_t resolved = resolve_at(HAKU_AT_FDCWD, user_path, path);
+    int32_t result;
+    if (resolved != 1) return (uint32_t)resolved;
+    /* The root canonicalizes to "."; the task stores it as the empty
+     * string so getcwd can rebuild "/". */
+    if (path[0] == '.' && path[1] == 0) {
+        scheduler_set_cwd("");
+        return 0u;
+    }
+    result = vfs_stat(scheduler_current_pid(), path, &st);
+    if (result != 1) return (uint32_t)result;
+    if (!(st.st_mode & HAKU_S_IFDIR))
+        return copy_from_user_error(HAKU_ENOTDIR);
+    if (scheduler_set_cwd(path) != 1)
+        return copy_from_user_error(HAKU_ENAMETOOLONG);
+    return 0u;
+}
+
+static uint32_t sys_getcwd(uint32_t user_buffer, uint32_t size) {
+    char cwd[VFS_PATH_MAX];
+    char out[VFS_PATH_MAX + 2u];
+    int32_t length = scheduler_get_cwd(cwd, sizeof(cwd));
+    uint32_t total;
+    if (length < 0) return copy_from_user_error((uint32_t)(-length));
+    out[0] = '/';
+    memcpy(out + 1, cwd, (uint32_t)length);
+    out[1 + (uint32_t)length] = 0;
+    total = (uint32_t)length + 2u;
+    if (size < total) return copy_from_user_error(HAKU_ERANGE);
+    if (!paging_user_range_valid(user_buffer, total, 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    if (!copy_to_user(user_buffer, out, total))
+        return copy_from_user_error(HAKU_EFAULT);
+    return user_buffer; /* Linux returns the buffer address */
+}
+
+static uint32_t sys_dup3(uint32_t oldfd, uint32_t newfd, uint32_t flags) {
+    int32_t result;
+    if (flags & ~(uint32_t)HAKU_O_CLOEXEC)
+        return copy_from_user_error(HAKU_EINVAL);
+    if (oldfd == newfd) return copy_from_user_error(HAKU_EINVAL);
+    result = vfs_dup2(scheduler_current_pid(), oldfd, newfd);
+    return (uint32_t)result;
+}
+
+/* pipe(42)/pipe2(331). */
+static uint32_t sys_pipe2(uint32_t user_fds, uint32_t flags) {
+    uint32_t fds[2];
+    int32_t result;
+    if (flags & ~(uint32_t)(HAKU_O_CLOEXEC | HAKU_O_NONBLOCK))
+        return copy_from_user_error(HAKU_EINVAL);
+    if (!paging_user_range_valid(user_fds, sizeof(fds), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    result = vfs_pipe(scheduler_current_pid(), fds);
+    if (result != 1) return (uint32_t)result;
+    if (flags & HAKU_O_NONBLOCK) {
+        vfs_set_status_flags(scheduler_current_pid(), fds[0], HAKU_O_NONBLOCK);
+        vfs_set_status_flags(scheduler_current_pid(), fds[1], HAKU_O_NONBLOCK);
+    }
+    if (!copy_to_user(user_fds, fds, sizeof(fds)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0u;
+}
+
+/* fcntl(55)/fcntl64(221). Haku keeps no record locks: F_GETLK reports
+ * "unlocked" and F_SETLK/F_SETLKW succeed without tracking anything,
+ * which is correct for a single-user kernel with no lock contention. */
+static uint32_t sys_fcntl(uint32_t fd, uint32_t command, uint32_t argument) {
+    int32_t result;
+    switch (command) {
+    case HAKU_F_DUPFD:
+    case HAKU_F_DUPFD_CLOEXEC:
+        return (uint32_t)vfs_dup_min(scheduler_current_pid(), fd, argument);
+    case HAKU_F_GETFD:
+    case HAKU_F_SETFD:
+        /* FD_CLOEXEC has no effect: a process has one thread and execve
+         * replaces the image without closing descriptors. */
+        result = vfs_get_status_flags(scheduler_current_pid(), fd);
+        return result < 0 ? (uint32_t)result : 0u;
+    case HAKU_F_GETFL:
+        return (uint32_t)vfs_get_status_flags(scheduler_current_pid(), fd);
+    case HAKU_F_SETFL:
+        result = vfs_set_status_flags(scheduler_current_pid(), fd,
+                                      argument & (HAKU_O_APPEND |
+                                                  HAKU_O_NONBLOCK));
+        return result == 1 ? 0u : (uint32_t)result;
+    case HAKU_F_GETLK: {
+        uint8_t lock[16];
+        result = vfs_get_status_flags(scheduler_current_pid(), fd);
+        if (result < 0) return (uint32_t)result;
+        if (!paging_user_range_valid(argument, sizeof(lock), 1))
+            return copy_from_user_error(HAKU_EFAULT);
+        memset(lock, 0, sizeof(lock));
+        lock[0] = (uint8_t)HAKU_F_UNLCK;
+        if (!copy_to_user(argument, lock, sizeof(lock)))
+            return copy_from_user_error(HAKU_EFAULT);
+        return 0u;
+    }
+    case HAKU_F_SETLK:
+    case HAKU_F_SETLKW:
+        result = vfs_get_status_flags(scheduler_current_pid(), fd);
+        return result < 0 ? (uint32_t)result : 0u;
+    default:
+        return copy_from_user_error(HAKU_EINVAL);
+    }
+}
+
+/* ioctl(54): the console answers the termios and window-size requests a
+ * shell needs. The terminal is fixed-mode, so TCSETS* are accepted and
+ * ignored rather than failing a program that probes the terminal. */
+static uint32_t sys_ioctl(uint32_t fd, uint32_t request, uint32_t user_arg) {
+    haku_termios_t termios;
+    haku_winsize_t winsize;
+    int32_t status;
+    if (!vfs_is_console(scheduler_current_pid(), fd)) {
+        status = vfs_get_status_flags(scheduler_current_pid(), fd);
+        if (status < 0) return (uint32_t)status;
+        return copy_from_user_error(HAKU_ENOTTY);
+    }
+    switch (request) {
+    case HAKU_TCGETS:
+        memset(&termios, 0, sizeof(termios));
+        termios.c_iflag = HAKU_ICRNL | HAKU_IXON;
+        termios.c_oflag = HAKU_OPOST | HAKU_ONLCR;
+        termios.c_cflag = 0x00BFu; /* CS8 | CREAD */
+        termios.c_lflag = HAKU_ISIG | HAKU_ICANON | HAKU_ECHO |
+                          HAKU_ECHOE | HAKU_ECHOK;
+        termios.c_cc[HAKU_VINTR] = 0x03;
+        termios.c_cc[HAKU_VERASE] = 0x7F;
+        termios.c_cc[HAKU_VEOF] = 0x04;
+        termios.c_cc[HAKU_VMIN] = 1;
+        if (!copy_to_user(user_arg, &termios, sizeof(termios)))
+            return copy_from_user_error(HAKU_EFAULT);
+        return 0u;
+    case HAKU_TCSETS:
+    case HAKU_TCSETSW:
+    case HAKU_TCSETSF:
+        if (!copy_from_user(&termios, user_arg, sizeof(termios)))
+            return copy_from_user_error(HAKU_EFAULT);
+        return 0u;
+    case HAKU_TIOCGWINSZ:
+        memset(&winsize, 0, sizeof(winsize));
+        winsize.ws_row = 25;
+        winsize.ws_col = 80;
+        if (!copy_to_user(user_arg, &winsize, sizeof(winsize)))
+            return copy_from_user_error(HAKU_EFAULT);
+        return 0u;
+    case HAKU_FIONREAD: {
+        uint32_t pending = 0;
+        if (!copy_to_user(user_arg, &pending, sizeof(pending)))
+            return copy_from_user_error(HAKU_EFAULT);
+        return 0u;
+    }
+    case HAKU_TCSBRK:
+    case HAKU_TCFLSH:
+        return 0u;
+    default:
+        return copy_from_user_error(HAKU_ENOTTY);
+    }
+}
+
+/* poll(168): report readiness for every descriptor now. The timeout is
+ * accepted but not waited on (see README "Console and pipes"); a shell
+ * that polls its terminal gets an immediate, correct answer. */
+static uint32_t sys_poll(uint32_t user_fds, uint32_t nfds, uint32_t timeout) {
+    haku_pollfd_t entry;
+    uint32_t ready = 0;
+    (void)timeout;
+    if (nfds > HAKU_FD_SETSIZE) return copy_from_user_error(HAKU_EINVAL);
+    if (nfds == 0) return 0u;
+    if (!paging_user_range_valid(user_fds, nfds * HAKU_POLLFD_SIZE, 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    for (uint32_t i = 0; i < nfds; i++) {
+        uint32_t address = user_fds + i * HAKU_POLLFD_SIZE;
+        uint32_t revents = 0;
+        if (!copy_from_user(&entry, address, sizeof(entry)))
+            return copy_from_user_error(HAKU_EFAULT);
+        if (entry.fd >= 0) {
+            uint32_t fd = (uint32_t)entry.fd;
+            if (entry.events & HAKU_POLLIN)
+                revents |= vfs_poll_events(scheduler_current_pid(), fd, 0);
+            if (entry.events & HAKU_POLLOUT)
+                revents |= vfs_poll_events(scheduler_current_pid(), fd, 1);
+        }
+        entry.revents = (haku_u16)(revents & (entry.events | HAKU_POLLERR |
+                                               HAKU_POLLHUP | HAKU_POLLNVAL));
+        if (!copy_to_user(address, &entry, sizeof(entry)))
+            return copy_from_user_error(HAKU_EFAULT);
+        if (entry.revents) ready++;
+    }
+    return ready;
+}
+
+/* getrlimit(191)/setrlimit(75)/prlimit64(340). The limits are fixed by
+ * the kernel's table sizes; setrlimit accepts and ignores them. */
+static uint32_t sys_getrlimit(uint32_t resource, uint32_t user_rlim,
+                              uint32_t wide) {
+    haku_rlimit_t limits;
+    if (resource >= HAKU_RLIMIT_NLIMITS)
+        return copy_from_user_error(HAKU_EINVAL);
+    switch (resource) {
+    case HAKU_RLIMIT_NOFILE:
+        limits.rlim_cur = 8u;
+        limits.rlim_max = 8u;
+        break;
+    case HAKU_RLIMIT_NPROC:
+        limits.rlim_cur = 4u;
+        limits.rlim_max = 4u;
+        break;
+    default:
+        limits.rlim_cur = HAKU_RLIM_INFINITY;
+        limits.rlim_max = HAKU_RLIM_INFINITY;
+        break;
+    }
+    if (wide) {
+        haku_rlimit64_t out;
+        out.rlim_cur = limits.rlim_cur;
+        out.rlim_max = limits.rlim_max;
+        if (!paging_user_range_valid(user_rlim, sizeof(out), 1))
+            return copy_from_user_error(HAKU_EFAULT);
+        if (!copy_to_user(user_rlim, &out, sizeof(out)))
+            return copy_from_user_error(HAKU_EFAULT);
+        return 0u;
+    }
+    if (!paging_user_range_valid(user_rlim, sizeof(limits), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    if (!copy_to_user(user_rlim, &limits, sizeof(limits)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0u;
+}
+
+static uint32_t sys_setrlimit(uint32_t resource, uint32_t user_rlim) {
+    haku_rlimit_t limits;
+    if (resource >= HAKU_RLIMIT_NLIMITS)
+        return copy_from_user_error(HAKU_EINVAL);
+    if (!copy_from_user(&limits, user_rlim, sizeof(limits)))
+        return copy_from_user_error(HAKU_EFAULT);
+    return 0u;
+}
+
+/* getrandom(355): a xorshift generator seeded from the tick counter and
+ * the process id. Good enough to seed a libc's PRNG, not cryptographic. */
+static uint32_t random_state;
+
+static uint32_t random_word(void) {
+    uint32_t x = random_state;
+    if (!x) x = 0x9E3779B9u ^ pit_ticks() ^ (scheduler_current_pid() << 16);
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    random_state = x;
+    return x;
+}
+
+static uint32_t sys_getrandom(uint32_t user_buffer, uint32_t length,
+                              uint32_t flags) {
+    uint8_t chunk[64];
+    uint32_t offset = 0;
+    if (flags & ~(uint32_t)(HAKU_GRND_NONBLOCK | HAKU_GRND_RANDOM))
+        return copy_from_user_error(HAKU_EINVAL);
+    if (!length) return 0u;
+    if (!paging_user_range_valid(user_buffer, length, 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    while (offset < length) {
+        uint32_t amount = length - offset;
+        if (amount > sizeof(chunk)) amount = sizeof(chunk);
+        for (uint32_t i = 0; i < amount; i += sizeof(uint32_t)) {
+            uint32_t word = random_word();
+            for (uint32_t b = 0; b < sizeof(uint32_t) && i + b < amount; b++)
+                chunk[i + b] = (uint8_t)(word >> (8 * b));
+        }
+        if (!copy_to_user(user_buffer + offset, chunk, amount))
+            return offset ? offset : copy_from_user_error(HAKU_EFAULT);
+        offset += amount;
+    }
+    return length;
+}
+
+/* prctl(172): process names are stored per task; the remaining options
+ * are accepted as no-ops because their Linux effects (dumpability,
+ * parent-death signals, seccomp, no-new-privs) have no meaning here. */
+static uint32_t sys_prctl(uint32_t option, uint32_t arg2) {
+    switch (option) {
+    case HAKU_PR_SET_NAME: {
+        char name[SCHEDULER_COMM_MAX];
+        int copied = copy_user_string(arg2, name, sizeof(name));
+        if (copied != 1) return (uint32_t)copied;
+        scheduler_set_comm(name);
+        return 0u;
+    }
+    case HAKU_PR_GET_NAME: {
+        char name[SCHEDULER_COMM_MAX];
+        char out[SCHEDULER_COMM_MAX];
+        int32_t length = scheduler_get_comm(name, sizeof(name));
+        if (length < 0) return (uint32_t)length;
+        if (!paging_user_range_valid(arg2, sizeof(out), 1))
+            return copy_from_user_error(HAKU_EFAULT);
+        memset(out, 0, sizeof(out));
+        memcpy(out, name, (uint32_t)length);
+        if (!copy_to_user(arg2, out, sizeof(out)))
+            return copy_from_user_error(HAKU_EFAULT);
+        return 0u;
+    }
+    case HAKU_PR_GET_DUMPABLE:
+        return 1u;
+    case HAKU_PR_SET_DUMPABLE:
+    case HAKU_PR_SET_PDEATHSIG:
+    case HAKU_PR_SET_NO_NEW_PRIVS:
+    case HAKU_PR_SET_CHILD_SUBREAPER:
+    case HAKU_PR_SET_SECCOMP:
+    case HAKU_PR_SET_VMA:
+        return 0u;
+    case HAKU_PR_GET_PDEATHSIG:
+    case HAKU_PR_GET_NO_NEW_PRIVS:
+    case HAKU_PR_GET_CHILD_SUBREAPER: {
+        uint32_t zero = 0;
+        if (!copy_to_user(arg2, &zero, sizeof(zero)))
+            return copy_from_user_error(HAKU_EFAULT);
+        return 0u;
+    }
+    case HAKU_PR_CAPBSET_READ:
+        /* Only the capability set Linux gives PID 1 in a container. */
+        return 1u;
+    default:
+        return copy_from_user_error(HAKU_EINVAL);
+    }
+}
+
+static uint32_t sys_personality(uint32_t persona) {
+    if (persona == HAKU_PER_QUERY) return HAKU_PER_LINUX;
+    if ((persona & HAKU_PER_MASK) != HAKU_PER_LINUX)
+        return copy_from_user_error(HAKU_EINVAL);
+    /* ADDR_NO_RANDOMIZE and the other modifiers are accepted: Haku never
+     * randomizes the address space. */
+    return HAKU_PER_LINUX;
+}
+
+/* fchmod/fchown and their *at forms: FAT12 has no ownership or mode
+ * bits, so the calls succeed when the target exists and change nothing. */
+static uint32_t sys_fchmod(uint32_t fd) {
+    int32_t result = vfs_get_status_flags(scheduler_current_pid(), fd);
+    return result < 0 ? (uint32_t)result : 0u;
+}
+
+static uint32_t sys_fchmodat(uint32_t dirfd, uint32_t user_path) {
+    char path[VFS_PATH_MAX];
+    vfs_stat_t st;
+    int32_t resolved = resolve_at(dirfd, user_path, path);
+    int32_t result;
+    if (resolved != 1) return (uint32_t)resolved;
+    result = vfs_stat(scheduler_current_pid(), path, &st);
+    return result == 1 ? 0u : (uint32_t)result;
+}
+
 regs_t *user_syscall(regs_t *r) {
     scheduler_note_syscall();
     switch (r->eax) {
@@ -1254,6 +1812,100 @@ regs_t *user_syscall(regs_t *r) {
         return r;
     case HAKU_SYS_RT_SIGRETURN:
         return scheduler_sigreturn(r);
+    case HAKU_SYS_OPENAT:
+        r->eax = sys_open_common(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_MKDIRAT:
+        r->eax = sys_mkdirat(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_UNLINKAT:
+        r->eax = sys_unlinkat(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_RENAMEAT:
+        r->eax = sys_renameat(r->ebx, r->ecx, r->edx, r->esi);
+        return r;
+    case HAKU_SYS_ACCESS:
+        r->eax = sys_access(HAKU_AT_FDCWD, r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_FACCESSAT:
+        r->eax = sys_access(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_CHMOD:
+    case HAKU_SYS_CHOWN:
+        r->eax = sys_fchmodat(HAKU_AT_FDCWD, r->ebx);
+        return r;
+    case HAKU_SYS_FCHMODAT:
+    case HAKU_SYS_FCHOWNAT:
+        r->eax = sys_fchmodat(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_FCHMOD:
+    case HAKU_SYS_FCHOWN:
+        r->eax = sys_fchmod(r->ebx);
+        return r;
+    case HAKU_SYS_TRUNCATE:
+        r->eax = sys_truncate(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_FTRUNCATE: {
+        int32_t truncated =
+            vfs_ftruncate(scheduler_current_pid(), r->ebx, r->ecx);
+        r->eax = truncated == 1 ? 0u : (uint32_t)truncated;
+        return r;
+    }
+    case HAKU_SYS_GETDENTS64:
+        r->eax = sys_getdents64(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_CHDIR:
+        r->eax = sys_chdir(r->ebx);
+        return r;
+    case HAKU_SYS_GETCWD:
+        r->eax = sys_getcwd(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_DUP3:
+        r->eax = sys_dup3(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_PIPE:
+        r->eax = sys_pipe2(r->ebx, 0u);
+        return r;
+    case HAKU_SYS_PIPE2:
+        r->eax = sys_pipe2(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_FCNTL:
+    case HAKU_SYS_FCNTL64:
+        r->eax = sys_fcntl(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_IOCTL:
+        r->eax = sys_ioctl(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_POLL:
+        r->eax = sys_poll(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_GETRLIMIT:
+        r->eax = sys_getrlimit(r->ebx, r->ecx, 0u);
+        return r;
+    case HAKU_SYS_SETRLIMIT:
+        r->eax = sys_setrlimit(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_PRLIMIT64:
+        if (r->ebx != 0u && r->ebx != scheduler_current_pid()) {
+            r->eax = copy_from_user_error(HAKU_ESRCH);
+            return r;
+        }
+        r->eax = r->esi ? sys_getrlimit(r->ecx, r->esi, 1u) : 0u;
+        return r;
+    case HAKU_SYS_GETRANDOM:
+        r->eax = sys_getrandom(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_SCHED_YIELD:
+        /* Nothing to do after the switch, so the task can simply hand the
+         * CPU over and resume at the syscall return. */
+        r->eax = 0u;
+        return scheduler_yield(r);
+    case HAKU_SYS_PRCTL:
+        r->eax = sys_prctl(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_PERSONALITY:
+        r->eax = sys_personality(r->ebx);
+        return r;
     default:
         r->eax = copy_from_user_error(HAKU_ENOSYS);
         return r;

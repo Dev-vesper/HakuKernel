@@ -18,6 +18,39 @@ int unlink(const char *path);
 int rename(const char *old_path, const char *new_path);
 int mkdir(const char *path);
 int rmdir(const char *path);
+/* Working directory and permission probing. */
+int chdir(const char *path);
+char *getcwd(char *buffer, size_t size);
+int access(const char *path, int mode);
+#define F_OK 0
+#define X_OK 1
+#define W_OK 2
+#define R_OK 4
+/* Length changes, pipes, and descriptor duplication. */
+int truncate(const char *path, off_t length);
+int ftruncate(int fd, off_t length);
+int pipe(int fds[2]);
+int pipe2(int fds[2], int flags);
+int dup3(int old_fd, int new_fd, int flags);
+int sched_yield(void);
+/* Fill buffer with pseudo-random bytes. */
+int getrandom(void *buffer, size_t length, unsigned int flags);
+#define GRND_NONBLOCK HAKU_GRND_NONBLOCK
+#define GRND_RANDOM   HAKU_GRND_RANDOM
+/* Process name (prctl PR_SET_NAME/PR_GET_NAME). */
+int prctl(int option, unsigned int arg2, unsigned int arg3,
+          unsigned int arg4, unsigned int arg5);
+#define PR_SET_NAME HAKU_PR_SET_NAME
+#define PR_GET_NAME HAKU_PR_GET_NAME
+#define PR_SET_PDEATHSIG HAKU_PR_SET_PDEATHSIG
+#define PR_GET_PDEATHSIG HAKU_PR_GET_PDEATHSIG
+#define PR_SET_DUMPABLE HAKU_PR_SET_DUMPABLE
+#define PR_GET_DUMPABLE HAKU_PR_GET_DUMPABLE
+#define PR_SET_NO_NEW_PRIVS HAKU_PR_SET_NO_NEW_PRIVS
+#define PR_GET_NO_NEW_PRIVS HAKU_PR_GET_NO_NEW_PRIVS
+int personality(unsigned int persona);
+#define PER_LINUX HAKU_PER_LINUX
+#define PER_QUERY HAKU_PER_QUERY
 int getpid(void);
 int getppid(void);
 int getuid(void);

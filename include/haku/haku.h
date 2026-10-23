@@ -4,8 +4,12 @@
 #include <haku/abi.h>
 #include <haku/types.h>
 #include <haku/errno.h>
+#include <haku/dirent.h>
 #include <haku/fcntl.h>
+#include <haku/poll.h>
+#include <haku/resource.h>
 #include <haku/stat.h>
+#include <haku/termios.h>
 #include <haku/futex.h>
 #include <haku/mman.h>
 #include <haku/signal.h>

@@ -31,6 +31,8 @@ int32_t terminal_write_bytes(const void *buffer, uint32_t count,
 void terminal_input_push(char c);
 /* Non-blocking consume; -1 when the ring is empty. */
 int terminal_input_poll(void);
+/* 1 when a read would not block (poll/select readiness). */
+int terminal_input_available(void);
 /* Block until a character is available. */
 char terminal_getchar(void);
 

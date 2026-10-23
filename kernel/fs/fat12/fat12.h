@@ -29,6 +29,14 @@ typedef struct {
     int is_dir;
 } fat12_stat_t;
 
+/* Directory enumeration handle: the directory's first cluster (0 is the
+ * fixed root region). The VFS keeps the entry cursor, so the backend stays
+ * stateless and a getdents64 call can start at any ordinal. */
+typedef struct {
+    uint32_t first_cluster;
+    int opened;
+} fat12_dir_t;
+
 #define FAT12_OPEN_READ   0x01u
 #define FAT12_OPEN_WRITE  0x02u
 #define FAT12_OPEN_CREATE 0x04u
@@ -90,5 +98,19 @@ int fat12_file_fstat(fat12_file_t *file, fat12_stat_t *out);
  * -FAT12_ERR_* convention; a non-empty directory reports NOT_EMPTY. */
 int fat12_dir_create(const char *name);
 int fat12_dir_remove(const char *name);
+/* Directory enumeration for getdents64. open resolves the path and
+ * requires a directory; read reports the index-th live entry (8.3 name
+ * rendered as "NAME.EXT", 13 bytes with the NUL) and returns 1, 0 at the
+ * end of the directory, or a negative -FAT12_ERR_*. Deleted entries,
+ * long-name fragments, volume labels, and "."/".." are skipped, so the
+ * index counts only the names a user would see. */
+int fat12_dir_open(const char *path, fat12_dir_t *dir);
+int fat12_dir_read(fat12_dir_t *dir, uint32_t index, fat12_stat_t *out,
+                   char name[13], uint32_t *next_index);
+/* Set the file length. Shrinking releases the clusters past the new end;
+ * growing zero-fills the new bytes. Like every FAT12 operation here it is
+ * not atomic, but the directory entry is only ever persisted with a size
+ * the disk already holds. Same 1 / -FAT12_ERR_* convention. */
+int fat12_file_truncate(fat12_file_t *file, uint32_t size);
 
 #endif

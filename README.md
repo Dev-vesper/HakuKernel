@@ -362,8 +362,9 @@ in the syscall layer: they resolve through the same VFS descriptor table as
 file handles, and the device itself only forwards to the terminal layer.
 `open`, `close`, `lseek`, `unlink`, `rename`, `mkdir`, `rmdir`, `stat`,
 `fstat`, and per-process file descriptors are backed by the VFS/FAT12 layer.
-Paths are `/`-separated 8.3 names resolved from the root; `.` keeps the
-current directory and `..` climbs to the parent (clamped at the root). `stat`
+Paths are `/`-separated 8.3 names: a relative name starts at the process
+working directory, an absolute one at the volume root, `.` keeps the current
+directory, and `..` climbs to the parent (clamped at the root). `stat`
 and `fstat` report byte size and mode (`S_IFREG | 0644` for files,
 `S_IFDIR | 0755` for directories) through an 8-byte user buffer. Reads
 and writes are bounded to 4096 bytes, and errors return
@@ -495,6 +496,64 @@ revoke, inherited-descriptor, and close-on-exit paths (`USER-STDIO-OK`,
 `USER-FD-INHERIT-OK`); after both processes exit, the idle self-test asserts
 their descriptor tables are empty.
 
+A process also has a working directory. `chdir` resolves the target, requires
+a directory, and stores the result as a canonical root-relative path (no
+leading slash, no `.` or `..` components, empty for the root); `getcwd`
+rebuilds `/` plus that path. Every path syscall resolves relative names
+against it, so `open("data.txt")` and `execve("NEXT.ELF", ...)` follow the
+process, while a leading `/` still starts at the volume root. The root itself
+canonicalizes to `.` for the VFS, which has no name for it. `fork`, `vfork`,
+and `spawn` children inherit the directory, and `execve` keeps it.
+
+The `*at` family takes a directory descriptor: `openat`, `unlinkat` (with
+`AT_REMOVEDIR`), `renameat`, `mkdirat`, `faccessat`, and the `dirfd` form of
+`fstatat64`/`statx` join a relative name to the directory the descriptor was
+opened on, and accept `AT_FDCWD` for the working directory. `open` with
+`O_DIRECTORY` returns a descriptor for enumeration: `getdents64` fills the
+user buffer with packed Linux `linux_dirent64` records (inode, offset,
+record length, type, name) from the backend's `opendir`/`readdir` pair, and a
+closed directory handle releases a directory object rather than a file one.
+Enumeration skips deleted slots, long-name fragments, volume labels, and
+`.`/`..`, so it lists the names a user would see.
+
+`pipe`/`pipe2` create a 512-byte in-memory pipe with two open file
+descriptions and separate reader/writer counts: a read returns `0` once
+every write end closes, a write to a pipe with no readers raises `SIGPIPE`
+and returns `EPIPE`, and `O_NONBLOCK` (set at creation or through
+`fcntl(F_SETFL)`) makes both directions return `EAGAIN` instead of blocking.
+Blocking pipe reads park on a wait queue like the console does. `fcntl`
+answers `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL` (`O_APPEND`, `O_NONBLOCK`),
+and `F_DUPFD`/`F_DUPFD_CLOEXEC`; `F_GETLK` reports "unlocked" and
+`F_SETLK`/`F_SETLKW` succeed as no-ops, because Haku tracks no record locks.
+`dup3` is `dup2` with an `O_CLOEXEC` flag check and rejects identical
+descriptors with `EINVAL`.
+
+`ioctl` on the console answers `TCGETS` with the terminal's fixed mode
+(`ICRNL|IXON`, `OPOST|ONLCR`, `ISIG|ICANON|ECHO|ECHOE|ECHOK`, erase `0x7F`,
+EOF `^D`), accepts `TCSETS`/`TCSETSW`/`TCSETSF` without changing that mode,
+reports an 80x25 window for `TIOCGWINSZ`, and returns `ENOTTY` for a
+descriptor that is not the console. `poll` reports the readiness of every
+descriptor immediately (a pipe with data is `POLLIN`, a closed write end adds
+`POLLHUP`, a closed read end makes the write side `POLLERR`); its timeout is
+accepted but not waited on, so a caller that needs to block should use
+`read` or `select` over `poll`. `access` checks that the name resolves and
+refuses `X_OK` because nothing is marked executable; `fchmod`, `fchown`,
+and their `*at` forms succeed without changing anything because FAT12 stores
+no mode or owner bits. `getrlimit`/`setrlimit`/`prlimit64` report the fixed
+table sizes (8 descriptors, 4 tasks, `RLIM_INFINITY` elsewhere) and accept a
+new value without applying it. `getrandom` fills a buffer from a xorshift
+generator seeded by the tick counter and the pid, `sched_yield` hands the
+CPU to the next runnable task, `prctl` stores a 15-character process name
+and accepts the remaining options as no-ops, and `personality` always
+reports `PER_LINUX`. The C library covers all of it
+(`include/haku/dirent.h`, `poll.h`, `termios.h`, `resource.h`, and the
+`*at` wrappers in `fcntl.h`), and the ring-3 self-test exercises the whole
+path as `USER-FS-ABI-OK`.
+
+Not implemented: `symlink`/`readlink` (FAT12 has no link type),
+`select` (musl builds it on `poll`), the legacy `getdents` record format,
+blocking `poll`, real record locks, and `mremap` with `MREMAP_DONTUNMAP`.
+
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It
 rejects unmapped/kernel pointers, wraparound, invalid descriptors and
@@ -517,11 +576,57 @@ each checked against its expected `#PF` error code (`7`, `7`, `4`, `6`). The
 blocking read is also observed to park the process (`SCHED-WAITQ-OK`) before
 the injected key arrives.
 
+### Supported POSIX subset
+
+Haku implements a POSIX-*inspired* subset aimed at a statically linked musl
+userland; conformance is not a goal. What exists, by area:
+
+- **Process:** `exit`/`exit_group`, `fork`, `vfork`, `clone` (fork form),
+  `wait4`/`waitpid`, `execve`, `getpid`/`getppid`/`getuid`/`geteuid`/
+  `getgid`/`getegid`/`gettid`, `kill`/`tkill`/`tgkill`, `rt_sigaction`/
+  `rt_sigprocmask`/`rt_sigreturn`, `sched_yield`, `prctl` (process name),
+  `personality`, `times`, `getrusage` (zeroed), `uname`,
+  `getrlimit`/`setrlimit`/`prlimit64` (fixed values), `getrandom`.
+- **Memory:** `brk`, `mmap`/`mmap2` (anonymous only), `munmap`, `mprotect`,
+  `mremap`, `madvise`, `set_thread_area`/`get_thread_area`.
+- **Files:** `open`/`openat`, `close`, `read`, `write`, `lseek`,
+  `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `fcntl`, `ioctl` (console),
+  `unlink`/`unlinkat`, `rename`/`renameat`, `mkdir`/`mkdirat`, `rmdir`,
+  `stat`/`lstat`/`fstat` (32- and 64-bit), `fstatat64`, `statx`,
+  `truncate`, `ftruncate`, `access`/`faccessat`, `chdir`, `getcwd`,
+  `getdents64`, `poll`, and `chmod`/`chown`/`fchmod`/`fchown` (accepted,
+  nothing to change).
+- **Time:** `gettimeofday`, `nanosleep`.
+- **Haku-specific:** `spawn`, `getusage`, `futex`.
+
+Deliberately absent: process groups and job control, threads (`clone`
+rejects the thread flags), symbolic and hard links, file-backed mappings,
+`socket`, `mount`, and networking. Where a call exists but cannot be
+honoured — permission bits, record locks, terminal modes — it succeeds
+without changing state and the limitation is documented above instead of
+returning a surprise error.
+
+### Manual testing and image recovery
+
+`python build.py run` boots the floppy in a QEMU window with the same disks
+as the automated run, so the whole flow can be driven by hand: the injected
+key only exists in `headless`, so press any key yourself at the read prompt.
+`build/serial.log` is only written by `headless`; in a windowed run the same
+text appears on the VGA/framebuffer console.
+
+A data image that a test corrupted can be thrown away safely: delete
+`build/haku_fs.img` or run `python build.py --fresh` (add `headless` to also
+run the tests), and the image is rebuilt from the test programs. Before
+discarding one, `python build.py inspect --check` says whether it is really
+damaged — it verifies the BPB, both FAT mirrors, every cluster chain, and
+orphans, and exits nonzero on any inconsistency.
+
 ### User C library
 
 `include/haku/` doubles as a freestanding C SDK: `<haku/haku.h>` includes the
 syscall ABI, `types.h`, `errno.h`, `string.h`, `stdlib.h`, `unistd.h`,
-`fcntl.h`, `stat.h`, `stdio.h`, and `signal.h`.
+`fcntl.h`, `stat.h`, `stdio.h`, `signal.h`, `mman.h`, `futex.h`, `dirent.h`,
+`poll.h`, `termios.h`, and `resource.h`.
 
 - Raw syscalls: `haku_syscall0`..`haku_syscall4` in `user/lib/syscall.asm`
   (i386 `int 0x80`, arguments in `ebx`/`ecx`/`edx`/`esi`, result in `eax`).
@@ -795,12 +900,13 @@ Haku/
                         crash.c/.h: register/MMU/stack crash reports
                         heap.c/.h: kernel kmalloc/kfree allocator
   user/
-    lib/              errno.c, memory.c, mman.c, signal.c, stdio.c, string.c,
-                      unistd.c, crt0.asm, syscall.asm: user C library
+    lib/              errno.c, fsabi.c, memory.c, mman.c, signal.c, stdio.c,
+                      string.c, unistd.c, crt0.asm, syscall.asm: user C library
     tests/            libtest.c: C library self-test installed as LIB.ELF
   include/haku/         abi.h + abi.inc: shared user/kernel ABI constants
                         types/errno/string/stdlib/unistd/fcntl/stat/stdio/
-                        signal/mman.h: user library headers, plus haku.h
+                        signal/mman/dirent/poll/termios/resource.h: user
+                        library headers, plus haku.h
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       boot floppy size/signature checks
   tools/mkfat12.py     FAT12 image builder for the user ELF

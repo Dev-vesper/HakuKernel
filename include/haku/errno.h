@@ -23,8 +23,23 @@
 #define ENOSPC       HAKU_ENOSPC
 #define EROFS        HAKU_EROFS
 #define ENAMETOOLONG HAKU_ENAMETOOLONG
+#define ENOLCK       HAKU_ENOLCK
 #define ENOSYS       HAKU_ENOSYS
 #define ENOTEMPTY    HAKU_ENOTEMPTY
+#define EPERM        HAKU_EPERM
+#define EACCES       HAKU_EACCES
+#define EBUSY        HAKU_EBUSY
+#define EXDEV        HAKU_EXDEV
+#define ENODEV       HAKU_ENODEV
+#define ENFILE       HAKU_ENFILE
+#define ENOTTY       HAKU_ENOTTY
+#define EFBIG        HAKU_EFBIG
+#define ESPIPE       HAKU_ESPIPE
+#define EPIPE        HAKU_EPIPE
+#define ERANGE       HAKU_ERANGE
+#define ELOOP        HAKU_ELOOP
+#define EOVERFLOW    HAKU_EOVERFLOW
+#define EOPNOTSUPP   HAKU_EOPNOTSUPP
 
 extern int errno;
 

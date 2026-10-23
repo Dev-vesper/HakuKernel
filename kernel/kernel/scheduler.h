@@ -9,6 +9,11 @@
 /* Signals: Haku implements the standard range 1..31, so a mask fits in a
  * single word with bit (sig - 1) set. */
 #define SCHEDULER_NSIG 31u
+/* Longest canonical (root-relative) working directory a task keeps. Must
+ * match VFS_PATH_MAX; scheduler.c asserts the two agree. */
+#define SCHEDULER_PATH_MAX 64u
+/* process name reported by PR_GET_NAME, NUL-terminated like Linux. */
+#define SCHEDULER_COMM_MAX 16u
 
 /* Event wait queue. A task that cannot make progress parks itself on a
  * queue and is woken by whoever satisfies the event (an IRQ handler or
@@ -81,6 +86,18 @@ uint32_t scheduler_futex_wake(uint32_t address, uint32_t count,
 uint32_t scheduler_munmap(uint32_t address, uint32_t length);
 uint32_t scheduler_current_pid(void);
 uint32_t scheduler_parent_pid(void);
+/* The per-task working directory is a canonical root-relative path (the
+ * empty string is the volume root). get copies the NUL-terminated name and
+ * returns its length, or -ERANGE when the buffer is too small. set takes an
+ * already-validated path and copies it. */
+int32_t scheduler_get_cwd(char *path, uint32_t size);
+int32_t scheduler_set_cwd(const char *path);
+/* The process name set by prctl(PR_SET_NAME). */
+int32_t scheduler_get_comm(char *name, uint32_t size);
+int32_t scheduler_set_comm(const char *name);
+/* sched_yield(2): let the next runnable task run. Returns the frame that
+ * resumes the caller (which may be this task when nobody else is ready). */
+regs_t *scheduler_yield(regs_t *frame);
 /* Signals. kill(2) takes a pid, 0 for the caller, or -1 for every other
  * process; Haku has no process groups. tkill/tgkill take thread ids, and
  * a thread id is a process id here. */

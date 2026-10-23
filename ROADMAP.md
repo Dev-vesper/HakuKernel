@@ -216,9 +216,16 @@ prevent boot.
   `NEXT.ELF` spawns it in the headless run and checks `USER-LIB-OK`).
 - [ ] Add automated tests for malformed ELF files, syscalls, VFS, FAT, and the
   scheduler.
-- [ ] Define the limited POSIX subset actually supported; add conformance
-  tests and document limitations for each capability.
-- [ ] Document manual testing and disk-image recovery or replacement.
+- [x] Define the limited POSIX subset actually supported; add conformance
+  tests and document limitations for each capability (README's "Supported
+  POSIX subset" lists the implemented calls by area, what is deliberately
+  absent, and which calls are accepted without changing state; the ring-3
+  self-tests `USER-LIB-OK` and `USER-FS-ABI-OK` exercise the surface, though
+  there is no formal conformance suite).
+- [x] Document manual testing and disk-image recovery or replacement
+  (README's "Manual testing and image recovery": a windowed run for
+  hands-on testing, `--fresh` to rebuild a discarded data image, and
+  `inspect --check` to prove an image is damaged before throwing it away).
 
 **Acceptance criteria:** An independent C program can be built and run using
 the documented toolchain, and `python build.py headless` runs all regression
@@ -300,15 +307,35 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   (`USER-MMAP-OK`). Still missing: file-backed mappings (there is no
   page cache yet), `mremap` with `MREMAP_DONTUNMAP`, and shared
   mappings that a second task can observe.
-- [ ] Add `futex` so libc locks, and later threads, behave correctly.
-- [ ] Extend the filesystem ABI for libc and shell tooling: the `*at` family
-  (`openat`, `unlinkat`, `renameat`, `mkdirat`, `fstatat`),
-  `fchmod`/`fchown`, `symlink`/`readlink`, `truncate`/`ftruncate`, `access`,
-  `getdents64`, `chdir`/`getcwd`, `dup3`, `pipe`/`pipe2`, `fcntl`, `ioctl`
-  (termios for an interactive shell), `poll`/`select`,
-  `getrlimit`/`setrlimit`, `getrandom`, `sched_yield`, `prctl`, and
-  `personality` (`statx`, `uname`, and the caller's `getuid` family are
-  already implemented).
+- [x] Add `futex` so libc locks, and later threads, behave correctly
+  (`FUTEX_WAIT`/`FUTEX_WAKE` plus the `_PRIVATE` and `_BITSET` forms, with a
+  relative timeout that reports `ETIMEDOUT`; waiters park on the scheduler's
+  address queue instead of spinning, and the C library covers the value
+  check, the wake, and the timeout as `USER-FUTEX-OK`). Thread creation
+  itself stays out of scope: `clone` still rejects the thread flags.
+- [x] Extend the filesystem ABI for libc and shell tooling: the `*at` family
+  (`openat`, `unlinkat`, `renameat`, `mkdirat`, `faccessat`, and
+  `fstatat` through the existing `fstatat64`/`statx`), `fchmod`/`fchown`
+  and their `*at` forms, `truncate`/`ftruncate`, `access`, `getdents64`,
+  `chdir`/`getcwd`, `dup3`, `pipe`/`pipe2`, `fcntl`, `ioctl` (termios and
+  `TIOCGWINSZ` for an interactive shell), `poll`, `getrlimit`/`setrlimit`/
+  `prlimit64`, `getrandom`, `sched_yield`, `prctl`, and `personality`.
+  Every path syscall resolves a relative name against the task's working
+  directory, which `chdir`/`getcwd` keep as a canonical path, and a `dirfd`
+  argument resolves against the directory descriptor the caller opened.
+  `getdents64` packs Linux `linux_dirent64` records from a new backend
+  `opendir`/`readdir` pair, `pipe` uses two descriptions with separate
+  reader and writer counts (end of file once every write end closes,
+  `EPIPE` plus `SIGPIPE` once every read end does), `fcntl` reports and sets
+  `O_APPEND`/`O_NONBLOCK` and duplicates onto a requested descriptor, and
+  the console answers `TCGETS`/`TCSETS*`, `TIOCGWINSZ`, and `FIONREAD`.
+  Permission and ownership calls succeed without changing anything because
+  FAT12 has no mode or owner bits, and `getrlimit` reports the fixed table
+  sizes (8 descriptors, 4 tasks). Proven from ring 3 as `USER-FS-ABI-OK`.
+  Still missing: `symlink`/`readlink` (there is no link type to store),
+  `select` (musl implements it over `poll`), the old `getdents` format,
+  blocking `poll` (it reports current readiness and returns immediately),
+  and real record locks (`F_SETLK` is accepted as a no-op).
 - [ ] Add a Unix-like filesystem for the userland: an in-memory filesystem
   (initramfs) with long names, permission bits, symlinks, timestamps, and
   nested directories, plus a device layer (`/dev/null`, `/dev/zero`,

@@ -7,8 +7,11 @@
 #define VFS_FD_COUNT 8u
 #define VFS_FIRST_FILE_FD 3u
 #define VFS_MAX_FS 4u
+#define VFS_MAX_PIPES 4u
+#define VFS_PIPE_CAPACITY 512u
 #define VFS_SUPPORTED_FLAGS \
-    (VFS_O_ACCMODE | VFS_O_CREAT | VFS_O_EXCL | VFS_O_TRUNC | VFS_O_APPEND)
+    (VFS_O_ACCMODE | VFS_O_CREAT | VFS_O_EXCL | VFS_O_TRUNC | VFS_O_APPEND | \
+     VFS_O_DIRECTORY)
 
 /* An open file description is shared by every descriptor that dup/dup2
  * points at it (Linux semantics): offset, access mode and the backend handle
@@ -16,19 +19,26 @@
  * referencing it; the backend handle is released only when the last one
  * closes, so a dup'd descriptor survives its sibling's close and
  * open-on-a-removed-file keeps working until the final close. A description
- * is either a regular file (ops/backend) or a character device such as the
- * console behind the standard descriptors (device). */
+ * is a regular file (ops/backend), a directory (ops/backend + cursor), a
+ * character device such as the console behind the standard descriptors
+ * (device), or one end of a pipe. */
 typedef enum {
     VFS_OFD_FILE,
-    VFS_OFD_DEVICE
+    VFS_OFD_DIR,
+    VFS_OFD_DEVICE,
+    VFS_OFD_PIPE
 } vfs_ofd_kind_t;
 
 typedef struct {
     vfs_ofd_kind_t kind;
-    const vfs_fs_ops_t *ops;        /* file backend, when kind == FILE */
+    const vfs_fs_ops_t *ops;        /* file backend, when kind == FILE/DIR */
     const vfs_device_ops_t *device; /* char device, when kind == DEVICE */
     void *backend;      /* backend-allocated per-open handle */
     uint32_t accmode;   /* VFS_O_RDONLY/WRONLY/RDWR, fixed at open */
+    uint32_t status;    /* O_APPEND/O_NONBLOCK, changeable by fcntl */
+    uint32_t dir_index; /* enumeration cursor, when kind == DIR */
+    char dir_path[VFS_PATH_MAX]; /* canonical path, when kind == DIR */
+    uint32_t pipe;      /* pipe index, when kind == PIPE */
     uint32_t refs;
     int used;
 } vfs_ofd_t;
@@ -37,6 +47,21 @@ typedef struct {
     uint32_t ofd;       /* index into ofd_table when used */
     int used;
 } vfs_fd_t;
+
+/* A pipe is a byte ring with one wait queue per direction. Its state is
+ * tiny and memory-only, so it is protected by short IRQ-off sections
+ * instead of the task-context VFS lock: a blocked reader must be able to
+ * park while a writer on another task makes progress. */
+typedef struct {
+    uint8_t data[VFS_PIPE_CAPACITY];
+    uint32_t head;      /* bytes written since the pipe was created */
+    uint32_t tail;      /* bytes read since the pipe was created */
+    uint32_t readers;
+    uint32_t writers;
+    wait_queue_t readable; /* readers park here until data arrives */
+    wait_queue_t writable; /* writers park here until space frees */
+    int used;
+} vfs_pipe_t;
 
 static vfs_fd_t descriptors[VFS_MAX_PROCESSES][VFS_FD_COUNT];
 static vfs_ofd_t ofd_table[VFS_MAX_PROCESSES * VFS_FD_COUNT];
@@ -49,6 +74,118 @@ static const vfs_device_ops_t *stdio_device;
  * Task-context spinlock: the holder may be preempted, so interrupts stay
  * enabled during I/O and a waiter busy-waits for the holder to run again. */
 static spinlock_t vfs_lock = SPINLOCK_INIT;
+static vfs_pipe_t pipes[VFS_MAX_PIPES];
+
+/* Claim a pipe slot. Called with the VFS lock held and before the pipe is
+ * reachable through any descriptor. */
+static int pipe_alloc(void) {
+    for (uint32_t i = 0; i < VFS_MAX_PIPES; i++) {
+        if (!pipes[i].used) {
+            memset(&pipes[i], 0, sizeof(pipes[i]));
+            pipes[i].used = 1;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* Release one end of a pipe. Called with the VFS lock held and interrupts
+ * disabled (the pipe state is IRQ-protected). */
+static void pipe_drop_end(uint32_t index, int write_end) {
+    vfs_pipe_t *pipe;
+    if (index >= VFS_MAX_PIPES || !pipes[index].used) return;
+    pipe = &pipes[index];
+    if (write_end) {
+        if (pipe->writers) pipe->writers--;
+    } else {
+        if (pipe->readers) pipe->readers--;
+    }
+    /* Both directions may now be able to proceed: a reader hitting EOF, a
+     * writer hitting EPIPE, or simply more room. */
+    wait_queue_wake_all(&pipe->readable);
+    wait_queue_wake_all(&pipe->writable);
+    if (!pipe->readers && !pipe->writers) pipe->used = 0;
+}
+
+/* Blocking pipe read. The IRQ-off section covers the check and the park,
+ * so a write can never slip in between them; the park releases the CPU
+ * until the writer's wake (or the timer, which simply re-selects us). */
+static int32_t pipe_read(vfs_pipe_t *pipe, uint32_t status, void *buffer,
+                         uint32_t count) {
+    uint8_t *bytes = (uint8_t *)buffer;
+    for (;;) {
+        irqflags_t flags = irq_lock();
+        uint32_t available = pipe->head - pipe->tail;
+        if (available) {
+            uint32_t take = count < available ? count : available;
+            for (uint32_t i = 0; i < take; i++)
+                bytes[i] = pipe->data[(pipe->tail + i) % VFS_PIPE_CAPACITY];
+            pipe->tail += take;
+            wait_queue_cancel(&pipe->readable);
+            wait_queue_wake_all(&pipe->writable);
+            irq_unlock(flags);
+            return (int32_t)take;
+        }
+        if (!pipe->writers) {
+            wait_queue_cancel(&pipe->readable);
+            irq_unlock(flags);
+            return 0; /* every write end closed: end of file */
+        }
+        if (status & HAKU_O_NONBLOCK) {
+            wait_queue_cancel(&pipe->readable);
+            irq_unlock(flags);
+            return -VFS_EAGAIN;
+        }
+        wait_queue_sleep(&pipe->readable);
+        __asm {
+            sti
+            hlt
+        }
+    }
+}
+
+/* Blocking pipe write. Writes are all-or-nothing: a count larger than the
+ * free space waits until it fits (Haku pipes are only used for short
+ * command pipelines). */
+static int32_t pipe_write(vfs_pipe_t *pipe, uint32_t status,
+                          const void *buffer, uint32_t count) {
+    const uint8_t *bytes = (const uint8_t *)buffer;
+    for (;;) {
+        irqflags_t flags = irq_lock();
+        uint32_t space = VFS_PIPE_CAPACITY - (pipe->head - pipe->tail);
+        if (!pipe->readers) {
+            irq_unlock(flags);
+            /* No reader will ever drain it: Linux raises SIGPIPE and
+             * reports EPIPE, and so does Haku. */
+            scheduler_kill_pid(scheduler_current_pid(), HAKU_SIGPIPE);
+            return -VFS_EPIPE;
+        }
+        if (count <= space) {
+            for (uint32_t i = 0; i < count; i++)
+                pipe->data[(pipe->head + i) % VFS_PIPE_CAPACITY] = bytes[i];
+            pipe->head += count;
+            wait_queue_cancel(&pipe->writable);
+            wait_queue_wake_all(&pipe->readable);
+            irq_unlock(flags);
+            return (int32_t)count;
+        }
+        if (count > VFS_PIPE_CAPACITY) {
+            wait_queue_cancel(&pipe->writable);
+            irq_unlock(flags);
+            return -VFS_EINVAL;
+        }
+        if (status & HAKU_O_NONBLOCK) {
+            wait_queue_cancel(&pipe->writable);
+            irq_unlock(flags);
+            return -VFS_EAGAIN;
+        }
+        wait_queue_sleep(&pipe->writable);
+        __asm {
+            sti
+            hlt
+        }
+    }
+}
 
 static int pid_valid(uint32_t pid) {
     return pid > 0 && pid <= VFS_MAX_PROCESSES;
@@ -84,10 +221,16 @@ static vfs_ofd_t *fd_ofd(uint32_t pid, uint32_t fd) {
 static int32_t ofd_release(vfs_ofd_t *ofd) {
     int32_t closed = 1;
     if (--ofd->refs == 0) {
-        if (ofd->kind == VFS_OFD_FILE) {
+        if (ofd->kind == VFS_OFD_DIR) {
+            closed = ofd->ops->closedir(ofd->backend);
+        } else if (ofd->kind == VFS_OFD_FILE) {
             /* ofd_release may be called with or without the lock held; to keep
              * the backend calls serialized, callers must take vfs_lock before. */
             closed = ofd->ops->close(ofd->backend);
+        } else if (ofd->kind == VFS_OFD_PIPE) {
+            irqflags_t flags = irq_lock();
+            pipe_drop_end(ofd->pipe, ofd->accmode != VFS_O_RDONLY);
+            irq_unlock(flags);
         }
         memset(ofd, 0, sizeof(*ofd));
     }
@@ -116,7 +259,8 @@ int vfs_register_fs(const vfs_fs_ops_t *ops) {
     if (!ops || !ops->name || !ops->mount || !ops->open || !ops->close ||
         !ops->read || !ops->write || !ops->seek || !ops->unlink ||
         !ops->rename || !ops->mkdir || !ops->rmdir || !ops->stat ||
-        !ops->fstat)
+        !ops->fstat || !ops->opendir || !ops->readdir || !ops->closedir ||
+        !ops->truncate)
         return 0;
     for (uint32_t i = 0; i < fs_count; i++) {
         if (fs_table[i] == ops || name_equal(fs_table[i]->name, ops->name))
@@ -157,6 +301,7 @@ int32_t vfs_mount_root_flags(const char *name, uint32_t flags) {
 void vfs_init(void) {
     memset(descriptors, 0, sizeof(descriptors));
     memset(ofd_table, 0, sizeof(ofd_table));
+    memset(pipes, 0, sizeof(pipes));
     fs_count = 0;
     root_fs = 0;
     root_read_only = 0;
@@ -245,6 +390,13 @@ int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
         ((flags & VFS_O_TRUNC) &&
          (flags & VFS_O_ACCMODE) == VFS_O_RDONLY))
         return -VFS_EINVAL;
+    /* A directory opens for enumeration only: creation and truncation do
+     * not apply to it. */
+    if (flags & VFS_O_DIRECTORY) {
+        if (flags & (VFS_O_CREAT | VFS_O_EXCL | VFS_O_TRUNC))
+            return -VFS_EINVAL;
+        return vfs_opendir(pid, path);
+    }
     spin_lock(&vfs_lock);
     if (root_read_only &&
         ((flags & VFS_O_ACCMODE) != VFS_O_RDONLY ||
@@ -277,6 +429,7 @@ int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
     ofd->kind = VFS_OFD_FILE;
     ofd->ops = root_fs;
     ofd->accmode = flags & VFS_O_ACCMODE;
+    ofd->status = flags & (VFS_O_APPEND | HAKU_O_NONBLOCK);
     ofd->backend = handle;
     ofd->refs = 1;
     ofd->used = 1;
@@ -375,6 +528,16 @@ int32_t vfs_read(uint32_t pid, uint32_t fd, void *buffer, uint32_t count) {
         spin_unlock(&vfs_lock);
         return -VFS_EBADF;
     }
+    if (ofd->kind == VFS_OFD_DIR) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EISDIR;
+    }
+    if (ofd->kind == VFS_OFD_PIPE) {
+        vfs_pipe_t *pipe = &pipes[ofd->pipe];
+        uint32_t status = ofd->status;
+        spin_unlock(&vfs_lock);
+        return pipe_read(pipe, status, buffer, count);
+    }
     if (ofd->kind == VFS_OFD_DEVICE) {
         /* Devices may block (console input), so the VFS lock is dropped
          * before calling them. */
@@ -407,9 +570,26 @@ int32_t vfs_write(uint32_t pid, uint32_t fd, const void *buffer,
         spin_unlock(&vfs_lock);
         return -VFS_EBADF;
     }
+    if (ofd->kind == VFS_OFD_DIR) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EISDIR;
+    }
+    if (ofd->kind == VFS_OFD_PIPE) {
+        vfs_pipe_t *pipe = &pipes[ofd->pipe];
+        uint32_t status = ofd->status;
+        spin_unlock(&vfs_lock);
+        return pipe_write(pipe, status, buffer, count);
+    }
     if (ofd->kind == VFS_OFD_FILE && root_read_only) {
         spin_unlock(&vfs_lock);
         return -VFS_EROFS;
+    }
+    if (ofd->kind == VFS_OFD_FILE && (ofd->status & VFS_O_APPEND)) {
+        uint32_t position = 0;
+        /* fcntl(F_SETFL, O_APPEND) must take effect on a description that
+         * was opened without it: reposition to the end before every
+         * write. A backend that cannot seek simply writes at its cursor. */
+        ofd->ops->seek(ofd->backend, 0, 2u, &position);
     }
     if (ofd->kind == VFS_OFD_DEVICE) {
         device = ofd->device;
@@ -437,7 +617,7 @@ int32_t vfs_seek(uint32_t pid, uint32_t fd, int32_t offset,
     }
     if (ofd->kind != VFS_OFD_FILE) {
         spin_unlock(&vfs_lock);
-        return -VFS_EINVAL;
+        return -VFS_ESPIPE;
     }
     moved = ofd->ops->seek(ofd->backend, offset, whence, &position);
     spin_unlock(&vfs_lock);
@@ -556,4 +736,337 @@ void vfs_close_all(uint32_t pid) {
         ofd_release(&ofd_table[slot->ofd]);
         spin_unlock(&vfs_lock);
     }
+}
+
+int32_t vfs_opendir(uint32_t pid, const char *path) {
+    vfs_fd_t *slot;
+    vfs_ofd_t *ofd;
+    uint32_t fd;
+    int ofd_index;
+    void *handle = 0;
+    int32_t opened;
+    if (!pid_valid(pid) || !path) return -VFS_EINVAL;
+    spin_lock(&vfs_lock);
+    for (fd = VFS_FIRST_FILE_FD; fd < VFS_FD_COUNT; fd++)
+        if (!descriptors[pid - 1u][fd].used) break;
+    if (fd == VFS_FD_COUNT) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EMFILE;
+    }
+    ofd_index = ofd_alloc();
+    if (ofd_index < 0) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EMFILE;
+    }
+    opened = root_fs->opendir(path, &handle);
+    if (opened != 1) {
+        spin_unlock(&vfs_lock);
+        return opened;
+    }
+    ofd = &ofd_table[ofd_index];
+    ofd->kind = VFS_OFD_DIR;
+    ofd->ops = root_fs;
+    ofd->backend = handle;
+    ofd->accmode = VFS_O_RDONLY;
+    ofd->status = 0;
+    ofd->dir_index = 0;
+    {
+        uint32_t length = (uint32_t)strlen(path);
+        if (length >= sizeof(ofd->dir_path))
+            length = sizeof(ofd->dir_path) - 1u;
+        memcpy(ofd->dir_path, path, length);
+        ofd->dir_path[length] = 0;
+    }
+    ofd->refs = 1;
+    ofd->used = 1;
+    slot = &descriptors[pid - 1u][fd];
+    slot->ofd = (uint32_t)ofd_index;
+    slot->used = 1;
+    spin_unlock(&vfs_lock);
+    return (int32_t)fd;
+}
+
+int32_t vfs_getdents(uint32_t pid, uint32_t fd, void *buffer, uint32_t count) {
+    vfs_ofd_t *ofd;
+    vfs_dirent_t entry;
+    uint32_t next;
+    uint32_t used = 0;
+    int got;
+    if (!buffer || count < VFS_DIRENT_RECORD_MAX) return -VFS_EINVAL;
+    spin_lock(&vfs_lock);
+    ofd = fd_ofd(pid, fd);
+    if (!ofd) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EBADF;
+    }
+    if (ofd->kind != VFS_OFD_DIR) {
+        spin_unlock(&vfs_lock);
+        return -VFS_ENOTDIR;
+    }
+    for (;;) {
+        uint32_t namelen;
+        uint32_t reclen;
+        if (count - used < 8u) break;
+        got = ofd->ops->readdir(ofd->backend, ofd->dir_index, &entry, &next);
+        if (got != 1) {
+            if (got < 0 && used == 0) {
+                spin_unlock(&vfs_lock);
+                return got;
+            }
+            break;
+        }
+        namelen = 0;
+        while (entry.name[namelen] && namelen < VFS_DIRENT_NAME_MAX - 1u)
+            namelen++;
+        reclen = (19u + namelen + 8u) & ~7u;
+        if (reclen > count - used) break; /* did not fit: leave it unconsumed */
+        ofd->dir_index = next;
+        {
+            uint8_t *rec = (uint8_t *)buffer + used;
+            uint32_t ino = (uint32_t)entry.ino;
+            for (uint32_t i = 0; i < 4; i++) rec[i] = (uint8_t)(ino >> (8 * i));
+            for (uint32_t i = 0; i < 4; i++) rec[4 + i] = 0;
+            for (uint32_t i = 0; i < 4; i++) rec[8 + i] = (uint8_t)(ofd->dir_index >> (8 * i));
+            for (uint32_t i = 0; i < 4; i++) rec[12 + i] = 0;
+            rec[16] = (uint8_t)(reclen & 0xFFu);
+            rec[17] = (uint8_t)((reclen >> 8) & 0xFFu);
+            rec[18] = (uint8_t)entry.type;
+            memcpy(rec + 19, entry.name, namelen + 1);
+            memset(rec + 19 + namelen + 1, 0, reclen - (19u + namelen + 1u));
+        }
+        used += reclen;
+    }
+    spin_unlock(&vfs_lock);
+    return (int32_t)used;
+}
+
+int32_t vfs_pipe(uint32_t pid, uint32_t *fds) {
+    int pipe_index;
+    int reader_ofd;
+    int writer_ofd;
+    uint32_t read_fd;
+    uint32_t write_fd;
+    vfs_pipe_t *pipe;
+    if (!pid_valid(pid) || !fds) return -VFS_EINVAL;
+    spin_lock(&vfs_lock);
+    for (read_fd = 0; read_fd < VFS_FD_COUNT; read_fd++)
+        if (!descriptors[pid - 1u][read_fd].used) break;
+    if (read_fd == VFS_FD_COUNT) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EMFILE;
+    }
+    for (write_fd = read_fd + 1u; write_fd < VFS_FD_COUNT; write_fd++)
+        if (!descriptors[pid - 1u][write_fd].used) break;
+    if (write_fd == VFS_FD_COUNT) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EMFILE;
+    }
+    pipe_index = pipe_alloc();
+    if (pipe_index < 0) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EMFILE;
+    }
+    reader_ofd = ofd_alloc();
+    if (reader_ofd < 0) {
+        pipes[pipe_index].used = 0;
+        spin_unlock(&vfs_lock);
+        return -VFS_EMFILE;
+    }
+    /* ofd_alloc only finds a free slot; mark it used before asking for
+     * the second one, or both ends would share a single description. */
+    memset(&ofd_table[reader_ofd], 0, sizeof(ofd_table[reader_ofd]));
+    ofd_table[reader_ofd].kind = VFS_OFD_PIPE;
+    ofd_table[reader_ofd].pipe = (uint32_t)pipe_index;
+    ofd_table[reader_ofd].accmode = VFS_O_RDONLY;
+    ofd_table[reader_ofd].refs = 1;
+    ofd_table[reader_ofd].used = 1;
+    writer_ofd = ofd_alloc();
+    if (writer_ofd < 0) {
+        ofd_table[reader_ofd].used = 0;
+        pipes[pipe_index].used = 0;
+        spin_unlock(&vfs_lock);
+        return -VFS_EMFILE;
+    }
+    /* Two descriptions, not one shared one: closing the write end must
+     * drop the writer count even while the reader stays open, otherwise
+     * a reader would never see end of file. */
+    pipe = &pipes[pipe_index];
+    memset(pipe, 0, sizeof(*pipe));
+    pipe->used = 1;
+    pipe->readers = 1;
+    pipe->writers = 1;
+    memset(&ofd_table[writer_ofd], 0, sizeof(ofd_table[writer_ofd]));
+    ofd_table[writer_ofd].kind = VFS_OFD_PIPE;
+    ofd_table[writer_ofd].pipe = (uint32_t)pipe_index;
+    ofd_table[writer_ofd].accmode = VFS_O_WRONLY;
+    ofd_table[writer_ofd].refs = 1;
+    ofd_table[writer_ofd].used = 1;
+    descriptors[pid - 1u][read_fd].ofd = (uint32_t)reader_ofd;
+    descriptors[pid - 1u][read_fd].used = 1;
+    descriptors[pid - 1u][write_fd].ofd = (uint32_t)writer_ofd;
+    descriptors[pid - 1u][write_fd].used = 1;
+    spin_unlock(&vfs_lock);
+    fds[0] = read_fd;
+    fds[1] = write_fd;
+    return 1;
+}
+
+int32_t vfs_dup_min(uint32_t pid, uint32_t fd, uint32_t minfd) {
+    vfs_ofd_t *ofd;
+    uint32_t newfd;
+    if (!pid_valid(pid) || fd >= VFS_FD_COUNT || minfd >= VFS_FD_COUNT)
+        return -VFS_EINVAL;
+    spin_lock(&vfs_lock);
+    ofd = fd_ofd(pid, fd);
+    if (!ofd) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EBADF;
+    }
+    for (newfd = minfd; newfd < VFS_FD_COUNT; newfd++)
+        if (!descriptors[pid - 1u][newfd].used) break;
+    if (newfd == VFS_FD_COUNT) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EMFILE;
+    }
+    ofd->refs++;
+    descriptors[pid - 1u][newfd].ofd = descriptors[pid - 1u][fd].ofd;
+    descriptors[pid - 1u][newfd].used = 1;
+    spin_unlock(&vfs_lock);
+    return (int32_t)newfd;
+}
+
+int32_t vfs_get_status_flags(uint32_t pid, uint32_t fd) {
+    vfs_ofd_t *ofd;
+    uint32_t status = 0;
+    if (!pid_valid(pid) || fd >= VFS_FD_COUNT) return -VFS_EBADF;
+    spin_lock(&vfs_lock);
+    ofd = fd_ofd(pid, fd);
+    if (!ofd) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EBADF;
+    }
+    status = ofd->accmode | (ofd->status & (VFS_O_APPEND | HAKU_O_NONBLOCK));
+    spin_unlock(&vfs_lock);
+    return (int32_t)status;
+}
+
+int32_t vfs_set_status_flags(uint32_t pid, uint32_t fd, uint32_t flags) {
+    vfs_ofd_t *ofd;
+    if (!pid_valid(pid) || fd >= VFS_FD_COUNT) return -VFS_EBADF;
+    if (flags & ~(VFS_O_APPEND | HAKU_O_NONBLOCK)) {
+        /* F_GETLK/F_SETLK/F_SETLKW have no POSIX record-lock support yet. */
+        return -VFS_ENOLCK;
+    }
+    spin_lock(&vfs_lock);
+    ofd = fd_ofd(pid, fd);
+    if (!ofd) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EBADF;
+    }
+    ofd->status = flags;
+    spin_unlock(&vfs_lock);
+    return 1;
+}
+
+int32_t vfs_ftruncate(uint32_t pid, uint32_t fd, uint32_t length) {
+    vfs_ofd_t *ofd;
+    int32_t moved;
+    if (!pid_valid(pid) || fd >= VFS_FD_COUNT) return -VFS_EBADF;
+    spin_lock(&vfs_lock);
+    ofd = fd_ofd(pid, fd);
+    if (!ofd) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EBADF;
+    }
+    if (ofd->kind != VFS_OFD_FILE) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EISDIR;
+    }
+    if (ofd->accmode == VFS_O_RDONLY) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EACCES;
+    }
+    if (!ofd->ops->truncate) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EOPNOTSUPP;
+    }
+    moved = ofd->ops->truncate(ofd->backend, length);
+    spin_unlock(&vfs_lock);
+    return moved;
+}
+
+uint32_t vfs_poll_events(uint32_t pid, uint32_t fd, int for_write) {
+    vfs_ofd_t *ofd;
+    vfs_pipe_t *pipe;
+    uint32_t events = 0;
+    if (!pid_valid(pid) || fd >= VFS_FD_COUNT) return VFS_POLLNVAL;
+    spin_lock(&vfs_lock);
+    ofd = fd_ofd(pid, fd);
+    if (!ofd) {
+        spin_unlock(&vfs_lock);
+        return VFS_POLLNVAL;
+    }
+    if (ofd->kind == VFS_OFD_DEVICE) {
+        int ready = 0;
+        if (ofd->device->readable) ready = ofd->device->readable();
+        spin_unlock(&vfs_lock);
+        return for_write ? HAKU_POLLOUT : (ready ? HAKU_POLLIN : 0);
+    }
+    if (ofd->kind == VFS_OFD_PIPE) {
+        irqflags_t irq_flags;
+        pipe = &pipes[ofd->pipe];
+        irq_flags = irq_lock();
+        if (for_write) {
+            if (!pipe->readers) events = HAKU_POLLERR;
+            else events = (pipe->head - pipe->tail) < VFS_PIPE_CAPACITY ? HAKU_POLLOUT : 0;
+        } else {
+            if (!pipe->writers) events = HAKU_POLLIN | HAKU_POLLHUP;
+            else events = (pipe->head - pipe->tail) > 0 ? HAKU_POLLIN : 0;
+        }
+        irq_unlock(irq_flags);
+        spin_unlock(&vfs_lock);
+        return events;
+    }
+    if (ofd->kind == VFS_OFD_DIR) {
+        spin_unlock(&vfs_lock);
+        return for_write ? HAKU_POLLOUT : HAKU_POLLIN;
+    }
+    if (ofd->kind == VFS_OFD_FILE) {
+        if (for_write) { spin_unlock(&vfs_lock); return HAKU_POLLOUT; }
+        spin_unlock(&vfs_lock);
+        return HAKU_POLLIN;
+    }
+    spin_unlock(&vfs_lock);
+    return VFS_POLLNVAL;
+}
+
+int vfs_is_console(uint32_t pid, uint32_t fd) {    vfs_ofd_t *ofd;
+    int result = 0;
+    spin_lock(&vfs_lock);
+    ofd = fd_ofd(pid, fd);
+    if (ofd && ofd->kind == VFS_OFD_DEVICE) result = 1;
+    spin_unlock(&vfs_lock);
+    return result;
+}
+
+/* The canonical path behind a directory descriptor, so the *at family can
+ * resolve a relative name against the descriptor the caller passed. */
+int32_t vfs_dir_path(uint32_t pid, uint32_t fd, char out[VFS_PATH_MAX]) {
+    vfs_ofd_t *ofd;
+    int32_t result;
+    if (!out) return -VFS_EINVAL;
+    spin_lock(&vfs_lock);
+    ofd = fd_ofd(pid, fd);
+    if (!ofd) {
+        spin_unlock(&vfs_lock);
+        return -VFS_EBADF;
+    }
+    if (ofd->kind != VFS_OFD_DIR) {
+        spin_unlock(&vfs_lock);
+        return -VFS_ENOTDIR;
+    }
+    memcpy(out, ofd->dir_path, VFS_PATH_MAX);
+    result = 1;
+    spin_unlock(&vfs_lock);
+    return result;
 }

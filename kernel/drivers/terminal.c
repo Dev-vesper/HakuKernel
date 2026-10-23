@@ -70,6 +70,7 @@ int32_t terminal_write_bytes(const void *buffer, uint32_t count,
 
 void terminal_input_push(char c) {
     uint32_t next = (input_head + 1u) & (TERMINAL_BUF_SIZE - 1u);
+
     if (next == input_tail) return; /* full, drop */
     input_buf[input_head] = (uint8_t)c;
     input_head = next;
@@ -81,6 +82,13 @@ int terminal_input_poll(void) {
     uint8_t ch = input_buf[input_tail];
     input_tail = (input_tail + 1u) & (TERMINAL_BUF_SIZE - 1u);
     return (int)ch;
+}
+
+int terminal_input_available(void) {
+    irqflags_t flags = irq_lock();
+    int available = input_head != input_tail;
+    irq_unlock(flags);
+    return available;
 }
 
 char terminal_getchar(void) {

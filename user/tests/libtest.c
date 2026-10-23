@@ -41,6 +41,150 @@ static void install(int sig, unsigned int handler, unsigned int flags,
     expect(sigaction(sig, &action, NULL) == 0, "sigaction");
 }
 
+/* The filesystem and descriptor ABI a shell needs: the *at family, a
+ * working directory, directory enumeration, pipes, poll, fcntl, termios,
+ * limits, and the small process-control calls. */
+static void test_filesystem_abi(void) {
+    char cwd[64];
+    char buffer[64];
+    char name[16];
+    unsigned char random_bytes[8];
+    haku_stat64_t status;
+    rlimit_t limits;
+    termios_t attributes;
+    struct winsize window;
+    struct pollfd poll_fds[2];
+    struct dirent *entry;
+    DIR *dir;
+    int fds[2];
+    int fd;
+    int duplicate;
+    int found;
+
+    unlink("ABI0.TXT");
+    unlink("ABI1.TXT");
+    unlink("ABI2.TXT");
+    unlink("ABI3.TXT");
+    unlink("ABIDIR/ABI0.TXT");
+    unlink("ABIDIR/ABI1.TXT");
+    rmdir("ABIDIR");
+
+    expect(mkdir("ABIDIR") == 0, "mkdir for the *at tests");
+    fd = open("ABIDIR", O_RDONLY | O_DIRECTORY);
+    expect(fd >= 0, "open O_DIRECTORY");
+    if (fd >= 0) {
+        int inside = openat(fd, "ABI0.TXT", O_CREAT | O_RDWR, 0644);
+        expect(inside >= 0, "openat with a dirfd");
+        if (inside >= 0) {
+            expect(write(inside, "hello", 5) == 5, "write after openat");
+            expect(ftruncate(inside, 2) == 0, "ftruncate shrink");
+            expect(lseek(inside, 0, SEEK_END) == 2, "size after ftruncate");
+            close(inside);
+        }
+        expect(stat("ABIDIR/ABI0.TXT", &status) == 0, "stat inside a dir");
+        expect(status.st_size == 2, "stat sees the truncated size");
+        expect(truncate("ABIDIR/ABI0.TXT", 6) == 0, "truncate grow");
+        expect(stat("ABIDIR/ABI0.TXT", &status) == 0 &&
+               status.st_size == 6, "truncate grew with zeros");
+        expect(renameat(fd, "ABI0.TXT", fd, "ABI1.TXT") == 0, "renameat");
+        expect(unlinkat(fd, "ABI1.TXT", 0) == 0, "unlinkat");
+        expect(mkdirat(fd, "SUB", 0755) == 0, "mkdirat");
+        expect(unlinkat(fd, "SUB", AT_REMOVEDIR) == 0, "unlinkat rmdir");
+        close(fd);
+    }
+
+    /* A working directory changes what a relative name means. */
+    expect(chdir("ABIDIR") == 0, "chdir");
+    expect(getcwd(cwd, sizeof(cwd)) != 0 && strcmp(cwd, "/ABIDIR") == 0,
+           "getcwd after chdir");
+    fd = open("ABI1.TXT", O_CREAT | O_WRONLY, 0644);
+    expect(fd >= 0, "create relative to the working directory");
+    if (fd >= 0) close(fd);
+    expect(access("ABI1.TXT", F_OK) == 0, "access F_OK");
+    expect(access("ABI1.TXT", X_OK) != 0, "access X_OK refused");
+    expect(chdir("..") == 0, "chdir back");
+    expect(getcwd(cwd, sizeof(cwd)) != 0 && strcmp(cwd, "/") == 0,
+           "getcwd at the root");
+    expect(unlink("ABIDIR/ABI1.TXT") == 0, "unlink through a path");
+    expect(rmdir("ABIDIR") == 0, "rmdir");
+
+    /* getdents64 through the directory API. */
+    found = 0;
+    dir = opendir("/");
+    if (dir) {
+        while ((entry = readdir(dir)) != 0) {
+            if (strcmp(entry->d_name, "HAKU.ELF") == 0) found = 1;
+        }
+        closedir(dir);
+    }
+    expect(found == 1, "getdents64 lists HAKU.ELF");
+
+    /* Pipes: write, readiness, read, and end of file. */
+    expect(pipe(fds) == 0, "pipe");
+    expect(write(fds[1], "ping", 4) == 4, "pipe write");
+    poll_fds[0].fd = fds[0];
+    poll_fds[0].events = POLLIN;
+    poll_fds[0].revents = 0;
+    poll_fds[1].fd = fds[1];
+    poll_fds[1].events = POLLOUT;
+    poll_fds[1].revents = 0;
+    expect(poll(poll_fds, 2, 0) == 2, "poll reports two ready descriptors");
+    expect((poll_fds[0].revents & POLLIN) != 0, "poll POLLIN on the pipe");
+    expect(read(fds[0], buffer, 4) == 4 && buffer[0] == 'p', "pipe read");
+    expect(close(fds[1]) == 0, "close the write end");
+    expect(read(fds[0], buffer, 4) == 0, "pipe end of file");
+    close(fds[0]);
+
+    /* dup3 and fcntl. */
+    fd = open("ABI2.TXT", O_CREAT | O_RDWR, 0644);
+    expect(fd >= 0, "open for dup3");
+    if (fd >= 0) {
+        duplicate = dup3(fd, 7, 0);
+        expect(duplicate == 7, "dup3 onto a fixed descriptor");
+        if (duplicate >= 0) close(duplicate);
+        expect(dup3(fd, fd, 0) == -1 && errno == EINVAL,
+               "dup3 rejects identical descriptors");
+        close(fd);
+        unlink("ABI2.TXT");
+    }
+    fd = open("ABI3.TXT", O_CREAT | O_RDWR, 0644);
+    expect(fd >= 0, "open for fcntl");
+    if (fd >= 0) {
+        expect(fcntl(fd, F_SETFL, O_APPEND) == 0, "fcntl F_SETFL");
+        expect((fcntl(fd, F_GETFL, 0) & O_APPEND) != 0, "fcntl F_GETFL");
+        duplicate = fcntl(fd, F_DUPFD, 5);
+        expect(duplicate >= 5, "fcntl F_DUPFD");
+        if (duplicate >= 0) close(duplicate);
+        close(fd);
+        unlink("ABI3.TXT");
+    }
+
+    /* The console answers the termios and window-size requests. */
+    expect(tcgetattr(1, &attributes) == 0, "tcgetattr");
+    expect((attributes.c_lflag & ECHO) != 0, "termios reports ECHO");
+    expect(tcsetattr(1, 0, &attributes) == 0, "tcsetattr");
+    expect(ioctl(1, TIOCGWINSZ, &window) == 0 && window.ws_col == 80,
+           "TIOCGWINSZ");
+    expect(isatty(1) == 1, "isatty(1)");
+    expect(isatty(-1) == 0, "isatty(-1)");
+
+    /* Limits, process name, persona, and randomness. */
+    expect(getrlimit(RLIMIT_NOFILE, &limits) == 0 && limits.rlim_cur == 8,
+           "getrlimit NOFILE");
+    limits.rlim_cur = 4;
+    expect(setrlimit(RLIMIT_NOFILE, &limits) == 0, "setrlimit");
+    memcpy(name, "haku-test", 10);
+    expect(prctl(PR_SET_NAME, (unsigned int)name, 0, 0, 0) == 0,
+           "PR_SET_NAME");
+    memset(name, 0, sizeof(name));
+    expect(prctl(PR_GET_NAME, (unsigned int)name, 0, 0, 0) == 0 &&
+               strcmp(name, "haku-test") == 0, "PR_GET_NAME");
+    expect(personality(PER_QUERY) == PER_LINUX, "personality query");
+    expect(getrandom(random_bytes, sizeof(random_bytes), 0) ==
+               (int)sizeof(random_bytes), "getrandom");
+    expect(sched_yield() == 0, "sched_yield");
+}
+
 int main(void) {
     char buffer[64];
     char copy[32];
@@ -517,10 +661,13 @@ int main(void) {
         }
     }
 
+    test_filesystem_abi();
+
     if (failures) {
         printf("USER-LIB-FAIL: %d checks failed\n", failures);
         return 1;
     }
+    printf("USER-FS-ABI-OK: openat getdents64 chdir pipe poll fcntl termios\n");
     printf("USER-SIGNAL-OK: kill tkill tgkill sigaction sigprocmask\n");
     printf("USER-MMAP-OK: mmap2 mprotect mremap madvise set_thread_area\n");
     printf("USER-FUTEX-OK: futex wait wake timeout\n");

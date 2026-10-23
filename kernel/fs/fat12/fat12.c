@@ -1323,3 +1323,124 @@ int fat12_file_fstat(fat12_file_t *file, fat12_stat_t *out) {
     out->is_dir = 0;
     return 1;
 }
+
+/* Render an 8.3 directory name as "NAME.EXT" (NUL-terminated, 13 bytes).
+ * The 0x05 escape for a leading 0xE5 is translated back, matching what
+ * make_short_name writes. */
+static void format_short_name(const uint8_t entry[11], char out[13]) {
+    uint32_t base = 8;
+    uint32_t ext = 3;
+    uint32_t length = 0;
+    while (base > 0 && entry[base - 1u] == ' ') base--;
+    while (ext > 0 && entry[8u + ext - 1u] == ' ') ext--;
+    for (uint32_t i = 0; i < base; i++) {
+        char c = (char)entry[i];
+        if (i == 0 && (uint8_t)c == 0x05u) c = (char)0xE5;
+        out[length++] = c;
+    }
+    if (ext) {
+        out[length++] = '.';
+        for (uint32_t i = 0; i < ext; i++) out[length++] = (char)entry[8u + i];
+    }
+    out[length] = 0;
+}
+
+int fat12_dir_open(const char *path, fat12_dir_t *dir) {
+    int is_dir = 0;
+    int have_entry = 0;
+    uint16_t cluster = 0;
+    uint32_t lba = 0;
+    uint32_t off = 0;
+    uint8_t short_name[11];
+    uint8_t entry[32];
+    int resolved;
+    if (!dir) return -FAT12_ERR_INVALID;
+    dir->opened = 0;
+    if (!volume.mounted) return -FAT12_ERR_INVALID;
+    resolved = path_resolve(path, &is_dir, &cluster, &have_entry, &lba, &off,
+                            short_name, entry);
+    if (resolved != 1) return resolved;
+    if (!is_dir) return -FAT12_ERR_NOT_DIR;
+    dir->first_cluster = cluster;
+    dir->opened = 1;
+    return 1;
+}
+
+int fat12_dir_read(fat12_dir_t *dir, uint32_t index, fat12_stat_t *out,
+                   char name[13], uint32_t *next_index) {
+    uint32_t seen = 0;
+    uint32_t slot = 0;
+    if (!dir || !dir->opened || !out || !name || !next_index)
+        return -FAT12_ERR_INVALID;
+    for (;; slot++) {
+        uint32_t lba;
+        int located;
+        if (dir->first_cluster == 0 &&
+            slot * FAT12_ENTRIES_PER_SECTOR >= volume.root_entries)
+            return 0;
+        located = dir_sector_lba((uint16_t)dir->first_cluster, slot, &lba);
+        if (located == 0) return 0;
+        if (located < 0) return -FAT12_ERR_IO;
+        if (!read_volume_sector(lba, sector_buffer)) return -FAT12_ERR_IO;
+        for (uint32_t offset = 0; offset < FAT12_SECTOR_SIZE; offset += 32u) {
+            const uint8_t *entry = &sector_buffer[offset];
+            if (entry[0] == 0) return 0;
+            if (entry[0] == 0xE5u ||
+                (entry[11] & FAT12_ATTR_LONG_NAME) == FAT12_ATTR_LONG_NAME ||
+                (entry[11] & FAT12_ATTR_VOLUME))
+                continue;
+            if (entry[0] == '.' && (entry[1] == ' ' || entry[1] == '.'))
+                continue;
+            if (seen == index) {
+                format_short_name(entry, name);
+                out->size = read_u32(entry + 28);
+                out->ino = slot * FAT12_ENTRIES_PER_SECTOR +
+                           offset / 32u + 1u;
+                out->is_dir = (entry[11] & FAT12_ATTR_DIRECTORY) != 0;
+                *next_index = index + 1u;
+                return 1;
+            }
+            seen++;
+        }
+    }
+}
+
+int fat12_file_truncate(fat12_file_t *file, uint32_t size) {
+    static const uint8_t zeros[FAT12_SECTOR_SIZE];
+    int refreshed;
+    int attached;
+    if (!file || !file->opened || !(file->flags & FAT12_OPEN_WRITE))
+        return -FAT12_ERR_INVALID;
+    refreshed = refresh_file(file);
+    if (refreshed < 0) return refreshed;
+    attached = (refreshed == 1);
+    if (size == file->size) return 1;
+    if (size < file->size) {
+        if (!truncate_chain_to(file, size)) return -FAT12_ERR_IO;
+        file->size = size;
+        if (file->position > size) file->position = size;
+        if (attached && !persist_file(file)) return -FAT12_ERR_IO;
+        return 1;
+    }
+    {
+        uint32_t offset = file->size;
+        while (offset < size) {
+            uint32_t amount = size - offset;
+            uint32_t done = 0;
+            int status;
+            if (amount > sizeof(zeros)) amount = sizeof(zeros);
+            status = write_file_bytes(file, offset, zeros, amount, &done);
+            offset += done;
+            if (status != 1) {
+                /* Keep only the zeroed prefix, exactly like a failed
+                 * write: the entry never claims a hole. */
+                file->size = offset;
+                if (attached) persist_file(file);
+                return -FAT12_ERR_IO;
+            }
+        }
+        file->size = size;
+        if (attached && !persist_file(file)) return -FAT12_ERR_IO;
+        return 1;
+    }
+}

@@ -167,6 +167,52 @@ static int32_t fat12_vfs_fstat(void *handle, vfs_stat_t *out) {
     return 1;
 }
 
+static int32_t fat12_vfs_opendir(const char *path, void **handle_out) {
+    fat12_dir_t *dir;
+    int opened;
+    if (!handle_out) return -VFS_EINVAL;
+    *handle_out = 0;
+    dir = (fat12_dir_t *)kmalloc(sizeof(fat12_dir_t));
+    if (!dir) return -VFS_ENOSPC;
+    opened = fat12_dir_open(path, dir);
+    if (opened != 1) {
+        kfree(dir);
+        return fat12_map_errno(opened);
+    }
+    *handle_out = dir;
+    return 1;
+}
+
+static int32_t fat12_vfs_readdir(void *handle, uint32_t index,
+                                 vfs_dirent_t *out, uint32_t *next_index) {
+    fat12_stat_t st;
+    char name[13];
+    int read;
+    if (!handle || !out || !next_index) return -VFS_EINVAL;
+    read = fat12_dir_read((fat12_dir_t *)handle, index, &st, name, next_index);
+    if (read == 0) return 0;
+    if (read != 1) return fat12_map_errno(read);
+    memset(out, 0, sizeof(*out));
+    out->ino = st.ino;
+    out->type = st.is_dir ? VFS_DT_DIR : VFS_DT_REG;
+    memcpy(out->name, name, sizeof(name));
+    return 1;
+}
+
+static int32_t fat12_vfs_closedir(void *handle) {
+    if (!handle) return -VFS_EINVAL;
+    kfree(handle);
+    return 1;
+}
+
+static int32_t fat12_vfs_truncate(void *handle, uint32_t size) {
+    int truncated;
+    if (!handle) return -VFS_EINVAL;
+    truncated = fat12_file_truncate((fat12_file_t *)handle, size);
+    if (truncated != 1) return fat12_map_errno(truncated);
+    return 1;
+}
+
 const vfs_fs_ops_t fat12_fs_ops = {
     "fat12",
     fat12_vfs_mount,
@@ -181,4 +227,8 @@ const vfs_fs_ops_t fat12_fs_ops = {
     fat12_vfs_rmdir,
     fat12_vfs_stat,
     fat12_vfs_fstat,
+    fat12_vfs_opendir,
+    fat12_vfs_readdir,
+    fat12_vfs_closedir,
+    fat12_vfs_truncate,
 };
