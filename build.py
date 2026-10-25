@@ -538,6 +538,7 @@ def main():
             "secondary-master LBA28", # spare disk on the second IDE channel
             "ATA-RECOVERY-OK",   # software reset + reread after a recovery
             "ATA-MULTI-OK",     # second channel device answers sector reads
+            "ATA-CACHE-OK",     # repeated sector read served from the cache
             "FAT12-MOUNT-OK",
             "FAT12-READ-OK name=HAKU.ELF",
             "USERMODE-ENTER",# iret entered CPL 3
@@ -572,6 +573,8 @@ def main():
             "USER-MMAP-OK",  # mmap2/mprotect/mremap/madvise/set_thread_area
             "USER-FUTEX-OK", # futex wait/wake with a timeout
             "USER-FS-ABI-OK", # openat/getdents64/chdir/pipe/poll/fcntl/termios
+            "USER-ERRNO-OK", # error matrix: bad fd/pointer/path/argument
+            "SCHED-CONCURRENT-OK", # two tasks doing disk I/O at once
             "USER-LIB-OK",   # C library syscalls/strings/malloc/file I/O
             "USER-EXIT-OK status=0 pid=1",
             "SCHED-REAP-OK",

@@ -48,6 +48,21 @@
 #define ATA_CHANNEL_SECONDARY 1u
 #define ATA_MAX_DEVICES      4u
 
+/* Read cache. FAT12 walks the same metadata sectors over and over (both FAT
+ * copies, the directory chain of every path component), so a small
+ * direct-mapped cache removes most of the polling latency without adding a
+ * background flusher: writes go straight to the disk and refresh the cached
+ * copy, which keeps the cache transparent and crash-consistent with the
+ * write-through model the filesystem already documents. */
+#define ATA_CACHE_SLOTS      16u
+#define ATA_SECTOR_SIZE      512u
+
+typedef struct {
+    uint32_t lba;
+    uint8_t valid;
+    uint8_t data[ATA_SECTOR_SIZE];
+} ata_cache_slot_t;
+
 typedef struct {
     uint16_t io_base;
     uint16_t ctrl_base;
@@ -62,12 +77,75 @@ static int active_device = -1;
 static uint32_t active_sectors;
 static uint32_t device_count;
 static uint8_t device_slots[ATA_MAX_DEVICES];
-static spinlock_t ata_lock = SPINLOCK_INIT;
+static mutex_t ata_lock = MUTEX_INIT;
 static uint8_t recovery_buffer_a[512];
 static uint8_t recovery_buffer_b[512];
+static ata_cache_slot_t sector_cache[ATA_CACHE_SLOTS];
+static uint32_t cache_hits;
+static uint32_t cache_misses;
 
 static int ata_read_sectors_unlocked(uint32_t lba, uint8_t count, void *buffer);
 static ata_channel_t *ata_active(void);
+
+/* The cache belongs to whichever device is selected, so a device change
+ * throws it away rather than risk serving another disk's sectors. */
+static void cache_flush(void) {
+    for (uint32_t i = 0; i < ATA_CACHE_SLOTS; i++)
+        sector_cache[i].valid = 0;
+}
+
+static ata_cache_slot_t *cache_slot_for(uint32_t lba) {
+    return &sector_cache[lba % ATA_CACHE_SLOTS];
+}
+
+/* One sector through the cache. The caller holds the disk mutex. */
+static int cached_read_sector(uint32_t lba, void *buffer) {
+    ata_cache_slot_t *slot = cache_slot_for(lba);
+    if (slot->valid && slot->lba == lba) {
+        memcpy(buffer, slot->data, ATA_SECTOR_SIZE);
+        cache_hits++;
+        return 1;
+    }
+    if (!ata_read_sectors_unlocked(lba, 1, slot->data)) {
+        slot->valid = 0;
+        return 0;
+    }
+    slot->lba = lba;
+    slot->valid = 1;
+    memcpy(buffer, slot->data, ATA_SECTOR_SIZE);
+    cache_misses++;
+    return 1;
+}
+
+/* A write owns the sector from now on: refresh the cached copy when it is
+ * exactly one sector, otherwise drop every slot the write may have touched.
+ * A failed write also drops them, because part of the transfer may have
+ * reached the platter. */
+static void cache_after_write(uint32_t lba, uint8_t count, const void *buffer,
+                              int succeeded) {
+    if (succeeded && count == 1u) {
+        ata_cache_slot_t *slot = cache_slot_for(lba);
+        slot->lba = lba;
+        slot->valid = 1;
+        memcpy(slot->data, buffer, ATA_SECTOR_SIZE);
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++)
+        cache_slot_for(lba + i)->valid = 0;
+}
+
+/* The bounds checks the public entry points share: an out-of-range request
+ * must fail before it can reach the cache or the drive. */
+static int ata_range_valid(uint32_t lba, uint32_t count) {
+    ata_channel_t *channel = ata_active();
+    if (!channel || !count || !active_sectors || lba >= active_sectors ||
+        count > active_sectors - lba)
+        return 0;
+    if (!channel->lba48[active_device] &&
+        (lba >= 0x10000000u || count > 0x10000000u - lba))
+        return 0;
+    return 1;
+}
 
 static const char *ata_device_name(int channel, int device) {
     if (channel == ATA_CHANNEL_PRIMARY)
@@ -323,6 +401,9 @@ static int ata_init_unlocked(void) {
     active_device = -1;
     active_sectors = 0;
     device_count = 0;
+    cache_flush();
+    cache_hits = 0;
+    cache_misses = 0;
     for (uint32_t i = 0; i < ATA_MAX_DEVICES; i++)
         device_slots[i] = 0;
 
@@ -363,14 +444,40 @@ static int ata_init_unlocked(void) {
         klog_prefix();
         klog_write("ata: ATA-MULTI-OK: second device sector read verified\n");
     }
+
+    /* The read cache must serve a repeated sector without touching the
+     * drive: read one sector twice and require the second read to hit. */
+    cache_flush();
+    {
+        uint32_t hits_before = cache_hits;
+        uint32_t misses_before = cache_misses;
+        if (!cached_read_sector(0, recovery_buffer_a) ||
+            !cached_read_sector(0, recovery_buffer_b)) {
+            klog_log(KLOG_ERROR, "ATA-FAIL: cache self-test read failed\n");
+            return 0;
+        }
+        if (cache_hits != hits_before + 1u ||
+            cache_misses != misses_before + 1u ||
+            memcmp(recovery_buffer_a, recovery_buffer_b, ATA_SECTOR_SIZE)) {
+            klog_log(KLOG_ERROR, "ATA-FAIL: sector cache did not hit\n");
+            return 0;
+        }
+        klog_prefix();
+        klog_write("ata: ATA-CACHE-OK: repeated sector served from cache, "
+                   "hits=");
+        klog_dec(cache_hits);
+        klog_write(" misses=");
+        klog_dec(cache_misses);
+        klog_write("\n");
+    }
     return 1;
 }
 
 int ata_init(void) {
     int result;
-    spin_lock(&ata_lock);
+    mutex_lock(&ata_lock);
     result = ata_init_unlocked();
-    spin_unlock(&ata_lock);
+    mutex_unlock(&ata_lock);
     return result;
 }
 
@@ -383,6 +490,7 @@ int ata_select_device(uint32_t index) {
     active_channel = slot >> 1;
     active_device = slot & 1;
     active_sectors = channels[active_channel].sectors[active_device];
+    cache_flush();
     return 1;
 }
 
@@ -488,9 +596,17 @@ static int ata_read_sectors_unlocked(uint32_t lba, uint8_t count,
 
 int ata_read_sectors(uint32_t lba, uint8_t count, void *buffer) {
     int result;
-    spin_lock(&ata_lock);
-    result = ata_read_sectors_unlocked(lba, count, buffer);
-    spin_unlock(&ata_lock);
+    if (!buffer || !count) return 0;
+    mutex_lock(&ata_lock);
+    if (!ata_range_valid(lba, count)) {
+        mutex_unlock(&ata_lock);
+        return 0;
+    }
+    if (count == 1u)
+        result = cached_read_sector(lba, buffer);
+    else
+        result = ata_read_sectors_unlocked(lba, count, buffer);
+    mutex_unlock(&ata_lock);
     return result;
 }
 
@@ -584,10 +700,23 @@ static int ata_write_sectors_unlocked(uint32_t lba, uint8_t count,
 
 int ata_write_sectors(uint32_t lba, uint8_t count, const void *buffer) {
     int result;
-    spin_lock(&ata_lock);
+    if (!buffer || !count) return 0;
+    mutex_lock(&ata_lock);
+    if (!ata_range_valid(lba, count)) {
+        mutex_unlock(&ata_lock);
+        return 0;
+    }
     result = ata_write_sectors_unlocked(lba, count, buffer);
-    spin_unlock(&ata_lock);
+    cache_after_write(lba, count, buffer, result);
+    mutex_unlock(&ata_lock);
     return result;
+}
+
+void ata_cache_stats(uint32_t *hits, uint32_t *misses) {
+    mutex_lock(&ata_lock);
+    if (hits) *hits = cache_hits;
+    if (misses) *misses = cache_misses;
+    mutex_unlock(&ata_lock);
 }
 
 uint32_t ata_sector_count(void) {

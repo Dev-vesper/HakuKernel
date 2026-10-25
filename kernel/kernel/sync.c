@@ -57,3 +57,68 @@ void spin_unlock_irqrestore(spinlock_t *lock, irqflags_t flags) {
     lock->locked = 0;
     irq_unlock(flags);
 }
+
+void mutex_init(mutex_t *mutex) {
+    mutex->locked = 0;
+    mutex->owner = 0;
+    mutex->waiters.waiters = 0;
+}
+
+/* Park the current task on the mutex until it can take the lock. The
+ * decision and the park happen in one IRQ-off section, so an unlock cannot
+ * slip in between the test and the sleep and leave the waiter parked with
+ * nobody left to wake it. The park re-enables interrupts before halting:
+ * the unlock (or the timer, which simply re-selects us) resumes execution
+ * right here. */
+void mutex_lock(mutex_t *mutex) {
+    for (;;) {
+        irqflags_t flags = irq_lock();
+        if (!mutex->locked) {
+            mutex->locked = 1;
+            mutex->owner = scheduler_current_pid();
+            irq_unlock(flags);
+            return;
+        }
+        if (wait_queue_sleep(&mutex->waiters)) {
+            __asm {
+                sti
+                hlt
+            }
+            continue;
+        }
+        /* Boot or idle context: there is no task to switch to, so the
+         * holder can only be this context, which the rules forbid. Spin
+         * with interrupts on so the timer can still make progress. */
+        irq_unlock(flags);
+        while (mutex->locked) {
+        }
+    }
+}
+
+int mutex_trylock(mutex_t *mutex) {
+    irqflags_t flags = irq_lock();
+    if (mutex->locked) {
+        irq_unlock(flags);
+        return 0;
+    }
+    mutex->locked = 1;
+    mutex->owner = scheduler_current_pid();
+    irq_unlock(flags);
+    return 1;
+}
+
+void mutex_unlock(mutex_t *mutex) {
+    irqflags_t flags = irq_lock();
+    mutex->locked = 0;
+    mutex->owner = 0;
+    /* Every waiter re-tests the lock, so waking all of them costs at most
+     * one extra pass through the loop per waiter and keeps the fast path
+     * free of a waiter count. */
+    wait_queue_wake_all(&mutex->waiters);
+    irq_unlock(flags);
+}
+
+int mutex_held_by_current(const mutex_t *mutex) {
+    uint32_t pid = scheduler_current_pid();
+    return mutex->locked && mutex->owner == pid;
+}

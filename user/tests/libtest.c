@@ -185,6 +185,231 @@ static void test_filesystem_abi(void) {
     expect(sched_yield() == 0, "sched_yield");
 }
 
+/* One round of create/write/read/verify/unlink for a private file name.
+ * Two tasks run this at the same time to prove the filesystem serializes
+ * shared metadata (the root directory sector) while both make progress. */
+static int concurrent_round(int task, int round) {
+    char name[16];
+    char data[256];
+    int fd;
+    int i;
+
+    name[0] = 'C';
+    name[1] = 'C';
+    name[2] = (char)('0' + task);
+    name[3] = (char)('0' + round);
+    name[4] = '.';
+    name[5] = 'T';
+    name[6] = 'X';
+    name[7] = 'T';
+    name[8] = 0;
+
+    fd = open(name, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (fd < 3) return 1;
+    for (i = 0; i < (int)sizeof(data); i++)
+        data[i] = (char)(task * 37 + round * 11 + i);
+    if (write(fd, data, sizeof(data)) != (int)sizeof(data)) {
+        close(fd);
+        return 2;
+    }
+    close(fd);
+
+    fd = open(name, O_RDONLY);
+    if (fd < 3) return 3;
+    memset(data, 0, sizeof(data));
+    if (read(fd, data, sizeof(data)) != (int)sizeof(data)) {
+        close(fd);
+        return 4;
+    }
+    close(fd);
+    for (i = 0; i < (int)sizeof(data); i++) {
+        if (data[i] != (char)(task * 37 + round * 11 + i)) return 5;
+    }
+    if (unlink(name) != 0) return 6;
+    return 0;
+}
+
+/* Two children hammer the disk at once. Each writes and verifies its own
+ * files, so a lost update or a torn directory sector shows up as a bad
+ * status instead of a corrupted image discovered later. */
+static void test_concurrent_filesystem(void) {
+    int children[2];
+    int status = 0;
+    int i;
+
+    for (i = 0; i < 2; i++) {
+        children[i] = fork();
+        if (children[i] == 0) {
+            int round;
+            for (round = 0; round < 6; round++) {
+                int result = concurrent_round(i, round);
+                if (result) _exit(result);
+            }
+            _exit(0);
+        }
+        expect(children[i] > 0, "fork for concurrent I/O");
+    }
+    for (i = 0; i < 2; i++) {
+        if (children[i] <= 0) continue;
+        status = 0;
+        expect(waitpid(children[i], &status, 0) == children[i],
+               "waitpid concurrent child");
+        expect(status == 0, "concurrent child finished cleanly");
+    }
+    printf("SCHED-CONCURRENT-OK: two tasks shared the disk\n");
+}
+
+/* Error matrix: every syscall family has to reject bad arguments, bad
+ * descriptors, and bad paths with the documented errno instead of
+ * succeeding, faulting the kernel, or returning an unset value. */
+static void expect_errno(int result, int expected, const char *what) {
+    if (result != -1 || errno != expected) {
+        printf("USER-LIB-FAIL: %s wanted errno %d, got %d (result=%d)\n",
+               what, expected, errno, result);
+        failures++;
+    }
+}
+
+static void test_syscall_errors(void) {
+    char buffer[8];
+    char tiny[1];
+    haku_stat64_t status;
+    haku_timespec_t request;
+    haku_sigaction_t action;
+    rlimit_t limits;
+    struct pollfd poll_fd;
+    struct winsize window;
+    int fds[2];
+    int fd;
+
+    unlink("ERR.TXT");
+    unlink("ERRDIR/ERR.TXT");
+    rmdir("ERRDIR");
+    mkdir("ERRDIR");
+    rmdir("ERRFULL");
+    mkdir("ERRFULL");
+    mkdir("ERRFULL/INNER");
+
+    /* Descriptor errors: an unused, negative, or wrong-direction
+     * descriptor never reaches the backend. */
+    expect_errno((int)read(99, buffer, 1), EBADF, "read unused fd");
+    expect_errno((int)read(-1, buffer, 1), EBADF, "read negative fd");
+    expect_errno((int)write(99, "x", 1), EBADF, "write unused fd");
+    expect_errno(close(-5), EBADF, "close negative fd");
+    expect_errno((int)lseek(99, 0, SEEK_SET), EBADF, "lseek unused fd");
+    expect_errno(dup(99), EBADF, "dup unused fd");
+    expect_errno(dup2(99, 5), EBADF, "dup2 unused source");
+    expect_errno(dup3(99, 5, 0), EBADF, "dup3 unused source");
+    expect_errno(ftruncate(99, 0), EBADF, "ftruncate unused fd");
+    expect_errno(fcntl(99, F_GETFL, 0), EBADF, "fcntl unused fd");
+    expect_errno(ioctl(99, TIOCGWINSZ, &window), EBADF, "ioctl unused fd");
+
+    /* User pointers: an invalid address is EFAULT, never a kernel fault. */
+    expect_errno((int)read(0, NULL, 1), EFAULT, "read NULL buffer");
+    expect_errno((int)write(1, NULL, 1), EFAULT, "write NULL buffer");
+    expect_errno((int)write(1, (void *)0x80000000, 4), EFAULT,
+                 "write unmapped buffer");
+    expect_errno(stat(NULL, &status), EFAULT, "stat NULL path");
+    expect_errno(unlink(NULL), EFAULT, "unlink NULL path");
+    expect_errno(open(NULL, O_RDONLY), EFAULT, "open NULL path");
+    expect_errno(pipe(NULL), EFAULT, "pipe NULL vector");
+    expect_errno((int)getrandom(NULL, 4, 0), EFAULT, "getrandom NULL");
+    expect_errno(nanosleep(NULL, NULL), EFAULT, "nanosleep NULL request");
+
+    /* Argument errors on a valid descriptor. */
+    fd = open("ERR.TXT", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    expect(fd >= 3, "open ERR.TXT");
+    if (fd >= 3) {
+        expect_errno((int)lseek(fd, 0, 9), EINVAL, "lseek bad whence");
+        expect_errno(fcntl(fd, 9999, 0), EINVAL, "fcntl bad command");
+        expect_errno(ioctl(fd, 0xDEAD, 0), ENOTTY, "ioctl unknown request");
+        expect_errno(truncate("NOFILE.TXT", 0), ENOENT, "truncate ENOENT");
+        close(fd);
+    }
+    fd = open("ERR.TXT", O_RDONLY);
+    if (fd >= 3) {
+        expect_errno((int)write(fd, "x", 1), EBADF, "write on O_RDONLY");
+        close(fd);
+    }
+    fd = open("ERR.TXT", O_WRONLY);
+    if (fd >= 3) {
+        expect_errno((int)read(fd, buffer, 1), EBADF, "read on O_WRONLY");
+        close(fd);
+    }
+
+    /* Path errors. */
+    expect_errno(open("NOFILE.TXT", O_RDONLY), ENOENT, "open ENOENT");
+    expect_errno(open("ERR.TXT", O_RDONLY | O_TRUNC), EINVAL,
+                 "open O_TRUNC with O_RDONLY");
+    expect_errno(open("ERR.TXT", O_CREAT | O_EXCL | O_WRONLY), EEXIST,
+                 "open O_EXCL on an existing file");
+    expect_errno(open("ERRDIR", O_WRONLY), EISDIR, "open directory for write");
+    expect_errno(stat("", &status), ENOENT, "stat empty path");
+    expect_errno(access("NOFILE.TXT", F_OK), ENOENT, "access ENOENT");
+    expect_errno(unlink("NOFILE.TXT"), ENOENT, "unlink ENOENT");
+    expect_errno(unlink("ERRFULL"), EISDIR, "unlink a directory");
+    expect_errno(rename("NOFILE.TXT", "OTHER.TXT"), ENOENT, "rename ENOENT");
+    expect_errno(rename("ERR.TXT", "ERRFULL/INNER"), EEXIST,
+                 "rename onto an existing name");
+    expect_errno(mkdir("ERR.TXT"), EEXIST, "mkdir over a file");
+    expect_errno(mkdir("NOPE/SUB"), ENOENT, "mkdir missing parent");
+    expect_errno(mkdir("ERR.TXT/SUB"), ENOTDIR, "mkdir through a file");
+    expect_errno(rmdir("NOFILE.TXT"), ENOENT, "rmdir ENOENT");
+    expect_errno(rmdir("ERR.TXT"), ENOTDIR, "rmdir a file");
+    expect_errno(rmdir("ERRFULL"), ENOTEMPTY, "rmdir a non-empty directory");
+    expect_errno(chdir("NOFILE.TXT"), ENOENT, "chdir ENOENT");
+    expect_errno(chdir("ERR.TXT"), ENOTDIR, "chdir a file");
+    expect(getcwd(tiny, sizeof(tiny)) == NULL && errno == ERANGE,
+           "getcwd ERANGE");
+
+    /* Limits, options, and process lookups. */
+    expect_errno(getrlimit(9999, &limits), EINVAL, "getrlimit bad resource");
+    expect_errno(prctl(9999, 0, 0, 0, 0), EINVAL, "prctl bad option");
+    expect_errno(personality(0x42), EINVAL, "personality bad persona");
+    expect_errno(kill(getpid(), 99), EINVAL, "kill bad signal");
+    expect_errno(waitpid(9999, &fds[0], 0), ECHILD, "waitpid ECHILD");
+    request.tv_sec = 0;
+    request.tv_nsec = 1000000000u;
+    expect_errno(nanosleep(&request, NULL), EINVAL, "nanosleep bad nsec");
+    action.handler = (unsigned int)on_signal;
+    action.flags = 0;
+    action.restorer = 0;
+    action.mask = 0;
+    action.mask_high = 0;
+    expect_errno(sigaction(99, &action, NULL), EINVAL, "sigaction bad signal");
+    expect_errno(execve("NOFILE.ELF", NULL, NULL), ENOENT, "execve ENOENT");
+
+    /* Memory: an unmapped range cannot change protection, and a zero
+     * length mapping is rejected. */
+    expect_errno(mprotect((void *)0x60000000, 4096, PROT_READ), ENOMEM,
+                 "mprotect unmapped range");
+    expect_errno((int)mmap(NULL, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS,
+                           -1, 0),
+                 EINVAL, "mmap zero length");
+
+    /* poll reports a bad descriptor in revents instead of failing. */
+    poll_fd.fd = 99;
+    poll_fd.events = POLLIN;
+    poll_fd.revents = 0;
+    expect(poll(&poll_fd, 1, 0) == 1 && (poll_fd.revents & POLLNVAL) != 0,
+           "poll POLLNVAL");
+    expect_errno(poll(&poll_fd, -1, 0), EINVAL, "poll negative count");
+
+    /* A pipe with no reader left reports EPIPE once SIGPIPE is ignored. */
+    expect(pipe(fds) == 0, "pipe for EPIPE");
+    expect(close(fds[0]) == 0, "close the read end");
+    expect(signal(SIGPIPE, SIG_IGN) != SIG_ERR, "ignore SIGPIPE");
+    expect_errno((int)write(fds[1], "x", 1), EPIPE, "pipe EPIPE");
+    close(fds[1]);
+
+    rmdir("ERRFULL/INNER");
+    rmdir("ERRFULL");
+    unlink("ERR.TXT");
+    printf("USER-ERRNO-OK: %s\n",
+           "EBADF EFAULT ENOENT EEXIST EISDIR ENOTDIR ENOTEMPTY EINVAL "
+           "ERANGE ENOTTY EPIPE ESRCH ECHILD ENOMEM");
+}
+
 int main(void) {
     char buffer[64];
     char copy[32];
@@ -662,6 +887,8 @@ int main(void) {
     }
 
     test_filesystem_abi();
+    test_concurrent_filesystem();
+    test_syscall_errors();
 
     if (failures) {
         printf("USER-LIB-FAIL: %d checks failed\n", failures);

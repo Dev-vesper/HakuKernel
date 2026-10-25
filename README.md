@@ -303,8 +303,10 @@ are reclaimed with the rest of the address space at exit or `execve`.
 
 `mprotect` (125) changes the protection of a mapped range: `PROT_READ` clears
 the `R/W` bit, `PROT_WRITE` sets it, and `PROT_NONE` clears the user bit so
-the range faults on the next access. A copy-on-write page keeps its shared
-frame protected and remembers that its mapping is writable, so the first write
+the range faults on the next access. A range that is not mapped reports
+`ENOMEM` the way Linux does, while a bad length, a bad `prot`, or an address
+outside the mapping window reports `EINVAL`. A copy-on-write page keeps its
+shared frame protected and remembers that its mapping is writable, so the first write
 still produces a private copy instead of writing through to the parent.
 `mremap` (163) grows, shrinks, or moves a mapping: without `MREMAP_MAYMOVE` a
 mapping may only grow in place, and with it the mapping moves to a free range
@@ -576,6 +578,19 @@ each checked against its expected `#PF` error code (`7`, `7`, `4`, `6`). The
 blocking read is also observed to park the process (`SCHED-WAITQ-OK`) before
 the injected key arrives.
 
+The error matrix (`USER-ERRNO-OK`) drives each syscall family with a bad
+descriptor, an invalid user pointer, a missing path, and a bad argument, and
+requires the documented errno instead of a success, a kernel fault, or an
+unset return value: `EBADF`, `EFAULT`, `ENOENT`, `EEXIST`, `EISDIR`,
+`ENOTDIR`, `ENOTEMPTY`, `EINVAL`, `ERANGE`, `ENOTTY`, `EPIPE`, `ESRCH`,
+`ECHILD`, and `ENOMEM`. The ELF rejection test (`ELF-REJECT-OK`) breaks one
+header or program-header field at a time — class, byte order, machine, entry,
+table geometry, `p_offset`, `p_vaddr`, `p_filesz` against `p_memsz`, `PT_INTERP`,
+and the writable+executable combination — and requires the loader to reject
+every one of them, plus a truncated image. `SCHED-CONCURRENT-OK` runs two
+children that create, verify, and unlink their own files at the same time,
+which exercises the sleeping VFS and disk mutexes end to end.
+
 ### Supported POSIX subset
 
 Haku implements a POSIX-*inspired* subset aimed at a statically linked musl
@@ -773,6 +788,40 @@ single-volume VFS, not full POSIX filesystem conformance. The QEMU headless
 test creates `P1.TXT`, exercises `DIR1/T.TXT` with `./DIR1/../DIR1` paths,
 and verifies multi-sector writes, reads, seeks, close, and reopen.
 
+#### Why FAT12 with 8.3 names, and not something bigger
+
+Long filenames, partition tables, and FAT16/FAT32 are each a deliberate
+non-goal for the data disk, not an oversight. The reasoning, recorded so the
+decision does not have to be re-derived:
+
+- **Long filenames (VFAT LFN).** LFN entries are a chain of hidden records
+  with a checksum tying them to the 8.3 name, ordered in reverse and
+  contiguous; every create, rename, unlink, and directory-growth path would
+  have to maintain that chain, and a torn write leaves an orphaned fragment.
+  Haku's userland root is moving to an in-memory filesystem with real long
+  names and permission bits (see `ROADMAP.md` milestone 7), which leaves FAT12
+  as an interchange format for small data disks where 8.3 names are enough.
+  Paying LFN complexity in the interchange format buys nothing the userland
+  filesystem does not already provide.
+- **Partition tables.** The kernel owns the whole disk image: the FAT12 volume
+  starts at LBA 0. Adding an MBR would mean parsing a partition table, keeping
+  a per-partition byte offset through every cluster calculation, and choosing a
+  boot partition — for a disk no other operating system shares. If Haku ever
+  has to coexist with another OS on one physical disk, this becomes worth
+  doing, and the offset layer is the natural place to add it.
+- **FAT16/FAT32.** The current images are 1.44 MB, where FAT12 is the correct
+  encoding (a 12-bit entry per cluster). FAT16 becomes relevant only for data
+  disks above roughly 16 MiB at 4 KiB clusters, and FAT32 brings long names,
+  FSInfo, and mirroring rules with it. Both would be new backends with their
+  own on-disk structures rather than a flag on the existing one.
+
+Any of these can be revisited, but only together with interoperability tests:
+before such a change lands, `mtools`/`fsck.fat` must be able to read, write,
+and check the resulting image in CI, and `tools/lsfat12.py` must agree with
+them. A filesystem that only Haku can read is not a filesystem Haku can
+export data through, and the roadmap treats that gate as mandatory rather than
+optional.
+
 `tools/mkfat12.py` puts `HAKU.ELF`, the exec target `NEXT.ELF`, and the
 spawn/wait child `CHILD.ELF` on a generated 1.44 MB FAT12 image. QEMU
 attaches this image as the primary-master IDE disk while the existing boot
@@ -785,42 +834,65 @@ image.
 
 ### Locking
 
-`kernel/kernel/sync.h` provides three primitives on top of `cpu_irq_save`/`restore`:
+`kernel/kernel/sync.h` provides four primitives on top of `cpu_irq_save`/`restore`:
 
 - `irq_lock`/`irq_unlock` — a plain IRQ-save pair for short critical sections
   that never block and never call into a blocking path. Nests correctly.
-- `spin_lock`/`spin_unlock` — a task-context spinlock. The critical section
-  runs with interrupts enabled, so a preempted holder can be scheduled again
-  while waiters busy-wait. Must never be acquired with interrupts disabled
-  and never held across a blocking call.
+- `mutex_lock`/`mutex_unlock` — a task-context sleeping mutex. Interrupts stay
+  enabled for the whole critical section, including the I/O inside it, and a
+  waiter parks on the lock's wait queue (`TASK_BLOCKED`) instead of spinning,
+  so a task queued behind a disk transfer costs no CPU. The test and the park
+  happen in one IRQ-off section, which is what makes a missed wake-up
+  impossible. Boot and idle context has no task to park, so the lock falls
+  back to a bounded spin there; that path is single-threaded by construction.
+  Mutexes are not recursive and are never acquired with interrupts disabled.
+- `spin_lock`/`spin_unlock` — a task-context spinlock for very short sections.
+  Waiters busy-wait, so nothing slow may happen while one is held.
 - `spin_lock_irqsave`/`spin_unlock_irqrestore` — a spinlock whose holder also
   disables interrupts, making it non-preemptible and safe from IRQ context.
 
 The locking rules per subsystem:
 
 - **Scheduler**: every task-array mutation runs with interrupts disabled (in an
-  IRQ handler or under `irq_lock`), so no spinlock is needed. A task-context
-  spinlock must never be taken with interrupts disabled — a preempted holder
-  would never run again to release it. `scheduler_spawn` therefore reserves a
-  task slot, then re-enables interrupts for `vfs_inherit` before publishing the
+  IRQ handler or under `irq_lock`), so no lock is needed. A task-context lock
+  must never be taken with interrupts disabled — a preempted holder would
+  never run again to release it. `scheduler_spawn` therefore reserves a task
+  slot, then re-enables interrupts for `vfs_inherit` before publishing the
   task as runnable.
 - **Allocators** (`kernel/arch/x86/mm/frame.c`, `kernel/kernel/heap.c`): IRQ-save
   spinlocks. The free-list/bitmap updates are short and the holder cannot be
   preempted, so the allocators are safe from both task and interrupt context.
-- **VFS** (`kernel/fs/vfs/vfs.c`): one task-context spinlock, `vfs_lock`, around all
-  descriptor/OFD table changes and file-backend calls. Interrupts stay enabled
-  during disk I/O, so a preempted holder can finish; console device I/O drops
-  the lock first because it may block. `ofd_release` does not lock — callers
-  hold `vfs_lock`.
-- **Drivers**: `kernel/drivers/ata.c` uses a task-context spinlock around the polling
-  transfers; `kernel/arch/x86/kernel/kbd.c` only translates scancodes and
-  forwards them to `terminal.c`, which owns the input ring (single-producer
-  IRQ1, single-consumer task) and the IRQ-safe wait queue; `terminal.c`
-  serializes output through the display and UART backends, which use IRQ-save
-  spinlocks because `klog` may run from interrupt context.
+- **VFS** (`kernel/fs/vfs/vfs.c`): one sleeping mutex, `vfs_lock`, around all
+  descriptor/OFD table changes and file-backend calls. Because the lock sleeps
+  instead of spinning, a second process that opens or reads a file while the
+  first is inside a disk transfer simply blocks and is woken by the unlock;
+  console and pipe I/O drop the lock first because they block for input or
+  buffer space. `ofd_release` does not lock — callers hold `vfs_lock`.
+- **Drivers**: `kernel/drivers/ata.c` takes the same kind of mutex (`ata_lock`)
+  around a polling transfer, so the VFS lock and the disk lock are distinct and
+  a task waiting for either one sleeps. The sector cache below `ata_lock` is
+  the only reader of the drive outside FAT12; `kernel/arch/x86/kernel/kbd.c`
+  only translates scancodes and forwards them to `terminal.c`, which owns the
+  input ring (single-producer IRQ1, single-consumer task) and the IRQ-safe
+  wait queue; `terminal.c` serializes output through the display and UART
+  backends, which use IRQ-save spinlocks because `klog` may run from interrupt
+  context.
 
-Locks are non-recursive; the only ordering rule is VFS → backend, never the
+Locks are non-recursive; the only ordering rule is VFS → disk, never the
 reverse.
+
+### Sector cache
+
+`kernel/drivers/ata.c` keeps a 16-slot direct-mapped read cache (8 KiB) in
+front of the drive. FAT12 re-reads the same metadata constantly — both FAT
+copies and the directory chain of every path component — so the cache removes
+most of the polling latency without changing the filesystem's write-through
+model: writes go straight to the platter, a single-sector write refreshes the
+cached copy, and a multi-sector write or a failed write invalidates every slot
+it may have touched. Selecting another device flushes the cache, because the
+sectors belong to whichever drive is active. The boot self-test reads one
+sector twice and requires the second read to hit (`ATA-CACHE-OK`), so a cache
+that silently serves stale data fails the headless run.
 
 ### ELF32 program loading
 
@@ -892,7 +964,7 @@ Haku/
       test/             fs_test.c/.h: kernel-side filesystem self-tests
     kernel/             kernel_main.c: kernel startup
                         scheduler.c/.h: scheduler + per-process usage counters
-                        sync.c/.h: spinlocks and IRQ-save locks + locking rules
+                        sync.c/.h: mutex/spinlock/IRQ-save locks + rules
                         usermode.c/.h: user mappings, syscall ABI, brk/mmap/munmap
                         getusage
                         klog.c/.h: timestamped, leveled terminal logging

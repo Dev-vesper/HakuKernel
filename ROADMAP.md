@@ -34,6 +34,12 @@ compatibility is not a short-term goal.
   append, descriptor access checks, spawn/waitpid exit status, exec
   argument/environment stacks, per-process usage accounting, and persisted
   disk data.
+- [x] Sleeping locks for the filesystem and the disk (a parked waiter costs no
+  CPU and interrupts stay enabled through a transfer), plus a read cache in
+  front of the drive (`ATA-CACHE-OK`).
+- [x] A ring-3 error matrix for every syscall family (`USER-ERRNO-OK`), an
+  expanded malformed-ELF suite (`ELF-REJECT-OK`), and a two-task concurrent
+  filesystem test (`SCHED-CONCURRENT-OK`).
 
 ## Proposed Milestones
 
@@ -91,10 +97,25 @@ unexpectedly lost image data across restarts.
   `ENOTEMPTY`; root mounts can be read-only via `VFS_MOUNT_RDONLY`, which
   rejects create/write/truncate/unlink/rename/mkdir/rmdir with `EROFS`
   while reads keep working, tested as `FS-EROFS-OK`).
-- [ ] Introduce appropriate disk and file locks instead of disabling
-  interrupts for the duration of all I/O; add a sector cache if needed.
-- [ ] Decide separately whether to support long filenames, partition tables,
-  or FAT16; require interoperability tests before expanding scope.
+- [x] Introduce appropriate disk and file locks instead of disabling interrupts
+  for the duration of all I/O; add a sector cache if needed (`mutex_t` in
+  `kernel/kernel/sync.h` parks a waiter on a wait queue instead of spinning;
+  the VFS and the ATA driver each own one, so a task queued behind a disk
+  transfer is `TASK_BLOCKED` and costs no CPU, while interrupts stay enabled
+  for the whole transfer. A 16-slot direct-mapped read cache sits in front of
+  the drive and absorbs the repeated FAT and directory reads
+  (`ATA-CACHE-OK`); writes remain write-through and refresh or invalidate the
+  cached copy, and selecting another device flushes it. Two tasks using the
+  filesystem at once is covered by `SCHED-CONCURRENT-OK`. Advisory record
+  locks are still missing: `F_SETLK` is accepted and changes nothing).
+- [x] Decide separately whether to support long filenames, partition tables,
+  or FAT16; require interoperability tests before expanding scope (decision:
+  none of the three for the data disk. README "Why FAT12 with 8.3 names, and
+  not something bigger" records the reasoning — the userland root moves to an
+  in-memory filesystem with long names and permission bits, which leaves
+  FAT12 as an interchange format where 8.3 names suffice. Any future change to
+  the on-disk format must first pass an `mtools`/`fsck.fat` round-trip in CI
+  and agree with `tools/lsfat12.py`).
 
 **Acceptance criteria:** Multiple processes can use independent files
 concurrently; file and directory operations, EOF, seeking, and errors are
@@ -127,7 +148,14 @@ tested, and common FAT tools can still read the disk image.
   in the timer IRQ instead of busy-waiting; `USER-TIME-OK`).
 - [x] Define a public user/kernel C ABI header for syscall numbers, errno
   values, open flags, and the `stat` structure.
-- [ ] Test invalid arguments, permissions, and device errors for every syscall.
+- [x] Test invalid arguments, permissions, and device errors for every syscall
+  (`USER-ERRNO-OK` drives each syscall family from ring 3 with a bad
+  descriptor, an invalid user pointer, a missing path, and a bad argument, and
+  asserts the documented errno — `EBADF`, `EFAULT`, `ENOENT`, `EEXIST`,
+  `EISDIR`, `ENOTDIR`, `ENOTEMPTY`, `EINVAL`, `ERANGE`, `ENOTTY`, `EPIPE`,
+  `ESRCH`, `ECHILD`, `ENOMEM`. Permission errors come from the read-only
+  mount (`FS-EROFS-OK`), and device errors from the console ioctl cases plus
+  the injected ATA failures (`FS-ATA-OK`)).
 
 **Acceptance criteria:** A basic shell can launch programs from disk, collect
 their output and exit status, and run multiple programs without unintended
@@ -214,8 +242,15 @@ prevent boot.
   kernel `cl.exe`/`clang-cl`, links a fixed-base PE32 without a CRT, and
   `tools/pe2elf.py` emits the ELF32 `PT_LOAD` image installed as `LIB.ELF`;
   `NEXT.ELF` spawns it in the headless run and checks `USER-LIB-OK`).
-- [ ] Add automated tests for malformed ELF files, syscalls, VFS, FAT, and the
-  scheduler.
+- [x] Add automated tests for malformed ELF files, syscalls, VFS, FAT, and the
+  scheduler (`ELF-REJECT-OK` breaks one header or program-header field at a
+  time — class, byte order, machine, entry, table geometry, `p_offset`,
+  `p_vaddr`, `p_filesz` against `p_memsz`, `PT_INTERP`, writable+executable —
+  and requires every mutation plus a truncated image to be rejected;
+  `USER-ERRNO-OK` is the syscall and VFS error matrix;
+  `SCHED-CONCURRENT-OK` runs two tasks against the filesystem at once; the
+  FAT suite stays `FS-ERRORS-OK`/`FS-EROFS-OK`/`FS-FILE-EDGE-OK`/
+  `FS-CORRUPT-OK`/`FS-ATA-OK`/`FS-STAT-OK`/`FS-ROLLBACK-OK`/`FS-ENOSPC-OK`).
 - [x] Define the limited POSIX subset actually supported; add conformance
   tests and document limitations for each capability (README's "Supported
   POSIX subset" lists the implemented calls by area, what is deliberately

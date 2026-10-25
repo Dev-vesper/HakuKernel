@@ -44,29 +44,66 @@ static const vfs_device_ops_t console_device = {
     terminal_input_available,
 };
 
+/* Rejection tests for the ELF loader. Each case copies the known-good
+ * program image, breaks exactly one field, and requires the loader to say
+ * no: a loader that accepts a malformed image maps memory from attacker
+ * controlled offsets before the process even starts. */
+#define ELF_REJECT_CASE(label, statement)                                     \
+    do {                                                                      \
+        memcpy(invalid, image, sizeof(invalid));                              \
+        statement;                                                            \
+        if (elf_load_executable(invalid, sizeof(invalid), &rejected)) {        \
+            klog_log(KLOG_ERROR, "ELF-FAIL: accepted " label "\n");           \
+            return 0;                                                         \
+        }                                                                     \
+    } while (0)
+
 static int elf_rejection_self_test(const uint8_t *image,
                                    uint32_t image_size) {
-    uint8_t invalid[116];
+    uint8_t invalid[116]; /* header plus two program headers */
     loaded_elf_t rejected;
 
     if (image_size < sizeof(invalid)) return 0;
-    memcpy(invalid, image, sizeof(invalid));
-    invalid[0] = 0;
-    if (elf_load_executable(invalid, sizeof(invalid), &rejected)) return 0;
 
-    memcpy(invalid, image, sizeof(invalid));
-    invalid[28] = 0xF0;
-    invalid[29] = 0xFF;
-    invalid[30] = 0xFF;
-    invalid[31] = 0xFF;
-    if (elf_load_executable(invalid, sizeof(invalid), &rejected)) return 0;
+    /* e_ident: magic, class, byte order, version. */
+    ELF_REJECT_CASE("bad magic", invalid[0] = 0);
+    ELF_REJECT_CASE("ELFCLASS64", invalid[4] = 2);
+    ELF_REJECT_CASE("big-endian", invalid[5] = 2);
+    ELF_REJECT_CASE("bad ident version", invalid[6] = 2);
+    /* The rest of the header: type, machine, entry, table geometry. */
+    ELF_REJECT_CASE("ET_DYN", invalid[16] = 3);
+    ELF_REJECT_CASE("EM_ARM", invalid[18] = 0x28);
+    ELF_REJECT_CASE("bad e_version", invalid[20] = 2);
+    ELF_REJECT_CASE("entry outside every segment", invalid[24] = 0xFF;
+                    invalid[25] = 0xFF; invalid[26] = 0xFF;
+                    invalid[27] = 0xFF);
+    ELF_REJECT_CASE("program headers past the image", invalid[28] = 0xF0;
+                    invalid[29] = 0xFF; invalid[30] = 0xFF;
+                    invalid[31] = 0xFF);
+    ELF_REJECT_CASE("bad e_ehsize", invalid[40] = 0);
+    ELF_REJECT_CASE("bad e_phentsize", invalid[42] = 0);
+    ELF_REJECT_CASE("no program headers", invalid[44] = 0);
+    ELF_REJECT_CASE("too many program headers", invalid[45] = 1);
+    /* The first program header sits at offset 52 (see the linker script). */
+    ELF_REJECT_CASE("PT_INTERP", invalid[52] = 3);
+    ELF_REJECT_CASE("p_offset past the image", invalid[56] = 0;
+                    invalid[57] = 0; invalid[58] = 0; invalid[59] = 1);
+    ELF_REJECT_CASE("p_vaddr below the user window", invalid[60] = 0;
+                    invalid[61] = 0x10; invalid[62] = 0; invalid[63] = 0);
+    ELF_REJECT_CASE("p_filesz greater than p_memsz", invalid[68] = 0xFF;
+                    invalid[69] = 0xFF; invalid[70] = 0xFF;
+                    invalid[71] = 0xFF);
+    ELF_REJECT_CASE("writable+executable segment", invalid[76] = 7);
 
-    memcpy(invalid, image, sizeof(invalid));
-    invalid[76] = 7; /* first PT_LOAD would be writable and executable */
-    if (elf_load_executable(invalid, sizeof(invalid), &rejected)) return 0;
+    /* A truncated image never reaches the header parser. */
+    if (elf_load_executable(image, 16, &rejected)) {
+        klog_log(KLOG_ERROR, "ELF-FAIL: accepted a truncated image\n");
+        return 0;
+    }
 
     klog_prefix();
-    klog_write("ELF-REJECT-OK: malformed headers and W+X rejected\n");
+    klog_write("ELF-REJECT-OK: malformed headers, bad segments, and W+X "
+               "rejected\n");
     return 1;
 }
 

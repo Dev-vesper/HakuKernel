@@ -1905,11 +1905,13 @@ uint32_t scheduler_mprotect(uint32_t address, uint32_t length, uint32_t prot) {
         return 0u - HAKU_EINVAL;
 
     index = mmap_find_region(task, start, end);
-    if (index == TASK_MAX_MMAP_REGIONS) return 0u - HAKU_EINVAL;
+    /* Linux reports an unmapped range as ENOMEM ("addresses in the range
+     * are not valid"), and libcs test for it, so Haku matches. */
+    if (index == TASK_MAX_MMAP_REGIONS) return 0u - HAKU_ENOMEM;
     if (!paging_protect_user_range(space, start, end - start,
                                    prot != (uint32_t)HAKU_PROT_NONE,
                                    (prot & HAKU_PROT_WRITE) != 0u))
-        return 0u - HAKU_EINVAL;
+        return 0u - HAKU_ENOMEM;
     task->mmap_regions[index].prot = prot;
     return 0;
 }
