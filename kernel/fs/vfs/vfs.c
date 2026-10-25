@@ -40,6 +40,7 @@ typedef struct {
     char dir_path[VFS_PATH_MAX]; /* canonical path, when kind == DIR */
     uint32_t pipe;      /* pipe index, when kind == PIPE */
     uint32_t refs;
+    uint32_t mount_index; /* mount this description was opened through */
     int used;
 } vfs_ofd_t;
 
@@ -67,8 +68,13 @@ static vfs_fd_t descriptors[VFS_MAX_PROCESSES][VFS_FD_COUNT];
 static vfs_ofd_t ofd_table[VFS_MAX_PROCESSES * VFS_FD_COUNT];
 static const vfs_fs_ops_t *fs_table[VFS_MAX_FS];
 static uint32_t fs_count;
-static const vfs_fs_ops_t *root_fs;
-static int root_read_only;
+/* Mount table. One backend is mounted at "" (the root); the others are
+ * mounted at a canonical directory path and own everything below it. The
+ * longest matching prefix wins, and the backend only ever sees the path
+ * relative to its own root, so no backend knows it is not the whole
+ * namespace. */
+static vfs_mount_t mounts[VFS_MAX_MOUNTS];
+static uint32_t mount_count;
 static const vfs_device_ops_t *stdio_device;
 /* Serializes descriptor/OFD-table changes and file/disk backend calls.
  * Sleeping mutex: the holder may be preempted and may be inside a disk
@@ -258,6 +264,48 @@ static uint32_t ofd_slot(const vfs_ofd_t *ofd) {
     return (uint32_t)(ofd - ofd_table);
 }
 
+/* Length of the mount prefix that owns a canonical path, or -1 when the
+ * path is not below this mount. The root mount (empty prefix) owns
+ * everything with length 0. */
+static int mount_match(const vfs_mount_t *mount, const char *path) {
+    uint32_t length = 0;
+    while (mount->prefix[length]) length++;
+    if (length == 0) return 0;
+    for (uint32_t i = 0; i < length; i++)
+        if (path[i] != mount->prefix[i]) return -1;
+    if (path[length] == 0) return (int)length;
+    if (path[length] != '/') return -1;
+    return (int)length;
+}
+
+/* Find the mount that owns a path and the path as that backend sees it.
+ * The mount root itself is reported as ".", which is the same convention
+ * the syscall layer uses for the volume root, so backends never receive an
+ * empty name. */
+static vfs_mount_t *mount_resolve(const char *path, const char **relative) {
+    vfs_mount_t *best = 0;
+    int best_length = -1;
+    for (uint32_t i = 0; i < mount_count; i++) {
+        int length = mount_match(&mounts[i], path);
+        if (length > best_length) {
+            best = &mounts[i];
+            best_length = length;
+        }
+    }
+    if (!best) return 0;
+    if (best_length == 0)
+        *relative = path;
+    else if (path[best_length] == 0)
+        *relative = ".";
+    else
+        *relative = path + best_length + 1;
+    return best;
+}
+
+static int mount_read_only(const vfs_mount_t *mount) {
+    return (mount->flags & VFS_MOUNT_RDONLY) != 0;
+}
+
 int vfs_register_fs(const vfs_fs_ops_t *ops) {
     if (!ops || !ops->name || !ops->mount || !ops->open || !ops->close ||
         !ops->read || !ops->write || !ops->seek || !ops->unlink ||
@@ -279,9 +327,28 @@ int32_t vfs_mount_root(const char *name) {
 }
 
 int32_t vfs_mount_root_flags(const char *name, uint32_t flags) {
+    return vfs_mount("", name, flags);
+}
+
+/* Validate a canonical mount prefix: no leading or trailing slash, no empty
+ * components. */
+static int prefix_valid(const char *prefix) {
+    if (!prefix) return 0;
+    if (prefix[0] == 0) return 1;
+    if (prefix[0] == '/' || prefix[strlen(prefix) - 1u] == '/') return 0;
+    for (uint32_t i = 0; prefix[i]; i++) {
+        if (prefix[i] == '/' && prefix[i + 1u] == '/') return 0;
+        if (prefix[i] == '/' && prefix[i + 1u] == 0) return 0;
+    }
+    return strlen(prefix) < VFS_PATH_MAX;
+}
+
+int32_t vfs_mount(const char *prefix, const char *name, uint32_t flags) {
     const vfs_fs_ops_t *ops = 0;
+    vfs_mount_t *mount = 0;
     int32_t mounted;
-    if (!name || (flags & ~VFS_MOUNT_RDONLY)) return -VFS_EINVAL;
+    if (!name || !prefix_valid(prefix) || (flags & ~VFS_MOUNT_RDONLY))
+        return -VFS_EINVAL;
     for (uint32_t i = 0; i < fs_count; i++) {
         if (name_equal(fs_table[i]->name, name)) {
             ops = fs_table[i];
@@ -290,24 +357,51 @@ int32_t vfs_mount_root_flags(const char *name, uint32_t flags) {
     }
     if (!ops) return -VFS_EINVAL;
     mutex_lock(&vfs_lock);
+    /* Remounting the same prefix replaces the entry: the read-only
+     * filesystem tests remount the root to check the flag both ways. */
+    for (uint32_t i = 0; i < mount_count; i++) {
+        if (name_equal(mounts[i].prefix, prefix)) {
+            mount = &mounts[i];
+            break;
+        }
+    }
     mounted = ops->mount();
     if (mounted != 1) {
         mutex_unlock(&vfs_lock);
         return mounted;
     }
-    root_fs = ops;
-    root_read_only = (flags & VFS_MOUNT_RDONLY) ? 1 : 0;
+    if (!mount) {
+        if (mount_count >= VFS_MAX_MOUNTS) {
+            mutex_unlock(&vfs_lock);
+            return -VFS_EBUSY;
+        }
+        mount = &mounts[mount_count++];
+        memset(mount, 0, sizeof(*mount));
+        {
+            uint32_t length = (uint32_t)strlen(prefix);
+            memcpy(mount->prefix, prefix, length + 1u);
+        }
+    }
+    mount->ops = ops;
+    mount->flags = flags;
     mutex_unlock(&vfs_lock);
     return 1;
+}
+
+int vfs_mounted(const char *prefix) {
+    if (!prefix) return 0;
+    for (uint32_t i = 0; i < mount_count; i++)
+        if (name_equal(mounts[i].prefix, prefix)) return 1;
+    return 0;
 }
 
 void vfs_init(void) {
     memset(descriptors, 0, sizeof(descriptors));
     memset(ofd_table, 0, sizeof(ofd_table));
     memset(pipes, 0, sizeof(pipes));
+    memset(mounts, 0, sizeof(mounts));
+    mount_count = 0;
     fs_count = 0;
-    root_fs = 0;
-    root_read_only = 0;
     stdio_device = 0;
     mutex_init(&vfs_lock);
 }
@@ -383,6 +477,8 @@ uint32_t vfs_open_count(uint32_t pid) {
 int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
     vfs_fd_t *slot;
     vfs_ofd_t *ofd;
+    vfs_mount_t *mount;
+    const char *relative = 0;
     uint32_t fd;
     int ofd_index;
     void *handle = 0;
@@ -401,15 +497,16 @@ int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
         return vfs_opendir(pid, path);
     }
     mutex_lock(&vfs_lock);
-    if (root_read_only &&
+    mount = mount_resolve(path, &relative);
+    if (!mount) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EIO;
+    }
+    if (mount_read_only(mount) &&
         ((flags & VFS_O_ACCMODE) != VFS_O_RDONLY ||
          (flags & (VFS_O_CREAT | VFS_O_TRUNC)))) {
         mutex_unlock(&vfs_lock);
         return -VFS_EROFS;
-    }
-    if (!root_fs) {
-        mutex_unlock(&vfs_lock);
-        return -VFS_EIO;
     }
     for (fd = VFS_FIRST_FILE_FD; fd < VFS_FD_COUNT; fd++)
         if (!descriptors[pid - 1u][fd].used) break;
@@ -423,14 +520,15 @@ int32_t vfs_open(uint32_t pid, const char *path, uint32_t flags) {
         return -VFS_EMFILE;
     }
 
-    opened = root_fs->open(path, flags, &handle);
+    opened = mount->ops->open(relative, flags, &handle);
     if (opened != 1) {
         mutex_unlock(&vfs_lock);
         return opened;
     }
     ofd = &ofd_table[ofd_index];
     ofd->kind = VFS_OFD_FILE;
-    ofd->ops = root_fs;
+    ofd->ops = mount->ops;
+    ofd->mount_index = (uint32_t)(mount - mounts);
     ofd->accmode = flags & VFS_O_ACCMODE;
     ofd->status = flags & (VFS_O_APPEND | HAKU_O_NONBLOCK);
     ofd->backend = handle;
@@ -583,7 +681,8 @@ int32_t vfs_write(uint32_t pid, uint32_t fd, const void *buffer,
         mutex_unlock(&vfs_lock);
         return pipe_write(pipe, status, buffer, count);
     }
-    if (ofd->kind == VFS_OFD_FILE && root_read_only) {
+    if (ofd->kind == VFS_OFD_FILE &&
+        mount_read_only(&mounts[ofd->mount_index])) {
         mutex_unlock(&vfs_lock);
         return -VFS_EROFS;
     }
@@ -630,82 +729,122 @@ int32_t vfs_seek(uint32_t pid, uint32_t fd, int32_t offset,
 }
 
 int32_t vfs_unlink(uint32_t pid, const char *path) {
+    vfs_mount_t *mount;
+    const char *relative = 0;
     int32_t removed;
     if (!pid_valid(pid) || !path) return -VFS_EINVAL;
     mutex_lock(&vfs_lock);
-    if (!root_fs) {
+    mount = mount_resolve(path, &relative);
+    if (!mount) {
         mutex_unlock(&vfs_lock);
         return -VFS_EIO;
     }
-    if (root_read_only) {
+    /* A mount point is a name in its parent filesystem; removing it would
+     * orphan the mount. */
+    if (relative[0] == '.' && relative[1] == 0) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EBUSY;
+    }
+    if (mount_read_only(mount)) {
         mutex_unlock(&vfs_lock);
         return -VFS_EROFS;
     }
-    removed = root_fs->unlink(path);
+    removed = mount->ops->unlink(relative);
     mutex_unlock(&vfs_lock);
     return removed;
 }
 
 int32_t vfs_rename(uint32_t pid, const char *oldpath, const char *newpath) {
+    vfs_mount_t *old_mount;
+    vfs_mount_t *new_mount;
+    const char *old_relative = 0;
+    const char *new_relative = 0;
     int32_t renamed;
     if (!pid_valid(pid) || !oldpath || !newpath) return -VFS_EINVAL;
     mutex_lock(&vfs_lock);
-    if (!root_fs) {
+    old_mount = mount_resolve(oldpath, &old_relative);
+    new_mount = mount_resolve(newpath, &new_relative);
+    if (!old_mount || !new_mount) {
         mutex_unlock(&vfs_lock);
         return -VFS_EIO;
     }
-    if (root_read_only) {
+    if (old_mount != new_mount) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EXDEV;
+    }
+    if (old_relative[0] == '.' && old_relative[1] == 0) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EBUSY;
+    }
+    if (mount_read_only(old_mount)) {
         mutex_unlock(&vfs_lock);
         return -VFS_EROFS;
     }
-    renamed = root_fs->rename(oldpath, newpath);
+    renamed = old_mount->ops->rename(old_relative, new_relative);
     mutex_unlock(&vfs_lock);
     return renamed;
 }
 
 int32_t vfs_mkdir(uint32_t pid, const char *path) {
+    vfs_mount_t *mount;
+    const char *relative = 0;
     int32_t created;
     if (!pid_valid(pid) || !path) return -VFS_EINVAL;
     mutex_lock(&vfs_lock);
-    if (!root_fs) {
+    mount = mount_resolve(path, &relative);
+    if (!mount) {
         mutex_unlock(&vfs_lock);
         return -VFS_EIO;
     }
-    if (root_read_only) {
+    if (relative[0] == '.' && relative[1] == 0) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EEXIST;
+    }
+    if (mount_read_only(mount)) {
         mutex_unlock(&vfs_lock);
         return -VFS_EROFS;
     }
-    created = root_fs->mkdir(path);
+    created = mount->ops->mkdir(relative);
     mutex_unlock(&vfs_lock);
     return created;
 }
 
 int32_t vfs_rmdir(uint32_t pid, const char *path) {
+    vfs_mount_t *mount;
+    const char *relative = 0;
     int32_t removed;
     if (!pid_valid(pid) || !path) return -VFS_EINVAL;
     mutex_lock(&vfs_lock);
-    if (!root_fs) {
+    mount = mount_resolve(path, &relative);
+    if (!mount) {
         mutex_unlock(&vfs_lock);
         return -VFS_EIO;
     }
-    if (root_read_only) {
+    if (relative[0] == '.' && relative[1] == 0) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EBUSY;
+    }
+    if (mount_read_only(mount)) {
         mutex_unlock(&vfs_lock);
         return -VFS_EROFS;
     }
-    removed = root_fs->rmdir(path);
+    removed = mount->ops->rmdir(relative);
     mutex_unlock(&vfs_lock);
     return removed;
 }
 
 int32_t vfs_stat(uint32_t pid, const char *path, vfs_stat_t *out) {
+    vfs_mount_t *mount;
+    const char *relative = 0;
     int32_t stated;
     if (!pid_valid(pid) || !path || !out) return -VFS_EINVAL;
     mutex_lock(&vfs_lock);
-    if (!root_fs) {
+    mount = mount_resolve(path, &relative);
+    if (!mount) {
         mutex_unlock(&vfs_lock);
         return -VFS_EIO;
     }
-    stated = root_fs->stat(path, out);
+    stated = mount->ops->stat(relative, out);
     mutex_unlock(&vfs_lock);
     return stated;
 }
@@ -744,12 +883,19 @@ void vfs_close_all(uint32_t pid) {
 int32_t vfs_opendir(uint32_t pid, const char *path) {
     vfs_fd_t *slot;
     vfs_ofd_t *ofd;
+    vfs_mount_t *mount;
+    const char *relative = 0;
     uint32_t fd;
     int ofd_index;
     void *handle = 0;
     int32_t opened;
     if (!pid_valid(pid) || !path) return -VFS_EINVAL;
     mutex_lock(&vfs_lock);
+    mount = mount_resolve(path, &relative);
+    if (!mount) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EIO;
+    }
     for (fd = VFS_FIRST_FILE_FD; fd < VFS_FD_COUNT; fd++)
         if (!descriptors[pid - 1u][fd].used) break;
     if (fd == VFS_FD_COUNT) {
@@ -761,14 +907,15 @@ int32_t vfs_opendir(uint32_t pid, const char *path) {
         mutex_unlock(&vfs_lock);
         return -VFS_EMFILE;
     }
-    opened = root_fs->opendir(path, &handle);
+    opened = mount->ops->opendir(relative, &handle);
     if (opened != 1) {
         mutex_unlock(&vfs_lock);
         return opened;
     }
     ofd = &ofd_table[ofd_index];
     ofd->kind = VFS_OFD_DIR;
-    ofd->ops = root_fs;
+    ofd->ops = mount->ops;
+    ofd->mount_index = (uint32_t)(mount - mounts);
     ofd->backend = handle;
     ofd->accmode = VFS_O_RDONLY;
     ofd->status = 0;
@@ -795,7 +942,7 @@ int32_t vfs_getdents(uint32_t pid, uint32_t fd, void *buffer, uint32_t count) {
     uint32_t next;
     uint32_t used = 0;
     int got;
-    if (!buffer || count < VFS_DIRENT_RECORD_MAX) return -VFS_EINVAL;
+    if (!buffer || count < 32u) return -VFS_EINVAL;
     mutex_lock(&vfs_lock);
     ofd = fd_ofd(pid, fd);
     if (!ofd) {
@@ -822,7 +969,16 @@ int32_t vfs_getdents(uint32_t pid, uint32_t fd, void *buffer, uint32_t count) {
         while (entry.name[namelen] && namelen < VFS_DIRENT_NAME_MAX - 1u)
             namelen++;
         reclen = (19u + namelen + 8u) & ~7u;
-        if (reclen > count - used) break; /* did not fit: leave it unconsumed */
+        if (reclen > count - used) {
+            /* The name does not fit in the caller's buffer. Report the
+             * records that did fit, or EINVAL when even the first one did
+             * not, so a short buffer is never mistaken for end of file. */
+            if (used == 0) {
+                mutex_unlock(&vfs_lock);
+                return -VFS_EINVAL;
+            }
+            break;
+        }
         ofd->dir_index = next;
         {
             uint8_t *rec = (uint8_t *)buffer + used;

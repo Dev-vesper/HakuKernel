@@ -31,6 +31,8 @@
 #define VFS_EAGAIN  HAKU_EAGAIN
 #define VFS_ENOLCK  HAKU_ENOLCK
 #define VFS_EOPNOTSUPP HAKU_EOPNOTSUPP
+#define VFS_EXDEV  HAKU_EXDEV
+#define VFS_EBUSY  HAKU_EBUSY
 
 /* poll(2)/select(2) readiness bits. */
 #define VFS_POLLIN   HAKU_POLLIN
@@ -44,19 +46,23 @@
 #define VFS_DT_DIR     HAKU_DT_DIR
 #define VFS_DT_REG     HAKU_DT_REG
 
-/* Longest file name a directory entry can carry (an 8.3 name plus slack
- * for a NUL). */
-#define VFS_DIRENT_NAME_MAX 16u
+/* Longest file name a directory entry can carry (a long name plus slack
+ * for a NUL). FAT12 only fills the first 12 bytes; the in-memory
+ * filesystem uses the whole field. */
+#define VFS_DIRENT_NAME_MAX 64u
 /* Largest packed getdents64 record for one entry (19-byte header plus an
  * 8-byte-aligned name). */
-#define VFS_DIRENT_RECORD_MAX 40u
+#define VFS_DIRENT_RECORD_MAX 96u
 
 /* File types for vfs_stat_t.mode. */
 #define VFS_S_IFREG HAKU_S_IFREG
 #define VFS_S_IFDIR HAKU_S_IFDIR
+#define VFS_S_IFLNK HAKU_S_IFLNK
+#define VFS_S_IFCHR HAKU_S_IFCHR
 
 /* Longest path (including NUL) the VFS and its backends accept. */
 #define VFS_PATH_MAX 64u
+#define VFS_MAX_MOUNTS 6u
 
 /* Filesystem-independent metadata: the fields the Linux stat layouts
  * carry. Backends fill what their filesystem can answer; the syscall
@@ -144,6 +150,14 @@ typedef struct vfs_device_ops {
     int (*readable)(void);
 } vfs_device_ops_t;
 
+/* One mount: a backend bound to a canonical directory path. The root mount
+ * uses the empty prefix. */
+typedef struct {
+    char prefix[VFS_PATH_MAX];
+    const vfs_fs_ops_t *ops;
+    uint32_t flags;
+} vfs_mount_t;
+
 /* Boot-time assembly: backends register here, then one is mounted as the
  * root filesystem that all descriptor operations route to. register
  * returns 1/0; mount_root returns 1 or a negative -VFS_E* errno.
@@ -154,6 +168,13 @@ typedef struct vfs_device_ops {
 int vfs_register_fs(const vfs_fs_ops_t *ops);
 int32_t vfs_mount_root(const char *name);
 int32_t vfs_mount_root_flags(const char *name, uint32_t flags);
+/* Mount a registered backend at a canonical directory prefix ("" for the
+ * root, otherwise a path without a leading or trailing slash). Everything
+ * below the prefix is resolved by that backend; a name that crosses mounts
+ * fails with EXDEV and the mount point itself cannot be removed. */
+int32_t vfs_mount(const char *prefix, const char *name, uint32_t flags);
+/* 1 when a backend is mounted at the prefix. */
+int vfs_mounted(const char *prefix);
 /* Install a character device (the console) for the standard descriptors. */
 int vfs_register_device(const vfs_device_ops_t *ops);
 
