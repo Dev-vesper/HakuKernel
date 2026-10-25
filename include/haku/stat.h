@@ -11,6 +11,8 @@
 #define S_IFMT  HAKU_S_IFMT
 #define S_ISREG(mode) HAKU_S_ISREG(mode)
 #define S_ISDIR(mode) HAKU_S_ISDIR(mode)
+#define S_ISLNK(mode) (((mode) & HAKU_S_IFMT) == HAKU_S_IFLNK)
+#define S_ISCHR(mode) (((mode) & HAKU_S_IFMT) == HAKU_S_IFCHR)
 
 /* stat/lstat/fstat fill the i386 "struct stat64" layout, the one glibc
  * and musl use on i386 (96 bytes). */

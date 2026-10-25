@@ -849,6 +849,23 @@ int32_t vfs_stat(uint32_t pid, const char *path, vfs_stat_t *out) {
     return stated;
 }
 
+int32_t vfs_lstat(uint32_t pid, const char *path, vfs_stat_t *out) {
+    vfs_mount_t *mount;
+    const char *relative = 0;
+    int32_t stated;
+    if (!pid_valid(pid) || !path || !out) return -VFS_EINVAL;
+    mutex_lock(&vfs_lock);
+    mount = mount_resolve(path, &relative);
+    if (!mount) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EIO;
+    }
+    stated = mount->ops->lstat ? mount->ops->lstat(relative, out)
+                               : mount->ops->stat(relative, out);
+    mutex_unlock(&vfs_lock);
+    return stated;
+}
+
 int32_t vfs_fstat(uint32_t pid, uint32_t fd, vfs_stat_t *out) {
     vfs_ofd_t *ofd;
     int32_t stated;
@@ -866,6 +883,56 @@ int32_t vfs_fstat(uint32_t pid, uint32_t fd, vfs_stat_t *out) {
     stated = ofd->ops->fstat(ofd->backend, out);
     mutex_unlock(&vfs_lock);
     return stated;
+}
+
+int32_t vfs_symlink(uint32_t pid, const char *target, const char *path) {
+    vfs_mount_t *mount;
+    const char *relative = 0;
+    int32_t created;
+    if (!pid_valid(pid) || !target || !path) return -VFS_EINVAL;
+    mutex_lock(&vfs_lock);
+    mount = mount_resolve(path, &relative);
+    if (!mount) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EIO;
+    }
+    if (!mount->ops->symlink) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EOPNOTSUPP;
+    }
+    if (relative[0] == '.' && relative[1] == 0) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EEXIST;
+    }
+    if (mount_read_only(mount)) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EROFS;
+    }
+    created = mount->ops->symlink(target, relative);
+    mutex_unlock(&vfs_lock);
+    return created;
+}
+
+int32_t vfs_readlink(uint32_t pid, const char *path, char *buffer,
+                     uint32_t size) {
+    vfs_mount_t *mount;
+    const char *relative = 0;
+    uint32_t length = 0;
+    int32_t read_result;
+    if (!pid_valid(pid) || !path || !buffer || !size) return -VFS_EINVAL;
+    mutex_lock(&vfs_lock);
+    mount = mount_resolve(path, &relative);
+    if (!mount) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EIO;
+    }
+    if (!mount->ops->readlink) {
+        mutex_unlock(&vfs_lock);
+        return -VFS_EOPNOTSUPP;
+    }
+    read_result = mount->ops->readlink(relative, buffer, size, &length);
+    mutex_unlock(&vfs_lock);
+    return read_result == 1 ? (int32_t)length : read_result;
 }
 
 void vfs_close_all(uint32_t pid) {

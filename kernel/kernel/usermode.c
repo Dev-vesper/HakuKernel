@@ -1,8 +1,12 @@
 #include "usermode.h"
+#include "devfs.h"
 #include "fat12_vfs.h"
+#include "initramfs.h"
 #include "klog.h"
 #include "paging.h"
 #include "pit.h"
+#include "procfs.h"
+#include "ramfs.h"
 #include "scheduler.h"
 #include "terminal.h"
 #include "fat12.h"
@@ -10,6 +14,7 @@
 #include "vfs.h"
 
 #define USER_ELF_MAX_SIZE (256u * 1024u)
+#define USER_INITRAMFS_MAX_SIZE (192u * 1024u)
 #define USER_EXEC_MAX_ARGUMENTS 64u
 #define USER_EXEC_MAX_BYTES 4096u
 #define USER_STACK_BOTTOM (USER_STACK_TOP - 2u * USER_PAGE_SIZE)
@@ -107,38 +112,131 @@ static int elf_rejection_self_test(const uint8_t *image,
     return 1;
 }
 
-int usermode_init(void) {
-    uint32_t loaded = 0;
-    uint32_t image_size = 0;
-    uint8_t *image;
-    int read_result;
+/* Read a whole file through the VFS into a kernel buffer. Used for the
+ * initramfs archive and for /init, both of which may live on any mounted
+ * filesystem. */
+static int32_t read_vfs_file(const char *path, uint8_t *buffer, uint32_t size,
+                             uint32_t *out_size) {
+    int32_t fd;
+    uint32_t total = 0;
+    *out_size = 0;
+    fd = vfs_open(1, path, VFS_O_RDONLY);
+    if (fd < 0) return fd;
+    for (;;) {
+        int32_t got;
+        if (total >= size) break;
+        got = vfs_read(1, (uint32_t)fd, buffer + total, size - total);
+        if (got < 0) {
+            vfs_close(1, (uint32_t)fd);
+            return got;
+        }
+        if (got == 0) break;
+        total += (uint32_t)got;
+    }
+    vfs_close(1, (uint32_t)fd);
+    *out_size = total;
+    return 1;
+}
 
-    /* Assemble the storage stack: VFS tables, then the FAT12 backend as
-     * the root filesystem. Everything below (syscalls, self-tests) only
-     * speaks the vfs_* interface from here on. */
-    vfs_init();
+/* Mount the boot namespace. With an initramfs on the data disk the root is
+ * the RAM filesystem, the disk is /disk, and /dev and /proc are their own
+ * backends; without one the FAT12 volume stays the root so an older image
+ * still boots. Returns the path of the program to run first. */
+static const char *mount_boot_filesystem(void) {
+    uint8_t *archive;
+    uint32_t archive_size = 0;
+    int32_t read_result;
+    int32_t mount_point;
+
     if (!vfs_register_device(&console_device)) {
         klog_log(KLOG_ERROR, "VFS-DEVICE-FAIL: console device registration\n");
         return 0;
     }
-    if (!vfs_register_fs(&fat12_fs_ops)) {
-        klog_log(KLOG_ERROR, "VFS-FS-FAIL: FAT12 filesystem registration\n");
+    if (!vfs_register_fs(&fat12_fs_ops) || !ramfs_init() || !devfs_init() ||
+        !procfs_init()) {
+        klog_log(KLOG_ERROR, "VFS-FS-FAIL: filesystem registration\n");
         return 0;
     }
-    if (vfs_mount_root("fat12") != 1) {
-        klog_log(KLOG_ERROR, "VFS-MOUNT-FAIL: FAT12 root mount\n");
+    /* The data disk is always available under /disk. The RAM filesystem is
+     * the namespace root, so the mount point is a real directory in it
+     * first — the same rule a Unix mount follows, and what makes the mount
+     * show up in a directory listing. */
+    if (vfs_mount_root("ramfs") != 1) {
+        klog_log(KLOG_ERROR, "VFS-MOUNT-FAIL: RAM filesystem root mount\n");
         return 0;
     }
+    /* EEXIST is fine: the directory is already there. */
+    mount_point = vfs_mkdir(1, "disk");
+    if (mount_point != 1 && mount_point != -VFS_EEXIST) {
+        klog_log(KLOG_ERROR, "VFS-MOUNT-FAIL: /disk mount point\n");
+        return 0;
+    }
+    if (vfs_mount("disk", "fat12", 0) != 1) {
+        klog_log(KLOG_ERROR, "VFS-MOUNT-FAIL: FAT12 data disk mount\n");
+        return 0;
+    }
+
+    archive = (uint8_t *)kmalloc(USER_INITRAMFS_MAX_SIZE);
+    if (!archive) {
+        klog_log(KLOG_ERROR, "INITRAMFS-FAIL: kernel heap exhausted\n");
+        return 0;
+    }
+    read_result = read_vfs_file("disk/INITRD", archive,
+                                USER_INITRAMFS_MAX_SIZE, &archive_size);
+    if (read_result != 1 || archive_size < 128u) {
+        kfree(archive);
+        klog_log(KLOG_INFO, "INITRAMFS-NONE: booting the FAT12 root\n");
+        /* An older image has no archive: keep the FAT12 volume as the root
+         * (it stays reachable at /disk as well). */
+        if (vfs_mount_root("fat12") != 1) {
+            klog_log(KLOG_ERROR, "VFS-MOUNT-FAIL: FAT12 root mount\n");
+            return 0;
+        }
+        return "HAKU.ELF";
+    }
+
+    if (initramfs_unpack(archive, archive_size) < 0) {
+        klog_log(KLOG_ERROR, "INITRAMFS-FAIL: archive rejected\n");
+        kfree(archive);
+        return 0;
+    }
+    kfree(archive);
+    if (vfs_mount("dev", "devfs", 0) != 1 ||
+        vfs_mount("proc", "procfs", 0) != 1) {
+        klog_log(KLOG_ERROR, "VFS-MOUNT-FAIL: /dev or /proc\n");
+        return 0;
+    }
+    klog_prefix();
+    klog_write("INITRAMFS-ROOT: ramfs is /, disk is /disk, /init is pid 1\n");
+    return "init";
+}
+
+int usermode_init(void) {
+    uint32_t loaded = 0;
+    uint32_t image_size = 0;
+    uint8_t *image;
+    const char *program;
+    int read_result;
+
+    /* Assemble the storage stack: VFS tables, the backends, and the boot
+     * namespace. Everything below (syscalls, self-tests) only speaks the
+     * vfs_* interface from here on. */
+    vfs_init();
+    program = mount_boot_filesystem();
+    if (!program) return 0;
+
     image = (uint8_t *)kmalloc(USER_ELF_MAX_SIZE);
     if (!image) {
         klog_log(KLOG_ERROR, "ELF-DISK-FAIL: kernel heap exhausted\n");
         return 0;
     }
-    read_result = fat12_read_file("HAKU.ELF", image, USER_ELF_MAX_SIZE,
-                                  &image_size);
+    read_result = read_vfs_file(program, image, USER_ELF_MAX_SIZE,
+                                &image_size);
     if (read_result != 1) {
         if (klog_begin(KLOG_ERROR)) {
-            klog_write("ELF-DISK-FAIL: HAKU.ELF read error=");
+            klog_write("ELF-DISK-FAIL: ");
+            klog_write(program);
+            klog_write(" read error=");
             klog_dec((uint32_t)-read_result);
             klog_write("\n");
         }
@@ -146,7 +244,9 @@ int usermode_init(void) {
         return 0;
     }
     klog_prefix();
-    klog_write("FAT12-READ-OK name=HAKU.ELF size=");
+    klog_write("INIT-READ-OK name=");
+    klog_write(program);
+    klog_write(" size=");
     klog_dec(image_size);
     klog_write("\n");
 
@@ -564,6 +664,49 @@ static uint32_t sys_rmdir(uint32_t user_path) {
     return sys_unlinkat(HAKU_AT_FDCWD, user_path, HAKU_AT_REMOVEDIR);
 }
 
+/* symlink(83)/readlink(85): the ramfs backend keeps symbolic links, so a
+ * shell can build them. The target is stored verbatim — it is resolved
+ * when the link is followed, not when it is created. */
+static uint32_t sys_symlink(uint32_t user_target, uint32_t user_path) {
+    char target[VFS_PATH_MAX];
+    char path[VFS_PATH_MAX];
+    int copied;
+    int32_t resolved;
+    int32_t created;
+
+    copied = copy_user_path(user_target, target);
+    if (copied != 1) return (uint32_t)copied;
+    if (target[0] == 0) return copy_from_user_error(HAKU_ENOENT);
+    resolved = resolve_at(HAKU_AT_FDCWD, user_path, path);
+    if (resolved != 1) return (uint32_t)resolved;
+    created = vfs_symlink(scheduler_current_pid(), target, path);
+    if (created != 1) return copy_from_user_error((uint32_t)-created);
+    return 0u;
+}
+
+static uint32_t sys_readlink(uint32_t user_path, uint32_t user_buffer,
+                             uint32_t size) {
+    char path[VFS_PATH_MAX];
+    char target[VFS_PATH_MAX];
+    int32_t resolved;
+    int32_t length;
+
+    if (size == 0u) return copy_from_user_error(HAKU_EINVAL);
+    if (!paging_user_range_valid(user_buffer, size, 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    resolved = resolve_at(HAKU_AT_FDCWD, user_path, path);
+    if (resolved != 1) return (uint32_t)resolved;
+    /* Linux truncates instead of failing when the buffer is short, so the
+     * kernel reads into its own buffer and copies back the smaller of the
+     * two lengths. */
+    if (size > sizeof(target)) size = sizeof(target);
+    length = vfs_readlink(scheduler_current_pid(), path, target, size);
+    if (length < 0) return copy_from_user_error((uint32_t)-length);
+    if (length > 0 && !copy_to_user(user_buffer, target, (uint32_t)length))
+        return copy_from_user_error(HAKU_EFAULT);
+    return (uint32_t)length;
+}
+
 /* Convert the VFS metadata into the two Linux i386 stat layouts. */
 static void vfs_stat_to_stat(const vfs_stat_t *in, haku_stat_t *out) {
     out->st_dev = in->st_dev;
@@ -616,7 +759,15 @@ static void vfs_stat_to_stat64(const vfs_stat_t *in, haku_stat64_t *out) {
 
 /* stat(106)/lstat(107): the 64-byte i386 "struct stat". Haku has no
  * symbolic links, so lstat reports the same metadata as stat. */
-static uint32_t sys_stat(uint32_t user_path, uint32_t user_buf) {
+/* stat/lstat share everything except whether the final component is
+ * followed, so both entry points take the flag. */
+static int32_t stat_path(int no_follow, const char *path, vfs_stat_t *out) {
+    uint32_t pid = scheduler_current_pid();
+    return no_follow ? vfs_lstat(pid, path, out) : vfs_stat(pid, path, out);
+}
+
+static uint32_t sys_stat(uint32_t user_path, uint32_t user_buf,
+                         int no_follow) {
     char path[VFS_PATH_MAX];
     vfs_stat_t st;
     haku_stat_t out;
@@ -625,7 +776,7 @@ static uint32_t sys_stat(uint32_t user_path, uint32_t user_buf) {
     if (resolved != 1) return (uint32_t)resolved;
     if (!paging_user_range_valid(user_buf, sizeof(out), 1))
         return copy_from_user_error(HAKU_EFAULT);
-    result = vfs_stat(scheduler_current_pid(), path, &st);
+    result = stat_path(no_follow, path, &st);
     if (result != 1) return (uint32_t)result;
     vfs_stat_to_stat(&st, &out);
     if (!copy_to_user(user_buf, &out, sizeof(out)))
@@ -635,7 +786,8 @@ static uint32_t sys_stat(uint32_t user_path, uint32_t user_buf) {
 
 /* stat64(195)/lstat64(196): the 96-byte i386 "struct stat64" that glibc
  * and musl use on i386. */
-static uint32_t sys_stat64(uint32_t user_path, uint32_t user_buf) {
+static uint32_t sys_stat64(uint32_t user_path, uint32_t user_buf,
+                           int no_follow) {
     char path[VFS_PATH_MAX];
     vfs_stat_t st;
     haku_stat64_t out;
@@ -644,7 +796,7 @@ static uint32_t sys_stat64(uint32_t user_path, uint32_t user_buf) {
     if (resolved != 1) return (uint32_t)resolved;
     if (!paging_user_range_valid(user_buf, sizeof(out), 1))
         return copy_from_user_error(HAKU_EFAULT);
-    result = vfs_stat(scheduler_current_pid(), path, &st);
+    result = stat_path(no_follow, path, &st);
     if (result != 1) return (uint32_t)result;
     vfs_stat_to_stat64(&st, &out);
     if (!copy_to_user(user_buf, &out, sizeof(out)))
@@ -754,7 +906,7 @@ static uint32_t sys_fstatat64(uint32_t dirfd, uint32_t user_path,
     if (resolved != 1) return (uint32_t)resolved;
     if (!paging_user_range_valid(user_buf, sizeof(out), 1))
         return copy_from_user_error(HAKU_EFAULT);
-    result = vfs_stat(scheduler_current_pid(), path, &st);
+    result = stat_path((flags & HAKU_AT_SYMLINK_NOFOLLOW) != 0, path, &st);
     if (result != 1) return (uint32_t)result;
     vfs_stat_to_stat64(&st, &out);
     if (!copy_to_user(user_buf, &out, sizeof(out)))
@@ -781,7 +933,7 @@ static uint32_t sys_statx(uint32_t dirfd, uint32_t user_path, uint32_t flags,
     if (resolved != 1) return (uint32_t)resolved;
     if (!paging_user_range_valid(user_buf, sizeof(out), 1))
         return copy_from_user_error(HAKU_EFAULT);
-    result = vfs_stat(scheduler_current_pid(), path, &st);
+    result = stat_path((flags & HAKU_AT_SYMLINK_NOFOLLOW) != 0, path, &st);
     if (result != 1) return (uint32_t)result;
 
     memset(&out, 0, sizeof(out));
@@ -1740,6 +1892,12 @@ regs_t *user_syscall(regs_t *r) {
     case HAKU_SYS_RMDIR:
         r->eax = sys_rmdir(r->ebx);
         return r;
+    case HAKU_SYS_SYMLINK:
+        r->eax = sys_symlink(r->ebx, r->ecx);
+        return r;
+    case HAKU_SYS_READLINK:
+        r->eax = sys_readlink(r->ebx, r->ecx, r->edx);
+        return r;
     case HAKU_SYS_DUP:
         r->eax = (uint32_t)vfs_dup(scheduler_current_pid(), r->ebx);
         return r;
@@ -1776,19 +1934,19 @@ regs_t *user_syscall(regs_t *r) {
         r->eax = scheduler_munmap(r->ebx, r->ecx);
         return r;
     case HAKU_SYS_STAT:
-        r->eax = sys_stat(r->ebx, r->ecx);
+        r->eax = sys_stat(r->ebx, r->ecx, 0);
         return r;
     case HAKU_SYS_LSTAT:
-        r->eax = sys_stat(r->ebx, r->ecx);
+        r->eax = sys_stat(r->ebx, r->ecx, 1);
         return r;
     case HAKU_SYS_FSTAT:
         r->eax = sys_fstat(r->ebx, r->ecx);
         return r;
     case HAKU_SYS_STAT64:
-        r->eax = sys_stat64(r->ebx, r->ecx);
+        r->eax = sys_stat64(r->ebx, r->ecx, 0);
         return r;
     case HAKU_SYS_LSTAT64:
-        r->eax = sys_stat64(r->ebx, r->ecx);
+        r->eax = sys_stat64(r->ebx, r->ecx, 1);
         return r;
     case HAKU_SYS_FSTAT64:
         r->eax = sys_fstat64(r->ebx, r->ecx);

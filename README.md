@@ -251,6 +251,7 @@ the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `fork` (2), `read` (3), `write` (4), `open` (5), `close` (6), `waitpid` (7),
 `unlink` (10), `execve` (11), `lseek` (19), `getpid` (20), `rename` (38),
 `mkdir` (39), `rmdir` (40), `dup` (41), `brk` (45), `dup2` (63),
+`symlink` (83), `readlink` (85),
 `gettimeofday` (78), `mmap` (90), `munmap` (91), `stat` (106), `lstat` (107),
 `fstat` (108), `wait4` (114), `clone` (120), `mprotect` (125),
 `nanosleep` (162), `mremap` (163), `vfork` (190), `mmap2` (192),
@@ -552,9 +553,9 @@ reports `PER_LINUX`. The C library covers all of it
 `*at` wrappers in `fcntl.h`), and the ring-3 self-test exercises the whole
 path as `USER-FS-ABI-OK`.
 
-Not implemented: `symlink`/`readlink` (FAT12 has no link type),
-`select` (musl builds it on `poll`), the legacy `getdents` record format,
-blocking `poll`, real record locks, and `mremap` with `MREMAP_DONTUNMAP`.
+Not implemented: `select` (musl builds it on `poll`), the legacy `getdents`
+record format, blocking `poll`, real record locks, and `mremap` with
+`MREMAP_DONTUNMAP`.
 
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It
@@ -590,6 +591,10 @@ and the writable+executable combination — and requires the loader to reject
 every one of them, plus a truncated image. `SCHED-CONCURRENT-OK` runs two
 children that create, verify, and unlink their own files at the same time,
 which exercises the sleeping VFS and disk mutexes end to end.
+`USER-INITRAMFS-OK` is the boot-namespace check described under "The boot
+namespace" below: it runs as a process started from the unpacked archive, so
+a broken mount table or a missing `/init` fails the build before anything
+else can pass.
 
 ### Supported POSIX subset
 
@@ -608,6 +613,7 @@ userland; conformance is not a goal. What exists, by area:
   `dup`/`dup2`/`dup3`, `pipe`/`pipe2`, `fcntl`, `ioctl` (console),
   `unlink`/`unlinkat`, `rename`/`renameat`, `mkdir`/`mkdirat`, `rmdir`,
   `stat`/`lstat`/`fstat` (32- and 64-bit), `fstatat64`, `statx`,
+  `symlink`/`readlink` (on the RAM root),
   `truncate`, `ftruncate`, `access`/`faccessat`, `chdir`, `getcwd`,
   `getdents64`, `poll`, and `chmod`/`chown`/`fchmod`/`fchown` (accepted,
   nothing to change).
@@ -615,9 +621,10 @@ userland; conformance is not a goal. What exists, by area:
 - **Haku-specific:** `spawn`, `getusage`, `futex`.
 
 Deliberately absent: process groups and job control, threads (`clone`
-rejects the thread flags), symbolic and hard links, file-backed mappings,
-`socket`, `mount`, and networking. Where a call exists but cannot be
-honoured — permission bits, record locks, terminal modes — it succeeds
+rejects the thread flags), hard links, file-backed mappings,
+`socket`, `mount` (the boot namespace is fixed at boot), and networking.
+Where a call exists but cannot be honoured — permission bits, record locks,
+terminal modes — it succeeds
 without changing state and the limitation is documented above instead of
 returning a surprise error.
 
@@ -765,28 +772,34 @@ volume/chain bounds checks are shared by files and directories.
 `kernel/fs/vfs/vfs.c` supplies per-process descriptors and the user `open`, `close`,
 `read`, `write`, and `lseek` interface through a filesystem-independent
 operations vector (`vfs_fs_ops`: mount/open/close/read/write/seek/unlink/
-rename/mkdir/rmdir/stat/fstat, each returning 1 or a `-VFS_E*` errno). VFS
-never names a concrete filesystem;
-`kernel/fs/fat12/fat12_vfs.c` implements the vector for FAT12 (flag translation,
-per-open handle allocation, errno mapping) and registers it at boot, after
-which one backend is mounted as the root filesystem. A root can be mounted
-read-only (`vfs_mount_root_flags(..., VFS_MOUNT_RDONLY)`); VFS then returns
-`EROFS` for every mutating operation instead of calling the backend. Disk
-I/O is serialized
+rename/mkdir/rmdir/stat/lstat/fstat, each returning 1 or a `-VFS_E*` errno).
+VFS never names a concrete filesystem; each backend registers the vector and
+the VFS binds it to a directory path in a mount table. Path resolution picks
+the longest matching prefix, so `/disk/HAKU.ELF` reaches the FAT12 backend as
+`HAKU.ELF` while `/dev/null` reaches the device backend as `null`; the mount
+root itself is `"."`, the same token the syscall layer hands the VFS after
+canonicalizing `/`. A mount is read-only when it is created with
+`VFS_MOUNT_RDONLY`, and VFS then returns `EROFS` for every mutating operation
+instead of calling the backend, including writes through a descriptor that
+was opened before the remount. A mount point cannot be unlinked, renamed, or
+removed (`EBUSY`), a `rename` that would cross two mounts reports `EXDEV`, and
+a mount point directory must exist in the parent filesystem so it shows up in
+a listing. Disk I/O is serialized
 against the preemptive scheduler; file contents and directory/FAT metadata
 are written through to the ATA disk. The current VFS supports up to five
 simultaneously open regular files per process (descriptors 3-7; `0`/`1`/`2`
 are the console) and the `O_RDONLY`, `O_WRONLY`, `O_RDWR`, `O_CREAT`,
 `O_EXCL`, `O_TRUNC`, and `O_APPEND` flags.
 
-The filesystem remains intentionally small: no partition tables, long
-filenames, permissions, mount points, journaling, FAT16, or FAT32.
-Directories are one cluster (16 entries) and do not grow; moving a directory
+FAT12 remains intentionally small as a *data-disk* format: no partition
+tables, long filenames, permissions, journaling, FAT16, or FAT32 (see the
+next section for why). Directories are one cluster (16 entries) and do not
+grow; moving a directory
 across parents with `rename` leaves its `..` entry pointing at the old
-parent, so directories should be renamed in place. This is a minimal
-single-volume VFS, not full POSIX filesystem conformance. The QEMU headless
-test creates `P1.TXT`, exercises `DIR1/T.TXT` with `./DIR1/../DIR1` paths,
-and verifies multi-sector writes, reads, seeks, close, and reopen.
+parent, so directories should be renamed in place. The userland root is the
+RAM filesystem described below, which has none of those limits. The QEMU
+headless test creates `P1.TXT`, exercises `DIR1/T.TXT` with `./DIR1/../DIR1`
+paths, and verifies multi-sector writes, reads, seeks, close, and reopen.
 
 #### Why FAT12 with 8.3 names, and not something bigger
 
@@ -823,14 +836,57 @@ export data through, and the roadmap treats that gate as mandatory rather than
 optional.
 
 `tools/mkfat12.py` puts `HAKU.ELF`, the exec target `NEXT.ELF`, and the
-spawn/wait child `CHILD.ELF` on a generated 1.44 MB FAT12 image. QEMU
+spawn/wait child `CHILD.ELF` on a generated 1.44 MB FAT12 image, together with
+the initramfs archive `INITRD` (no extension, because the volume only stores
+8.3 names). QEMU
 attaches this image as the primary-master IDE disk while the existing boot
 floppy still starts the kernel; the build also attaches a generated
 1.44 MB spare disk as secondary master so the headless run exercises
 device scanning across both legacy channels. The kernel
 loads the initial ELF at startup; `execve` uses VFS to load subsequent ELF
-files from the disk into a fresh address space before replacing the current
-image.
+files into a fresh address space before replacing the current image.
+
+#### The boot namespace: initramfs, ramfs, `/dev`, and `/proc`
+
+The root of the userland namespace is the RAM filesystem, not the FAT12
+volume. At boot the kernel mounts `ramfs` on `/`, creates the `/disk` mount
+point directory, mounts the FAT12 data disk there, reads `disk/INITRD`, and
+unpacks the cpio archive into the RAM root. `/init` from that archive runs as
+PID 1; the FAT volume stays reachable at `/disk`, and an image without an
+archive still boots the old way with FAT12 as the root.
+
+- **`ramfs`** (`kernel/fs/ramfs`) is the writable root: long names (48 bytes
+  per component), permission bits, timestamps from the PIT, nested
+  directories, and symbolic links with a hop limit of 8. Nodes come from a
+  fixed 160-entry table and file data from the kernel heap (96 KiB per file),
+  so nothing survives a reboot — which is exactly what an initramfs needs.
+  Unlinking a file that is still open keeps the data alive until the last
+  descriptor closes, the same promise FAT12 makes.
+- **`devfs`** (`kernel/fs/devfs`) is a fixed table of `/dev/null`, `/dev/zero`,
+  `/dev/urandom`, `/dev/random`, `/dev/console`, and `/dev/tty`. These are
+  ordinary descriptors on the normal read/write path; `seek` reports `ESPIPE`
+  and the entries cannot be unlinked or renamed.
+- **`procfs`** (`kernel/fs/procfs`) generates `/proc/version`, `/proc/uptime`,
+  and `/proc/meminfo` when the file is opened, so a `cat` sees current values.
+  It is read-only: writes report `EACCES`, and the entries cannot be removed.
+
+The archive is cpio "newc" (`070701`), built by `tools/mkcpio.py` from the
+same ELF images the FAT volume carries. It holds `/init`, the programs the
+exec tests use, and empty `dev`, `proc`, and `disk` directories so the mount
+points appear in a listing. `INITRAMFS-UNPACK-OK entries=… files=… bytes=…`
+reports what was unpacked, and the ring-3 self-test proves the rest from user
+mode (`USER-INITRAMFS-OK`): the root listing, a name longer than 8.3, a file
+two directories deep, a symlink that `lstat` reports as a link while `stat`
+and `open` follow it, `/dev/null` returning end of file, `/dev/zero`
+returning zeros, `/proc/version` naming the kernel, and `/disk/HAKU.ELF`
+starting with the ELF magic.
+
+`lstat` is a real no-follow call: the backend's optional `lstat` operation
+describes the last component itself (ramfs walks with `follow_last = 0`),
+`AT_SYMLINK_NOFOLLOW` is honored by `fstatat64` and `statx`, and a backend
+without links answers exactly like `stat`. `symlink` and `readlink` are
+available to user mode; `readlink` truncates to the caller's buffer instead
+of failing, like Linux.
 
 ### Locking
 
@@ -960,7 +1016,11 @@ Haku/
     fs/
       fat12/            fat12.c/.h: writable FAT12 files, subdirectories, paths
                         fat12_vfs.c/.h: FAT12 vfs_fs_ops backend + errno mapping
-      vfs/              vfs.c/.h: fs-independent descriptors, registry, root mount
+      ramfs/            ramfs.c/.h: in-memory root (long names, modes, links)
+      devfs/            devfs.c/.h: /dev/null, zero, urandom, console, tty
+      procfs/           procfs.c/.h: generated /proc/version, uptime, meminfo
+      initramfs/        cpio.c/.h: cpio "newc" unpacker into the VFS
+      vfs/              vfs.c/.h: fs-independent descriptors, mount table
       test/             fs_test.c/.h: kernel-side filesystem self-tests
     kernel/             kernel_main.c: kernel startup
                         scheduler.c/.h: scheduler + per-process usage counters
@@ -982,6 +1042,7 @@ Haku/
   tools/pe2bin.py      PE image → flat binary (+ reports ENTRY= for the bootloader)
   tools/mkimg.py       boot floppy size/signature checks
   tools/mkfat12.py     FAT12 image builder for the user ELF
+  tools/mkcpio.py      cpio "newc" initramfs builder (INITRD on the FAT volume)
   tools/pe2elf.py      fixed-base PE32 to ELF32 (RX/R/RW) for user C
   .github/workflows/  ci.yml: hosted headless build/test + artifacts
                       release.yml: tag-driven bootable image release
@@ -989,6 +1050,7 @@ Haku/
   build/               generated files (stage*.bin, *.obj/pe, haku.img, ...)
   haku.img             bootable floppy image
   build/haku_fs.img    1.44 MB FAT12 ATA disk image with HAKU/NEXT/LIB ELFs
+                      and the INITRD initramfs archive
   build/ata_spare.img  1.44 MB blank ATA disk on the secondary channel (scan test)
 ```
 

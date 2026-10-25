@@ -136,7 +136,7 @@ static int test_empty_file(void) {
     int ok = 1;
     int32_t fd;
     int32_t r;
-    fd = vfs_open(FS_TEST_PID, "EMPTY.TXT", VFS_O_CREAT | VFS_O_RDWR);
+    fd = vfs_open(FS_TEST_PID, "disk/EMPTY.TXT", VFS_O_CREAT | VFS_O_RDWR);
     ok &= expect_tagged("FS-EDGE-FAIL", "empty-create", fd >= 3 ? 0 : fd, 0);
     if (fd < 3) return 0;
     /* A fresh file is already at EOF: reads return 0, END is 0. */
@@ -170,7 +170,7 @@ static int test_sector_edges(void) {
     int32_t fd;
     int32_t r;
     fill_pattern(edge_buf, sizeof(edge_buf));
-    fd = vfs_open(FS_TEST_PID, "EDGE.TXT", VFS_O_CREAT | VFS_O_RDWR);
+    fd = vfs_open(FS_TEST_PID, "disk/EDGE.TXT", VFS_O_CREAT | VFS_O_RDWR);
     ok &= expect_tagged("FS-EDGE-FAIL", "edge-create", fd >= 3 ? 0 : fd, 0);
     if (fd < 3) return 0;
     /* Exact-sector write, then a two-sector write. */
@@ -212,20 +212,23 @@ static int test_sector_edges(void) {
 
 /* Build a 3-cluster scratch file through the public VFS interface, then
  * locate its chain with the read-only debug hook for fault injection.
- * Returns 1 or a negative -VFS_E* errno. */
-static int open_scratch_chain(const char *name, uint16_t *first_out) {
+ * The debug hook talks to the backend, so it takes the name the way the
+ * backend sees it (relative to the mount) while the VFS takes the path
+ * with the mount prefix. Returns 1 or a negative -VFS_E* errno. */
+static int open_scratch_chain(const char *path, const char *backend_name,
+                              uint16_t *first_out) {
     int32_t fd;
     int32_t written;
     int looked_up;
     fill_pattern(edge_buf, 3u * FS_SECTOR);
-    fd = vfs_open(FS_TEST_PID, name,
+    fd = vfs_open(FS_TEST_PID, path,
                   VFS_O_CREAT | VFS_O_RDWR | VFS_O_TRUNC);
     if (fd < 3) return fd;
     written = vfs_write(FS_TEST_PID, (uint32_t)fd, edge_buf,
                         3u * FS_SECTOR);
     vfs_close(FS_TEST_PID, (uint32_t)fd);
     if (written != (int32_t)(3u * FS_SECTOR)) return -VFS_EIO;
-    looked_up = fat12_debug_first_cluster(name, first_out);
+    looked_up = fat12_debug_first_cluster(backend_name, first_out);
     if (looked_up != 1) return fat12_map_errno(looked_up);
     return 1;
 }
@@ -234,7 +237,7 @@ static int heal_check(const char *label, uint32_t position, uint32_t count) {
     int32_t fd;
     int32_t r;
     int ok = 1;
-    fd = vfs_open(FS_TEST_PID, "CHAIN.TXT", VFS_O_RDONLY);
+    fd = vfs_open(FS_TEST_PID, "disk/CHAIN.TXT", VFS_O_RDONLY);
     if (fd < 3) {
         expect_tagged("FS-CORRUPT-FAIL", label, fd, 3);
         return 0;
@@ -270,12 +273,12 @@ static int test_corrupt_chains(void) {
     int setup_result;
     /* FULLD.TXT is only a directory entry until the data-full probe, so
      * creating it up front keeps the later FAT snapshot accurate. */
-    fd = vfs_open(FS_TEST_PID, "FULLD.TXT", VFS_O_CREAT | VFS_O_RDWR);
+    fd = vfs_open(FS_TEST_PID, "disk/FULLD.TXT", VFS_O_CREAT | VFS_O_RDWR);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "corrupt-fulld-create",
                         fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) vfs_close(FS_TEST_PID, (uint32_t)fd);
     else return 0;
-    setup_result = open_scratch_chain("CHAIN.TXT", &first);
+    setup_result = open_scratch_chain("disk/CHAIN.TXT", "CHAIN.TXT", &first);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "corrupt-setup", setup_result, 1);
     if (setup_result != 1) return 0;
     if (!snap_take(&snap)) {
@@ -322,7 +325,7 @@ static int test_corrupt_chains(void) {
     chain_set(work, first, FS_FAT12_EOC);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "trunc-patch",
                         snap_write_all(&snap, work), 1);
-    fd = vfs_open(FS_TEST_PID, "CHAIN.TXT", VFS_O_RDONLY);
+    fd = vfs_open(FS_TEST_PID, "disk/CHAIN.TXT", VFS_O_RDONLY);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "trunc-open", fd >= 3 ? 0 : fd,
                         0);
     if (fd >= 3) {
@@ -347,7 +350,7 @@ static int test_corrupt_chains(void) {
     chain_set(work, b, FS_FAT12_BAD);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "bad-patch",
                         snap_write_all(&snap, work), 1);
-    fd = vfs_open(FS_TEST_PID, "CHAIN.TXT", VFS_O_RDONLY);
+    fd = vfs_open(FS_TEST_PID, "disk/CHAIN.TXT", VFS_O_RDONLY);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "bad-open", fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) {
         ok &= expect_tagged("FS-CORRUPT-FAIL", "bad-seek",
@@ -372,7 +375,7 @@ static int test_corrupt_chains(void) {
     chain_set(work, b, FS_FAT12_RESERVED);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "reserved-patch",
                         snap_write_all(&snap, work), 1);
-    fd = vfs_open(FS_TEST_PID, "CHAIN.TXT", VFS_O_RDONLY);
+    fd = vfs_open(FS_TEST_PID, "disk/CHAIN.TXT", VFS_O_RDONLY);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "reserved-open",
                         fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) {
@@ -404,10 +407,10 @@ static int test_corrupt_chains(void) {
                         snap_write_all(&snap, work), 1);
     ok &= heal_check("cycle-read-terminates", 0, 3u * FS_SECTOR);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "cycle-trunc-eio",
-                        vfs_open(FS_TEST_PID, "CHAIN.TXT",
+                        vfs_open(FS_TEST_PID, "disk/CHAIN.TXT",
                                  VFS_O_RDWR | VFS_O_TRUNC),
                         -VFS_EIO);
-    fd = vfs_open(FS_TEST_PID, "CHAIN.TXT", VFS_O_RDONLY);
+    fd = vfs_open(FS_TEST_PID, "disk/CHAIN.TXT", VFS_O_RDONLY);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "cycle-empty-open",
                         fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) {
@@ -421,7 +424,7 @@ static int test_corrupt_chains(void) {
     }
     /* Heal with ordinary writes: the freed loop clusters are reusable
      * and the entry is already a valid empty file. */
-    fd = vfs_open(FS_TEST_PID, "CHAIN.TXT",
+    fd = vfs_open(FS_TEST_PID, "disk/CHAIN.TXT",
                   VFS_O_CREAT | VFS_O_RDWR | VFS_O_TRUNC);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "cycle-recreate",
                         fd >= 3 ? 0 : fd, 0);
@@ -457,7 +460,7 @@ static int test_corrupt_chains(void) {
         chain_set(work, cluster, FS_FAT12_EOC);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "datafull-patch",
                         snap_write_all(&snap, work), 1);
-    fd = vfs_open(FS_TEST_PID, "FULLD.TXT", VFS_O_RDWR);
+    fd = vfs_open(FS_TEST_PID, "disk/FULLD.TXT", VFS_O_RDWR);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "datafull-open",
                         fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) {
@@ -471,7 +474,7 @@ static int test_corrupt_chains(void) {
     }
     ok &= expect_tagged("FS-CORRUPT-FAIL", "datafull-restore",
                         snap_write_all(&snap, snap.image), 1);
-    fd = vfs_open(FS_TEST_PID, "FULLD.TXT", VFS_O_RDWR);
+    fd = vfs_open(FS_TEST_PID, "disk/FULLD.TXT", VFS_O_RDWR);
     ok &= expect_tagged("FS-CORRUPT-FAIL", "datafull-heal-open",
                         fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) {
@@ -524,7 +527,7 @@ static int test_write_rollback(void) {
 
     /* Scratch files up front so the snapshots below cover their chains.
      * ROLL stays empty; TRUNC owns three clusters for the cycle probe. */
-    fd = vfs_open(FS_TEST_PID, "ROLL.TXT", VFS_O_CREAT | VFS_O_RDWR);
+    fd = vfs_open(FS_TEST_PID, "disk/ROLL.TXT", VFS_O_CREAT | VFS_O_RDWR);
     ok &= expect_tagged("FS-ROLLBACK-FAIL", "rollback-roll-create",
                         fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) vfs_close(FS_TEST_PID, (uint32_t)fd);
@@ -532,7 +535,7 @@ static int test_write_rollback(void) {
         ok = 0;
         goto done;
     }
-    setup_result = open_scratch_chain("TRUNC.TXT", &first);
+    setup_result = open_scratch_chain("disk/TRUNC.TXT", "TRUNC.TXT", &first);
     ok &= expect_tagged("FS-ROLLBACK-FAIL", "rollback-trunc-setup",
                         setup_result, 1);
     if (setup_result != 1) {
@@ -550,7 +553,7 @@ static int test_write_rollback(void) {
      * be zeroed, so the size must stay 0 and the error stays ENOSPC. */
     ok &= expect_tagged("FS-ROLLBACK-FAIL", "gap-patch",
                         craft_disk_full(&snap, work), 1);
-    fd = vfs_open(FS_TEST_PID, "ROLL.TXT", VFS_O_RDWR);
+    fd = vfs_open(FS_TEST_PID, "disk/ROLL.TXT", VFS_O_RDWR);
     ok &= expect_tagged("FS-ROLLBACK-FAIL", "gap-open",
                         fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) {
@@ -573,7 +576,7 @@ static int test_write_rollback(void) {
     ok &= expect_tagged("FS-ROLLBACK-FAIL", "gap-restore",
                         snap_write_all(&snap, snap.image), 1);
     /* The volume heals: a plain small write works again. */
-    fd = vfs_open(FS_TEST_PID, "ROLL.TXT", VFS_O_RDWR);
+    fd = vfs_open(FS_TEST_PID, "disk/ROLL.TXT", VFS_O_RDWR);
     ok &= expect_tagged("FS-ROLLBACK-FAIL", "gap-heal-open",
                         fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) {
@@ -599,7 +602,7 @@ static int test_write_rollback(void) {
     ok &= expect_tagged("FS-ROLLBACK-FAIL", "partial-patch",
                         craft_disk_full(&snap, work), 1);
     fill_pattern(edge_buf, 600);
-    fd = vfs_open(FS_TEST_PID, "ROLL.TXT", VFS_O_RDWR);
+    fd = vfs_open(FS_TEST_PID, "disk/ROLL.TXT", VFS_O_RDWR);
     ok &= expect_tagged("FS-ROLLBACK-FAIL", "partial-open",
                         fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) {
@@ -649,12 +652,12 @@ static int test_write_rollback(void) {
     ok &= expect_tagged("FS-ROLLBACK-FAIL", "trunc-cycle-patch",
                         snap_write_all(&snap, work), 1);
     ok &= expect_tagged("FS-ROLLBACK-FAIL", "trunc-open-eio",
-                        vfs_open(FS_TEST_PID, "TRUNC.TXT",
+                        vfs_open(FS_TEST_PID, "disk/TRUNC.TXT",
                                  VFS_O_RDWR | VFS_O_TRUNC),
                         -VFS_EIO);
     /* No restore: the failed free already released the loop and the
      * directory entry is consistent-as-empty by construction. */
-    fd = vfs_open(FS_TEST_PID, "TRUNC.TXT", VFS_O_RDONLY);
+    fd = vfs_open(FS_TEST_PID, "disk/TRUNC.TXT", VFS_O_RDONLY);
     ok &= expect_tagged("FS-ROLLBACK-FAIL", "trunc-reopen",
                         fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) {
@@ -682,7 +685,7 @@ static int test_stat_metadata(void) {
     int32_t fd;
     vfs_stat_t st;
 
-    fd = vfs_open(FS_TEST_PID, "STAT.TXT", VFS_O_CREAT | VFS_O_RDWR);
+    fd = vfs_open(FS_TEST_PID, "disk/STAT.TXT", VFS_O_CREAT | VFS_O_RDWR);
     ok &= expect_tagged("FS-STAT-FAIL", "stat-create", fd >= 3 ? 0 : fd, 0);
     if (fd < 3) return 0;
     ok &= expect_tagged("FS-STAT-FAIL", "stat-write",
@@ -706,7 +709,7 @@ static int test_stat_metadata(void) {
                         vfs_close(FS_TEST_PID, (uint32_t)fd), 0);
 
     ok &= expect_tagged("FS-STAT-FAIL", "stat-path",
-                        vfs_stat(FS_TEST_PID, "STAT.TXT", &st), 1);
+                        vfs_stat(FS_TEST_PID, "disk/STAT.TXT", &st), 1);
     ok &= expect_tagged("FS-STAT-FAIL", "stat-path-mode",
                         (st.st_mode & VFS_S_IFREG) ? 0 : 1, 0);
     ok &= expect_tagged("FS-STAT-FAIL", "stat-path-size",
@@ -714,17 +717,19 @@ static int test_stat_metadata(void) {
     ok &= expect_tagged("FS-STAT-FAIL", "stat-path-ino",
                         st.st_ino != 0u ? 0 : 1, 0);
 
+    /* The volume root is the mount point, so the backend sees "." there;
+     * stat through the mount prefix reaches the same directory. */
     ok &= expect_tagged("FS-STAT-FAIL", "stat-dir",
-                        vfs_stat(FS_TEST_PID, "/", &st), 1);
+                        vfs_stat(FS_TEST_PID, "disk", &st), 1);
     ok &= expect_tagged("FS-STAT-FAIL", "stat-dir-mode",
                         (st.st_mode & VFS_S_IFDIR) ? 0 : 1, 0);
     ok &= expect_tagged("FS-STAT-FAIL", "stat-dir-nlink",
                         st.st_nlink == 1u ? 0 : 1, 0);
 
     ok &= expect_tagged("FS-STAT-FAIL", "stat-missing",
-                        vfs_stat(FS_TEST_PID, "NOSUCH.TXT", &st), -VFS_ENOENT);
+                        vfs_stat(FS_TEST_PID, "disk/NOSUCH.TXT", &st), -VFS_ENOENT);
     ok &= expect_tagged("FS-STAT-FAIL", "stat-unlink",
-                        vfs_unlink(FS_TEST_PID, "STAT.TXT"), 1);
+                        vfs_unlink(FS_TEST_PID, "disk/STAT.TXT"), 1);
     return ok;
 }
 
@@ -768,13 +773,13 @@ static int test_read_only(void) {
     int32_t fd;
     int32_t writable;
 
-    writable = vfs_open(FS_TEST_PID, "HAKU.ELF", VFS_O_RDWR);
+    writable = vfs_open(FS_TEST_PID, "disk/HAKU.ELF", VFS_O_RDWR);
     pass &= expect("ro-preopen", writable >= 3 ? 0 : writable, 0);
 
     pass &= expect("ro-mount",
-                   vfs_mount_root_flags("fat12", VFS_MOUNT_RDONLY), 1);
+                   vfs_mount("disk", "fat12", VFS_MOUNT_RDONLY), 1);
 
-    fd = vfs_open(FS_TEST_PID, "HAKU.ELF", VFS_O_RDONLY);
+    fd = vfs_open(FS_TEST_PID, "disk/HAKU.ELF", VFS_O_RDONLY);
     pass &= expect("ro-open-read", fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) {
         pass &= expect("ro-read",
@@ -786,23 +791,25 @@ static int test_read_only(void) {
     }
 
     pass &= expect("ro-open-write",
-                   vfs_open(FS_TEST_PID, "HAKU.ELF", VFS_O_WRONLY),
+                   vfs_open(FS_TEST_PID, "disk/HAKU.ELF", VFS_O_WRONLY),
                    -VFS_EROFS);
     pass &= expect("ro-create",
-                   vfs_open(FS_TEST_PID, "RO.TXT",
+                   vfs_open(FS_TEST_PID, "disk/RO.TXT",
                             VFS_O_CREAT | VFS_O_WRONLY),
                    -VFS_EROFS);
     pass &= expect("ro-trunc",
-                   vfs_open(FS_TEST_PID, "HAKU.ELF",
+                   vfs_open(FS_TEST_PID, "disk/HAKU.ELF",
                             VFS_O_RDWR | VFS_O_TRUNC),
                    -VFS_EROFS);
-    pass &= expect("ro-unlink", vfs_unlink(FS_TEST_PID, "HAKU.ELF"),
+    pass &= expect("ro-unlink", vfs_unlink(FS_TEST_PID, "disk/HAKU.ELF"),
                    -VFS_EROFS);
     pass &= expect("ro-rename",
-                   vfs_rename(FS_TEST_PID, "HAKU.ELF", "RO.ELF"),
+                   vfs_rename(FS_TEST_PID, "disk/HAKU.ELF", "disk/RO.ELF"),
                    -VFS_EROFS);
-    pass &= expect("ro-mkdir", vfs_mkdir(FS_TEST_PID, "RODIR"), -VFS_EROFS);
-    pass &= expect("ro-rmdir", vfs_rmdir(FS_TEST_PID, "RODIR"), -VFS_EROFS);
+    pass &= expect("ro-mkdir",
+                   vfs_mkdir(FS_TEST_PID, "disk/RODIR"), -VFS_EROFS);
+    pass &= expect("ro-rmdir",
+                   vfs_rmdir(FS_TEST_PID, "disk/RODIR"), -VFS_EROFS);
 
     if (writable >= 3) {
         pass &= expect("ro-late-write",
@@ -814,14 +821,14 @@ static int test_read_only(void) {
         pass = 0;
     }
 
-    pass &= expect("ro-remount", vfs_mount_root_flags("fat12", 0), 1);
-    fd = vfs_open(FS_TEST_PID, "RO.TXT", VFS_O_CREAT | VFS_O_RDWR);
+    pass &= expect("ro-remount", vfs_mount("disk", "fat12", 0), 1);
+    fd = vfs_open(FS_TEST_PID, "disk/RO.TXT", VFS_O_CREAT | VFS_O_RDWR);
     pass &= expect("rw-create", fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) {
         pass &= expect("rw-write",
                        vfs_write(FS_TEST_PID, (uint32_t)fd, scratch, 1), 1);
         pass &= expect("rw-close", vfs_close(FS_TEST_PID, (uint32_t)fd), 0);
-        pass &= expect("rw-unlink", vfs_unlink(FS_TEST_PID, "RO.TXT"), 1);
+        pass &= expect("rw-unlink", vfs_unlink(FS_TEST_PID, "disk/RO.TXT"), 1);
     } else {
         pass = 0;
     }
@@ -861,30 +868,30 @@ void fs_error_self_test(void) {
     pass &= expect("if-bad-mount", vfs_mount_root("no-such-fs"),
                    -VFS_EINVAL);
     pass &= expect("if-null-register", vfs_register_fs(0), 0);
-    fd = vfs_open(FS_TEST_PID, "HAKU.ELF", VFS_O_RDONLY);
+    fd = vfs_open(FS_TEST_PID, "disk/HAKU.ELF", VFS_O_RDONLY);
     pass &= expect("if-root-alive", fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) vfs_close(FS_TEST_PID, (uint32_t)fd);
     else pass = 0;
 
     /* Missing file. */
     pass &= expect("missing-open",
-                   vfs_open(FS_TEST_PID, "NOPE.TXT", VFS_O_RDONLY),
+                   vfs_open(FS_TEST_PID, "disk/NOPE.TXT", VFS_O_RDONLY),
                    -VFS_ENOENT);
 
     /* Invalid input: bad flag word, TRUNC without write, EXCL alone. */
     pass &= expect("invalid-flags",
-                   vfs_open(FS_TEST_PID, "HAKU.ELF", 0xFFFFu), -VFS_EINVAL);
+                   vfs_open(FS_TEST_PID, "disk/HAKU.ELF", 0xFFFFu), -VFS_EINVAL);
     pass &= expect("invalid-trunc",
-                   vfs_open(FS_TEST_PID, "HAKU.ELF",
+                   vfs_open(FS_TEST_PID, "disk/HAKU.ELF",
                             VFS_O_RDONLY | VFS_O_TRUNC),
                    -VFS_EINVAL);
     pass &= expect("invalid-excl",
-                   vfs_open(FS_TEST_PID, "HAKU.ELF", VFS_O_EXCL),
+                   vfs_open(FS_TEST_PID, "disk/HAKU.ELF", VFS_O_EXCL),
                    -VFS_EINVAL);
 
     /* Existing file with O_CREAT|O_EXCL. */
     pass &= expect("exists",
-                   vfs_open(FS_TEST_PID, "HAKU.ELF",
+                   vfs_open(FS_TEST_PID, "disk/HAKU.ELF",
                             VFS_O_CREAT | VFS_O_EXCL | VFS_O_RDWR),
                    -VFS_EEXIST);
 
@@ -898,7 +905,7 @@ void fs_error_self_test(void) {
                    vfs_seek(FS_TEST_PID, 99, 0, 0), -VFS_EBADF);
 
     /* Wrong-mode descriptor: write/seek on a read-only handle. */
-    fd = vfs_open(FS_TEST_PID, "HAKU.ELF", VFS_O_RDONLY);
+    fd = vfs_open(FS_TEST_PID, "disk/HAKU.ELF", VFS_O_RDONLY);
     pass &= expect("readonly-open-fd", fd >= 3 ? 0 : fd, 0);
     if (fd >= 3) {
         pass &= expect("readonly-write",

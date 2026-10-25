@@ -18,6 +18,9 @@ int unlink(const char *path);
 int rename(const char *old_path, const char *new_path);
 int mkdir(const char *path);
 int rmdir(const char *path);
+/* Symbolic links, which only the RAM filesystem keeps. */
+int symlink(const char *target, const char *path);
+ssize_t readlink(const char *path, char *buffer, size_t size);
 /* Working directory and permission probing. */
 int chdir(const char *path);
 char *getcwd(char *buffer, size_t size);

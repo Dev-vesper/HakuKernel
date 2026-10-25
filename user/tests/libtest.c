@@ -410,6 +410,162 @@ static void test_syscall_errors(void) {
            "ERANGE ENOTTY EPIPE ESRCH ECHILD ENOMEM");
 }
 
+/* The boot namespace: the initramfs is unpacked into a RAM root, the FAT
+ * volume is mounted at /disk, and /dev and /proc are generated. Everything
+ * here is only true because the root is ramfs: FAT12 cannot store a name
+ * longer than 8.3, a symbolic link, or a directory tree that deep. */
+static void test_initramfs_root(void) {
+    static const char long_name[] =
+        "a-name-much-longer-than-eight-point-three.txt";
+    static const char target[] = "TARGET.TXT";
+    char buffer[128];
+    char link[64];
+    haku_stat64_t status;
+    struct dirent *entry;
+    DIR *dir;
+    int fd;
+    int length;
+    int found_init = 0;
+    int found_disk = 0;
+    int found_dev = 0;
+    int found_proc = 0;
+
+    /* The archive contents and both mount points show up in the listing. */
+    dir = opendir("/");
+    if (dir) {
+        while ((entry = readdir(dir)) != 0) {
+            if (strcmp(entry->d_name, "init") == 0) found_init = 1;
+            if (strcmp(entry->d_name, "disk") == 0) found_disk = 1;
+            if (strcmp(entry->d_name, "dev") == 0) found_dev = 1;
+            if (strcmp(entry->d_name, "proc") == 0) found_proc = 1;
+        }
+        closedir(dir);
+    }
+    expect(found_init && found_disk && found_dev && found_proc,
+           "the root lists init, disk, dev, and proc");
+
+    /* A name far past 8.3 lives on the RAM root. */
+    unlink(long_name);
+    fd = open(long_name, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    expect(fd >= 0, "create a name longer than 8.3");
+    if (fd >= 0) {
+        expect(write(fd, "long", 4) == 4, "write the long name");
+        expect(lseek(fd, 0, SEEK_SET) == 0, "rewind the long name");
+        expect(read(fd, buffer, sizeof(buffer)) == 4, "read the long name");
+        expect(close(fd) == 0, "close the long name");
+        expect(stat(long_name, &status) == 0 && status.st_size == 4,
+               "stat the long name");
+        expect(strlen(long_name) > 12, "the long name really is long");
+        expect(unlink(long_name) == 0, "unlink the long name");
+    }
+
+    /* Directories nest as deep as the heap allows. */
+    rmdir("TMPDIR/SUBDIR");
+    rmdir("TMPDIR");
+    expect(mkdir("TMPDIR") == 0, "mkdir TMPDIR");
+    expect(mkdir("TMPDIR/SUBDIR") == 0, "mkdir TMPDIR/SUBDIR");
+    fd = open("TMPDIR/SUBDIR/DEEP.TXT", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    expect(fd >= 0, "create a file two levels down");
+    if (fd >= 0) {
+        expect(write(fd, "deep", 4) == 4, "write two levels down");
+        close(fd);
+        fd = open("TMPDIR/SUBDIR/DEEP.TXT", O_RDONLY);
+        expect(fd >= 0 && read(fd, buffer, 4) == 4 &&
+               memcmp(buffer, "deep", 4) == 0,
+               "read two levels down");
+        if (fd >= 0) close(fd);
+    }
+    expect(unlink("TMPDIR/SUBDIR/DEEP.TXT") == 0, "unlink two levels down");
+    expect(rmdir("TMPDIR/SUBDIR") == 0, "rmdir the inner directory");
+    expect(rmdir("TMPDIR") == 0, "rmdir TMPDIR");
+
+    /* Symbolic links: lstat reports the link, stat and open follow it. */
+    unlink("LINK.TXT");
+    unlink(target);
+    fd = open(target, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    expect(fd >= 0, "create the link target");
+    if (fd >= 0) {
+        expect(write(fd, "linked", 6) == 6, "write the link target");
+        close(fd);
+    }
+    expect(symlink(target, "LINK.TXT") == 0, "symlink");
+    length = (int)readlink("LINK.TXT", link, sizeof(link) - 1u);
+    expect(length == 10, "readlink returns the target length");
+    if (length > 0) {
+        link[length] = 0;
+        expect(strcmp(link, target) == 0, "readlink returns the target");
+    }
+    expect(lstat("LINK.TXT", &status) == 0 && S_ISLNK(status.st_mode),
+           "lstat sees the link itself");
+    expect(stat("LINK.TXT", &status) == 0 && S_ISREG(status.st_mode),
+           "stat follows the link");
+    fd = open("LINK.TXT", O_RDONLY);
+    expect(fd >= 0 && read(fd, buffer, 6) == 6 &&
+           memcmp(buffer, "linked", 6) == 0,
+           "open follows the link");
+    if (fd >= 0) close(fd);
+    /* A short buffer truncates instead of failing, like Linux. */
+    length = (int)readlink("LINK.TXT", link, 4);
+    expect(length == 4 && memcmp(link, "TARG", 4) == 0,
+           "readlink truncates to the buffer");
+    expect(unlink("LINK.TXT") == 0, "unlink the link");
+    expect(unlink(target) == 0, "unlink the target");
+
+    /* /dev/null swallows writes and reports end of file; /dev/zero does
+     * not. Both are ordinary descriptors, so the same read/write path
+     * serves them. */
+    fd = open("/dev/null", O_RDWR);
+    expect(fd >= 0, "open /dev/null");
+    if (fd >= 0) {
+        expect(write(fd, "discard", 7) == 7, "write to /dev/null");
+        expect(read(fd, buffer, sizeof(buffer)) == 0, "/dev/null reads EOF");
+        close(fd);
+    }
+    fd = open("/dev/zero", O_RDONLY);
+    expect(fd >= 0, "open /dev/zero");
+    if (fd >= 0) {
+        expect(read(fd, buffer, 8) == 8 && buffer[0] == 0 && buffer[7] == 0,
+               "/dev/zero reads zeros");
+        close(fd);
+    }
+
+    /* /proc is generated on open and refuses writes. */
+    fd = open("/proc/version", O_RDONLY);
+    expect(fd >= 0, "open /proc/version");
+    if (fd >= 0) {
+        length = (int)read(fd, buffer, sizeof(buffer) - 1u);
+        if (length > 0) buffer[length] = 0;
+        expect(length > 0 && strstr(buffer, "Haku") != 0,
+               "/proc/version names the kernel");
+        close(fd);
+    }
+    fd = open("/proc/meminfo", O_RDONLY);
+    expect(fd >= 0, "open /proc/meminfo");
+    if (fd >= 0) {
+        length = (int)read(fd, buffer, sizeof(buffer) - 1u);
+        if (length > 0) buffer[length] = 0;
+        expect(length > 0 && strstr(buffer, "MemTotal") != 0,
+               "/proc/meminfo reports MemTotal");
+        close(fd);
+    }
+    expect_errno(open("/proc/version", O_WRONLY), EACCES, "/proc is read-only");
+    expect_errno(unlink("/proc/version"), EPERM, "/proc entries are fixed");
+
+    /* The FAT volume is still reachable, now under /disk. */
+    expect(stat("/disk", &status) == 0 && S_ISDIR(status.st_mode),
+           "/disk is a directory");
+    fd = open("/disk/HAKU.ELF", O_RDONLY);
+    expect(fd >= 0, "open a FAT file through /disk");
+    if (fd >= 0) {
+        expect(read(fd, buffer, 4) == 4 && buffer[0] == 0x7F &&
+               buffer[1] == 'E', "/disk/HAKU.ELF starts with the ELF magic");
+        close(fd);
+    }
+
+    printf("USER-INITRAMFS-OK: ramfs root, long names, symlinks, devfs, "
+           "procfs, /disk mount\n");
+}
+
 int main(void) {
     char buffer[64];
     char copy[32];
@@ -889,6 +1045,7 @@ int main(void) {
     test_filesystem_abi();
     test_concurrent_filesystem();
     test_syscall_errors();
+    test_initramfs_root();
 
     if (failures) {
         printf("USER-LIB-FAIL: %d checks failed\n", failures);

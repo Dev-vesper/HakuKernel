@@ -324,9 +324,14 @@ def main():
         os.path.join(kernel_dir, "fs", "fat12"),
         os.path.join(kernel_dir, "fs", "vfs"),
         os.path.join(kernel_dir, "fs", "test"),
+        os.path.join(kernel_dir, "fs", "ramfs"),
+        os.path.join(kernel_dir, "fs", "devfs"),
+        os.path.join(kernel_dir, "fs", "procfs"),
+        os.path.join(kernel_dir, "fs", "initramfs"),
         os.path.join(kernel_dir, "kernel"),
     ]
     fat12_script = os.path.join(ROOT, "tools", "mkfat12.py")
+    cpio_script = os.path.join(ROOT, "tools", "mkcpio.py")
     entry_obj = os.path.join(BUILD, "entry.obj")
     isr_obj = os.path.join(BUILD, "isr.obj")
     user_elf = os.path.join(BUILD, "user.elf")
@@ -388,6 +393,18 @@ def main():
                   "/OUT:" + libtest_pe] + user_objects)
     run([py, pe2elf_script, libtest_pe, libtest_elf])
 
+    # The initramfs holds the userland image the kernel unpacks into its RAM
+    # filesystem at boot: /init is the first program, and the helper
+    # programs stay reachable under their old names so the existing tests
+    # exercise the RAM filesystem instead of the data disk.
+    initramfs_image = os.path.join(BUILD, "initrd.cpio")
+    run([py, cpio_script, initramfs_image,
+         f"init={user_elf}", f"HAKU.ELF={user_elf}",
+         f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}",
+         f"VFORK.ELF={vfork_elf}", f"FAULT.ELF={fault_elf}",
+         f"LIB.ELF={libtest_elf}", "--dir=dev", "--dir=proc",
+         "--dir=disk"])
+
     if mode == "headless" or fresh or not os.path.isfile(filesystem_image):
         if mode == "headless" and os.path.isfile(filesystem_image):
             log("headless: recreating the data image "
@@ -395,7 +412,7 @@ def main():
         run([py, fat12_script, user_elf, filesystem_image,
              f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}",
              f"FAULT.ELF={fault_elf}", f"LIB.ELF={libtest_elf}",
-             f"VFORK.ELF={vfork_elf}"])
+             f"VFORK.ELF={vfork_elf}", f"INITRD={initramfs_image}"])
         log(f"FAT12 program disk ready "
             f"({os.path.getsize(filesystem_image)} bytes)")
     else:
@@ -540,7 +557,9 @@ def main():
             "ATA-MULTI-OK",     # second channel device answers sector reads
             "ATA-CACHE-OK",     # repeated sector read served from the cache
             "FAT12-MOUNT-OK",
-            "FAT12-READ-OK name=HAKU.ELF",
+            "INITRAMFS-UNPACK-OK",
+            "INITRAMFS-ROOT: ramfs is /, disk is /disk, /init is pid 1",
+            "INIT-READ-OK name=init",
             "USERMODE-ENTER",# iret entered CPL 3
             "SCHED-READY tasks=1 kernel-stack=per-task",
             "SCHED-START pid=1",
@@ -574,6 +593,7 @@ def main():
             "USER-FUTEX-OK", # futex wait/wake with a timeout
             "USER-FS-ABI-OK", # openat/getdents64/chdir/pipe/poll/fcntl/termios
             "USER-ERRNO-OK", # error matrix: bad fd/pointer/path/argument
+            "USER-INITRAMFS-OK", # ramfs root, long names, symlinks, devfs, procfs
             "SCHED-CONCURRENT-OK", # two tasks doing disk I/O at once
             "USER-LIB-OK",   # C library syscalls/strings/malloc/file I/O
             "USER-EXIT-OK status=0 pid=1",

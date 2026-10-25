@@ -33,6 +33,11 @@
 #define VFS_EOPNOTSUPP HAKU_EOPNOTSUPP
 #define VFS_EXDEV  HAKU_EXDEV
 #define VFS_EBUSY  HAKU_EBUSY
+#define VFS_ENOMEM HAKU_ENOMEM
+#define VFS_EPERM  HAKU_EPERM
+#define VFS_ENAMETOOLONG HAKU_ENAMETOOLONG
+#define VFS_ELOOP  HAKU_ELOOP
+#define VFS_ENOTTY HAKU_ENOTTY
 
 /* poll(2)/select(2) readiness bits. */
 #define VFS_POLLIN   HAKU_POLLIN
@@ -132,6 +137,16 @@ typedef struct vfs_fs_ops {
     int32_t (*closedir)(void *handle);
     /* Set the file length, growing with zero fill. */
     int32_t (*truncate)(void *handle, uint32_t size);
+    /* Optional symbolic-link support. A backend that cannot store a link
+     * leaves both NULL and the VFS reports EOPNOTSUPP; FAT12 has no link
+     * type, the RAM filesystem does. */
+    int32_t (*symlink)(const char *target, const char *path);
+    int32_t (*readlink)(const char *path, char *buffer, uint32_t size,
+                        uint32_t *out_length);
+    /* Optional: describe the last component without following it, so
+     * lstat() can report a link instead of its target. NULL means the
+     * backend has no link type and stat is the answer. */
+    int32_t (*lstat)(const char *path, vfs_stat_t *out);
 } vfs_fs_ops_t;
 
 /* Character-device backend for the standard descriptors 0/1/2. These are
@@ -212,7 +227,16 @@ int32_t vfs_rename(uint32_t pid, const char *oldpath, const char *newpath);
 int32_t vfs_mkdir(uint32_t pid, const char *path);
 int32_t vfs_rmdir(uint32_t pid, const char *path);
 int32_t vfs_stat(uint32_t pid, const char *path, vfs_stat_t *out);
+/* Metadata for the last component itself: a symbolic link is reported as
+ * a link instead of the file it points at. Backends without links answer
+ * exactly like vfs_stat. */
+int32_t vfs_lstat(uint32_t pid, const char *path, vfs_stat_t *out);
 int32_t vfs_fstat(uint32_t pid, uint32_t fd, vfs_stat_t *out);
+/* symlink(2)/readlink(2). A backend without link support reports
+ * EOPNOTSUPP, and readlink never NUL-terminates: it returns the length. */
+int32_t vfs_symlink(uint32_t pid, const char *target, const char *path);
+int32_t vfs_readlink(uint32_t pid, const char *path, char *buffer,
+                     uint32_t size);
 /* Open a directory for enumeration and fill a buffer with packed Linux
  * linux_dirent64 records. getdents returns the number of bytes written
  * (0 at the end of the directory) or a negative -VFS_E*. */

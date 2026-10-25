@@ -40,6 +40,14 @@ compatibility is not a short-term goal.
 - [x] A ring-3 error matrix for every syscall family (`USER-ERRNO-OK`), an
   expanded malformed-ELF suite (`ELF-REJECT-OK`), and a two-task concurrent
   filesystem test (`SCHED-CONCURRENT-OK`).
+- [x] A mount table in the VFS (longest-prefix resolution, per-mount
+  read-only, `EBUSY`/`EXDEV` for mount-point operations) and a RAM
+  filesystem as the userland root, with `/disk` for FAT12, a device layer on
+  `/dev`, and a generated `/proc` (`USER-INITRAMFS-OK`).
+- [x] An initramfs cpio archive loaded at boot, unpacked into the RAM
+  filesystem, with `/init` running as PID 1 (`INITRAMFS-UNPACK-OK`,
+  `INIT-READ-OK name=init`); media without an archive still boots FAT12 as
+  the root.
 
 ## Proposed Milestones
 
@@ -367,18 +375,42 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   Permission and ownership calls succeed without changing anything because
   FAT12 has no mode or owner bits, and `getrlimit` reports the fixed table
   sizes (8 descriptors, 4 tasks). Proven from ring 3 as `USER-FS-ABI-OK`.
-  Still missing: `symlink`/`readlink` (there is no link type to store),
-  `select` (musl implements it over `poll`), the old `getdents` format,
-  blocking `poll` (it reports current readiness and returns immediately),
-  and real record locks (`F_SETLK` is accepted as a no-op).
-- [ ] Add a Unix-like filesystem for the userland: an in-memory filesystem
+  Still missing: `select` (musl implements it over `poll`), the old
+  `getdents` format, blocking `poll` (it reports current readiness and
+  returns immediately), and real record locks (`F_SETLK` is accepted as a
+  no-op).
+- [x] Add a Unix-like filesystem for the userland: an in-memory filesystem
   (initramfs) with long names, permission bits, symlinks, timestamps, and
   nested directories, plus a device layer (`/dev/null`, `/dev/zero`,
   `/dev/urandom`, `/dev/console`, `/dev/tty`) and a minimal `/proc`
   (FAT12 stays as the data-disk backend for the existing 8.3 tree).
-- [ ] Load a userland image at boot: unpack an initramfs/cpio archive into
+  The VFS now holds a mount table instead of a single root backend, with
+  longest-prefix resolution, per-mount read-only flags, `EBUSY` on mount
+  points, and `EXDEV` for a rename across mounts. `ramfs` is the writable
+  root: 48-byte name components, mode bits, PIT timestamps, nested
+  directories, symlinks with a hop limit, unlink-while-open, and a fixed
+  160-node table with heap-backed file data. `devfs` serves the six device
+  nodes through the ordinary descriptor path (`ESPIPE` on seek, no unlink or
+  rename), and `procfs` generates `version`/`uptime`/`meminfo` at open time
+  and refuses writes with `EACCES`. `symlink`/`readlink` became real
+  syscalls, and `lstat`/`AT_SYMLINK_NOFOLLOW` now describe the link instead
+  of its target through a new optional backend operation. Proven from ring 3
+  as `USER-INITRAMFS-OK` (root listing, a name past 8.3, a two-level
+  directory, a followed and an unfollowed link, `/dev/null`, `/dev/zero`,
+  `/proc/version`, `/proc/meminfo`, and `/disk/HAKU.ELF`).
+- [x] Load a userland image at boot: unpack an initramfs/cpio archive into
   the RAM filesystem and `execve` `/init` as PID 1 (the boot path currently
   loads a single ELF from the FAT12 disk).
+  `tools/mkcpio.py` writes a `070701` archive and `kernel/fs/initramfs/cpio.c`
+  unpacks it through the public VFS (`mkdir -p` for parents, symlinks, and
+  regular files, with the header-plus-name padding rule). The kernel mounts
+  `ramfs` on `/`, creates `/disk` as a real directory, mounts the FAT12 data
+  disk there, reads `disk/INITRD`, unpacks it, mounts `/dev` and `/proc`, and
+  runs `/init` as PID 1 (`INITRAMFS-UNPACK-OK`, `INITRAMFS-ROOT`,
+  `INIT-READ-OK`). An image without an archive still boots with FAT12 as the
+  root, so older media keeps working. The headless run asserts the whole
+  path: every ring-3 marker now comes from a process that was started out of
+  the RAM filesystem.
 - [ ] Build the userland in the Linux CI (static musl, e.g. busybox and/or
   GNU coreutils), ship it with the release artifacts, and extend the
   headless test to assert its behavior (for example `busybox sh -c "echo"`

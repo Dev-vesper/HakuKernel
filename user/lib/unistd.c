@@ -54,6 +54,16 @@ int rmdir(const char *path) {
     return haku_errno_check(haku_syscall1(HAKU_SYS_RMDIR, (int)path));
 }
 
+int symlink(const char *target, const char *path) {
+    return haku_errno_check(
+        haku_syscall2(HAKU_SYS_SYMLINK, (int)target, (int)path));
+}
+
+ssize_t readlink(const char *path, char *buffer, size_t size) {
+    return (ssize_t)haku_errno_check(
+        haku_syscall3(HAKU_SYS_READLINK, (int)path, (int)buffer, (int)size));
+}
+
 int getpid(void) {
     return haku_syscall0(HAKU_SYS_GETPID);
 }
@@ -163,7 +173,11 @@ int stat(const char *path, haku_stat64_t *status) {
 }
 
 int lstat(const char *path, haku_stat64_t *status) {
-    return stat(path, status);
+    /* AT_SYMLINK_NOFOLLOW keeps the final component from being followed,
+     * so a link describes itself. */
+    return haku_errno_check(
+        haku_syscall4(HAKU_SYS_FSTATAT64, HAKU_AT_FDCWD, (int)path,
+                      (int)status, HAKU_AT_SYMLINK_NOFOLLOW));
 }
 
 int fstat(int fd, haku_stat64_t *status) {
