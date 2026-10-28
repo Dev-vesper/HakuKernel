@@ -41,14 +41,15 @@ void *mremap(void *address, size_t old_length, size_t new_length, int flags,
 int madvise(void *address, size_t length, int advice);
 int munmap(void *address, size_t length);
 
-/* The thread area descriptor of set_thread_area(2): the kernel reads the
- * base address from it and uses it as the user FS base. */
-typedef struct {
-    unsigned int entry_number;
-    unsigned int base_addr;
-} haku_thread_area_t;
-
+/* The thread area descriptor (the i386 "struct user_desc") is part of the
+ * ABI: see haku_thread_area_t in abi.h. The kernel takes base_addr as the
+ * thread pointer and writes the descriptor entry it used back into
+ * entry_number; like Linux it returns 0 on success, so a libc reads the
+ * entry from the structure and loads the selector (entry * 8 + 3) into
+ * %gs. A libc passes -1 in entry_number to ask for one. */
 int set_thread_area(haku_thread_area_t *area);
+/* Haku-specific: reports the current thread pointer (the FS base) instead
+ * of filling a descriptor, because there is only one thread area. */
 unsigned int get_thread_area(void);
 
 #endif

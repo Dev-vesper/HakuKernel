@@ -11,8 +11,14 @@ compatibility is not a short-term goal.
 
 - [x] BIOS boot into 32-bit protected mode, with a bootloader that can load a
   kernel larger than the original boot-sector limit.
-- [x] E820-backed physical memory inventory, two-level paging with a 128 MiB
-  supervisor direct map, and separate user address spaces.
+- [x] E820-backed physical memory inventory, two-level paging with a
+  memory-map-sized supervisor direct map, and separate user address spaces.
+- [x] Size the frame pool and direct map from the detected RAM instead of a
+  fixed 128 MiB (`paging_init` reads the highest usable E820 address and
+  maps that much up to the 1020 MiB the 32-bit address space can reach;
+  bitmaps, direct-map tables, and frame reference counters are sized at boot,
+  `MEM-OK` reports the result, and `/proc/meminfo` describes physical memory
+  rather than the kernel heap).
 - [x] Static ELF32 programs running at ring 3, per-process kernel stacks, and
   PIT-driven preemptive scheduling.
 - [x] `exit`, `read`, `write`, `open`, `close`, `lseek`, and `getpid` syscalls
@@ -48,6 +54,11 @@ compatibility is not a short-term goal.
   filesystem, with `/init` running as PID 1 (`INITRAMFS-UNPACK-OK`,
   `INIT-READ-OK name=init`); media without an archive still boots FAT12 as
   the root.
+- [x] A statically linked musl binary booted as `/init` in Linux CI
+  (`musl_probe`, `MUSL-PROBE-OK`): Linux-shaped initial stack and auxiliary
+  vector, Linux-shaped `set_thread_area`, and the `_llseek`/`readv`/`writev`/
+  `set_tid_address` calls an outside libc expects. `python build.py probe`
+  boots any externally built ELF as PID 1 and asserts its markers.
 
 ## Proposed Milestones
 
@@ -185,11 +196,12 @@ address-space or descriptor sharing.
   `SCHED-WAITQ-OK`, while `nanosleep`/`waitpid` keep their existing states).
 - [x] Extend allocation beyond the current identity-mapped range and add
   user virtual-memory allocation and release (the frame allocator uses every
-  tracked E820 frame below 128 MiB through a supervisor direct map at
-  `0xF0000000`; its self-test allocates and touches a frame above 8 MiB.
-  `brk` now shrinks and unmaps released heap pages, and `munmap` (91) trims,
-  splits, and frees anonymous mappings so later `mmap` calls reuse the
-  address space; `USER-MEM-OK` covers shrink, release, and reuse).
+  tracked E820 frame through a supervisor direct map at `0xC0400000`, sized
+  from the memory map; its self-test allocates and touches a frame above
+  8 MiB and probes the last usable frame. `brk` now shrinks and unmaps
+  released heap pages, and `munmap` (91) trims, splits, and frees anonymous
+  mappings so later `mmap` calls reuse the address space; `USER-MEM-OK`
+  covers shrink, release, and reuse).
 - [x] Improve page protections and test read-only, unmapped, and
   use-after-free access (the kernel sets `CR0.WP`, maps `mmap` pages from
   `PROT_WRITE` so `PROT_READ` is enforced read-only, and only tears down user
@@ -374,11 +386,14 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   the console answers `TCGETS`/`TCSETS*`, `TIOCGWINSZ`, and `FIONREAD`.
   Permission and ownership calls succeed without changing anything because
   FAT12 has no mode or owner bits, and `getrlimit` reports the fixed table
-  sizes (8 descriptors, 4 tasks). Proven from ring 3 as `USER-FS-ABI-OK`.
-  Still missing: `select` (musl implements it over `poll`), the old
-  `getdents` format, blocking `poll` (it reports current readiness and
-  returns immediately), and real record locks (`F_SETLK` is accepted as a
-  no-op).
+  sizes (8 descriptors, 4 tasks). `poll` blocks (zero scans once, negative
+  waits forever, positive is a millisecond deadline) by parking on a
+  scheduler activity queue the timer wakes every tick, so the wait and its
+  deadline are re-scanned at 100 Hz without per-descriptor wakeups; `select`
+  (142 `_newselect` and 82, the number musl uses) feeds the same scan, and
+  the legacy `getdents` layout is produced by rewriting the 64-bit records in
+  place. Proven from ring 3 as `USER-FS-ABI-OK`.
+  Still missing: real record locks (`F_SETLK` is accepted as a no-op).
 - [x] Add a Unix-like filesystem for the userland: an in-memory filesystem
   (initramfs) with long names, permission bits, symlinks, timestamps, and
   nested directories, plus a device layer (`/dev/null`, `/dev/zero`,
@@ -411,10 +426,32 @@ userland root becomes a Unix-like RAM filesystem, not FAT12.
   root, so older media keeps working. The headless run asserts the whole
   path: every ring-3 marker now comes from a process that was started out of
   the RAM filesystem.
-- [ ] Build the userland in the Linux CI (static musl, e.g. busybox and/or
+- [x] Build the userland in the Linux CI (static musl, e.g. busybox and/or
   GNU coreutils), ship it with the release artifacts, and extend the
   headless test to assert its behavior (for example `busybox sh -c "echo"`
   and a file round-trip through the RAM filesystem).
+  `user/tests/musl_probe.c` is built with `musl-gcc -static` in a dedicated
+  `musl` CI job and booted as `/init` through the new
+  `python build.py probe --init=<elf> --expect=<marker>` mode, which skips
+  the keyboard injection and asserts the boot markers plus the requested
+  one. Making an outside libc work required four ABI corrections: the
+  initial process now starts on the same stack `execve` builds (previously
+  PID 1 got a bare `esp` at the top of the region, which faulted), the
+  auxiliary vector carries `AT_PHDR`/`AT_PHENT`/`AT_PHNUM` so musl can find
+  its own `PT_TLS` segment (Haku's images do not map their header table, so
+  the loader maps a copy on a page below the stack), `set_thread_area`
+  follows the Linux contract (accepts `0xFFFFFFFF`, writes the chosen entry
+  back, returns it) so musl's `%gs` setup succeeds, and the kernel gained
+  `_llseek` (140), `readv`/`writev` (145/146), and `set_tid_address` (258) —
+  musl's stdio writes through `writev`, so without it a static libc prints
+  nothing. The probe asserts `MUSL-OK`, a file round trip, `chdir`/`getcwd`,
+  and a `readdir` of `/` before printing `MUSL-PROBE-OK`.
+  The filesystem ABI now covers the calls busybox leans on for an
+  interactive shell: blocking `poll`, `select` through both i386 numbers (142
+  and 82), and the legacy `getdents` layout alongside `getdents64`.
+  Still missing for a full busybox userland: record locks, and enough of
+  `/proc` for `ps`. The probe ships with the CI artifacts, not
+  with the release image; the release still contains Haku's own userland.
 
 **Acceptance criteria:** A statically linked musl binary runs as PID 1 from
 an initramfs, executes shell builtins and applets, reads and writes files

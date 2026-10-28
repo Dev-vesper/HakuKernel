@@ -6,6 +6,7 @@ Usage:
     python build.py run             build + boot in a QEMU window
     python build.py run --fresh     recreate the FAT12 data image, then boot
     python build.py headless        fresh data image + boot headless, verify
+    python build.py --memory=MB     guest RAM (default 512, max 1020)
     python build.py inspect ...     examine a FAT12 image (see --help there)
 
 Pipeline:
@@ -49,6 +50,25 @@ os.makedirs(BUILD, exist_ok=True)
 
 def log(msg):
     print(msg, flush=True)
+
+
+def wait_for_serial(path, needle, timeout):
+    """Poll the serial log until `needle` shows up, or the timeout expires.
+
+    Used instead of a fixed sleep before the keystroke: the kernel prints
+    SCHED-WAITQ-OK exactly when pid 1 parks on the console read, so sending
+    the key then is deterministic however long the boot took.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with open(path, errors="replace") as f:
+                if needle in f.read():
+                    return True
+        except OSError:
+            pass
+        time.sleep(0.05)
+    return False
 
 
 def monitor_cmd(port, cmds, timeout=5):
@@ -288,12 +308,42 @@ def main():
                              ] + rest).returncode
         sys.exit(rc)
 
+    init_override = None
+    expectations = []
+    memory_mb = 512
     for flag in raw_args:
-        if flag.startswith("-") and flag != "--fresh":
-            sys.exit(f"unknown flag: {flag} (only --fresh is supported)")
+        if flag == "--fresh":
+            continue
+        if flag.startswith("--init="):
+            init_override = flag.split("=", 1)[1]
+            continue
+        if flag.startswith("--expect="):
+            expectations.append(flag.split("=", 1)[1])
+            continue
+        if flag.startswith("--memory="):
+            # The kernel sizes its direct map and frame pool from E820, so
+            # the guest RAM is what it actually gets to use.
+            value = flag.split("=", 1)[1]
+            if not value.isdigit() or not 16 <= int(value) <= 4096:
+                sys.exit("--memory=MB takes 16..4096 "
+                         "(the kernel clips its direct map at 1020 MiB)")
+            memory_mb = int(value)
+            continue
+        if flag.startswith("-"):
+            sys.exit(f"unknown flag: {flag} "
+                     "(use --fresh, --memory=MB, --init=PATH, --expect=MARKER)")
     fresh = "--fresh" in raw_args
     if len(positionals) > 1:
         sys.exit(f"unexpected argument: {positionals[1]}")
+    if mode == "probe":
+        if not init_override:
+            sys.exit("probe needs --init=PATH: the ELF to run as /init")
+        if not os.path.isfile(init_override):
+            sys.exit(f"no such file: {init_override}")
+        if not expectations:
+            sys.exit("probe needs at least one --expect=MARKER")
+    elif init_override or expectations:
+        sys.exit("--init and --expect only apply to `probe`")
 
     kernel_dir = os.path.join(ROOT, "kernel")
     arch_dir = os.path.join(kernel_dir, "arch", "x86")
@@ -399,16 +449,17 @@ def main():
     # exercise the RAM filesystem instead of the data disk.
     initramfs_image = os.path.join(BUILD, "initrd.cpio")
     run([py, cpio_script, initramfs_image,
-         f"init={user_elf}", f"HAKU.ELF={user_elf}",
+         f"init={init_override or user_elf}", f"HAKU.ELF={user_elf}",
          f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}",
          f"VFORK.ELF={vfork_elf}", f"FAULT.ELF={fault_elf}",
          f"LIB.ELF={libtest_elf}", "--dir=dev", "--dir=proc",
          "--dir=disk"])
 
-    if mode == "headless" or fresh or not os.path.isfile(filesystem_image):
-        if mode == "headless" and os.path.isfile(filesystem_image):
-            log("headless: recreating the data image "
-                "(fault-injection tests mutate the disk)")
+    if mode in ("headless", "probe") or fresh or \
+            not os.path.isfile(filesystem_image):
+        if mode in ("headless", "probe") and os.path.isfile(filesystem_image):
+            log(f"{mode}: recreating the data image "
+                "(the run mutates the disk)")
         run([py, fat12_script, user_elf, filesystem_image,
              f"NEXT.ELF={exec_target_elf}", f"CHILD.ELF={child_elf}",
              f"FAULT.ELF={fault_elf}", f"LIB.ELF={libtest_elf}",
@@ -484,7 +535,8 @@ def main():
     with open(spare_image, "wb") as f:
         f.truncate(1474560)
 
-    disk = [qemu, "-drive", f"file={img},format=raw,if=floppy,index=0",
+    disk = [qemu, "-m", str(memory_mb),
+            "-drive", f"file={img},format=raw,if=floppy,index=0",
             "-drive", f"file={filesystem_image},format=raw,if=ide,index=0,media=disk",
             "-drive", f"file={spare_image},format=raw,if=ide,index=2,media=disk",
             "-boot", "order=a", "-no-reboot"]
@@ -493,7 +545,7 @@ def main():
     if mode == "run":
         log("Booting Haku in QEMU (close the window to return)...")
         subprocess.run(disk)
-    elif mode == "headless":
+    elif mode in ("headless", "probe"):
         serial = os.path.join(BUILD, "serial.log")
         shot = os.path.join(BUILD, "screen.png")
         ppm = os.path.join(BUILD, "screen.ppm")
@@ -506,10 +558,18 @@ def main():
                                         "-monitor", f"tcp:127.0.0.1:{MON_PORT},server=on,wait=off"])
         try:
             # The initial test process blocks once in read(0, ..., 1).
-            # CI runners are slower; allow the environment to delay the key
-            # and to extend the wait without changing local behavior.
-            time.sleep(float(os.environ.get("HAKU_BOOT_DELAY", "1.0")))
-            monitor_cmd(MON_PORT, ["sendkey x"])
+            # Waiting for the marker that the kernel prints at that moment
+            # is deterministic: a fixed sleep lost the keystroke whenever
+            # boot ran slower than the guess (a bigger guest RAM, a slower
+            # CI runner), which showed up as a whole run of missing USER-*
+            # markers. A probe does not read the console, so it gets no
+            # keystroke.
+            if mode == "headless":
+                if not wait_for_serial(
+                        serial, "SCHED-WAITQ-OK",
+                        float(os.environ.get("HAKU_BOOT_DELAY", "15"))):
+                    log("warning: pid 1 never parked on the console read")
+                monitor_cmd(MON_PORT, ["sendkey x"])
             proc.wait(timeout=float(
                 os.environ.get("HAKU_HEADLESS_TIMEOUT", "30")))
         except subprocess.TimeoutExpired:
@@ -536,7 +596,9 @@ def main():
         log("--- serial log ---")
         log(content)
         # Commit-by-commit boot proof: every marker below must be present.
-        expected = [
+        # `probe` boots a program built elsewhere (a musl binary) and only
+        # asserts the boot path plus the markers the caller named.
+        headless_expected = [
             "HAKU-BOOT-OK",  # kernel_main reached
             "IDT-OK",        # 48 IDT gates loaded
             "EXC-03-BP",     # INT3 self-test dispatched through the IDT
@@ -546,6 +608,7 @@ def main():
             "HEAP-OK",       # kmalloc/kfree/krealloc self-test passed
             "E820-OK",       # stage2 INT 15h map handoff verified
             "FRAME-OK",      # frame_alloc/free self-test passed
+            "MEM-OK",        # direct map and frame pool sized from E820
             "GDT-OK",        # kernel/user selectors and ring-0 TSS stack loaded
             "ELF-REJECT-OK", # malformed images and W+X segments were rejected
             "ELF-LOAD-OK",   # valid ELF32 PT_LOAD segments loaded to fresh CR3
@@ -614,6 +677,11 @@ def main():
             "T+2s",
             "T+3s",
         ]
+        if mode == "probe":
+            expected = ["HAKU-BOOT-OK", "INITRAMFS-UNPACK-OK",
+                        "INIT-READ-OK name=init", "USERMODE-ENTER"] + expectations
+        else:
+            expected = headless_expected
         missing = [m for m in expected if m not in content]
         if "EXECVE-FAIL" in content:
             missing.append("successful execve did not return an error")
@@ -636,9 +704,16 @@ def main():
                                      "FS-CORRUPT-FAIL",
                                      "FS-ATA-FAIL",
                                      "FS-ROLLBACK-FAIL",
-                                     "FS-ENOSPC-FAIL") if m in content]
+                                     "FS-ENOSPC-FAIL",
+                                     "MUSL-FAIL",
+                                     "ELF-LOAD-FAIL",
+                                     "ELF-DISK-FAIL",
+                                     "INITRAMFS-FAIL") if m in content]
         if not missing and not unexpected:
-            log("HEADLESS CHECK PASSED: " + ", ".join(expected))
+            log(("PROBE CHECK PASSED: " if mode == "probe"
+                 else "HEADLESS CHECK PASSED: ") + ", ".join(expected))
+            if mode == "probe":
+                return
             # The guest just ran fault-injection restores and a root-fill
             # against this image: prove on the host side that mirrors,
             # chains, and allocation state are still consistent.

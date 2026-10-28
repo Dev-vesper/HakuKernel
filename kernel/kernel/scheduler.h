@@ -27,6 +27,11 @@ typedef struct {
 
 #define WAIT_QUEUE_INIT { 0u }
 
+/* Woken once per timer tick so a task parked in poll(2)/select(2)
+ * re-checks descriptor readiness even when nothing else signals it. The
+ * poll loop treats that wake as the clock: a tick costs one re-scan. */
+extern wait_queue_t scheduler_activity;
+
 /* Mark the current task blocked on the queue. The caller must immediately
  * execute sti;hlt so either the waking IRQ returns straight back or the
  * timer IRQ switches away. Returns 1 when a task was parked. */

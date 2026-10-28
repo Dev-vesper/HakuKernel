@@ -68,9 +68,24 @@ code_start:
     jne .fail
     cmp dword [esp + 28], 0
     jne .fail
-    cmp dword [esp + 32], 0
-    jne .fail
-    cmp dword [esp + 36], 0
+    ; The auxiliary vector follows the environment and ends with AT_NULL.
+    lea esi, [esp + 32]
+    mov ecx, 16
+    xor ebx, ebx                 ; page size, if the vector carries it
+.auxv:
+    mov eax, [esi]
+    test eax, eax
+    jz .auxv_end
+    cmp eax, HAKU_AT_PAGESZ
+    jne .auxv_next
+    mov ebx, [esi + 4]
+.auxv_next:
+    add esi, 8
+    dec ecx
+    jnz .auxv
+    jmp .fail                    ; the vector has no AT_NULL
+.auxv_end:
+    cmp ebx, 4096
     jne .fail
 
     ; exec keeps the process identity.

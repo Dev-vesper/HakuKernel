@@ -65,6 +65,7 @@ static void test_filesystem_abi(void) {
     unlink("ABI1.TXT");
     unlink("ABI2.TXT");
     unlink("ABI3.TXT");
+    unlink("ABI4.TXT");
     unlink("ABIDIR/ABI0.TXT");
     unlink("ABIDIR/ABI1.TXT");
     rmdir("ABIDIR");
@@ -79,6 +80,25 @@ static void test_filesystem_abi(void) {
             expect(write(inside, "hello", 5) == 5, "write after openat");
             expect(ftruncate(inside, 2) == 0, "ftruncate shrink");
             expect(lseek(inside, 0, SEEK_END) == 2, "size after ftruncate");
+            /* The raw i386 form a real libc uses: a 64-bit offset in, and
+             * the resulting position written back through a pointer. */
+            {
+                unsigned int position[2];
+                position[0] = 0xFFFFFFFFu;
+                position[1] = 0xFFFFFFFFu;
+                expect(haku_syscall5(HAKU_SYS_LLSEEK, inside, 0, 0,
+                                     (int)position, SEEK_SET) == 0,
+                       "_llseek to the start");
+                expect(position[0] == 0u && position[1] == 0u,
+                       "_llseek reported the position");
+                expect(haku_syscall5(HAKU_SYS_LLSEEK, inside, 0, 2,
+                                     (int)position, SEEK_SET) == 0 &&
+                       position[0] == 2u && position[1] == 0u,
+                       "_llseek to a 64-bit offset");
+                expect(haku_syscall5(HAKU_SYS_LLSEEK, inside, 1, 0,
+                                     (int)position, SEEK_SET) == -EINVAL,
+                       "_llseek rejects an unrepresentable offset");
+            }
             close(inside);
         }
         expect(stat("ABIDIR/ABI0.TXT", &status) == 0, "stat inside a dir");
@@ -119,6 +139,37 @@ static void test_filesystem_abi(void) {
     }
     expect(found == 1, "getdents64 lists HAKU.ELF");
 
+    /* The pre-64-bit getdents layout musl's readdir uses on i386:
+     * { u32 ino, u32 off, u16 reclen, name }. */
+    fd = open("/", O_RDONLY | O_DIRECTORY);
+    if (fd >= 0) {
+        unsigned char records[256];
+        int calls = 0;
+        int total = 0;
+        found = 0;
+        /* A caller with a fixed buffer keeps calling until the directory
+         * reports end of file, exactly as a libc readdir loop does. */
+        for (;;) {
+            int got = haku_syscall3(HAKU_SYS_GETDENTS, fd, (int)records,
+                                    sizeof(records));
+            unsigned int offset = 0;
+            if (got <= 0) break;
+            total += got;
+            calls++;
+            while (offset + 12u <= (unsigned int)got) {
+                unsigned int reclen = (unsigned int)records[offset + 8] |
+                                      ((unsigned int)records[offset + 9] << 8);
+                if (!reclen) break;
+                if (strcmp((char *)(records + offset + 10), "HAKU.ELF") == 0)
+                    found = 1;
+                offset += reclen;
+            }
+            if (calls > 64) break;
+        }
+        expect(total > 0 && found == 1, "getdents lists HAKU.ELF");
+        close(fd);
+    }
+
     /* Pipes: write, readiness, read, and end of file. */
     expect(pipe(fds) == 0, "pipe");
     expect(write(fds[1], "ping", 4) == 4, "pipe write");
@@ -131,6 +182,54 @@ static void test_filesystem_abi(void) {
     expect(poll(poll_fds, 2, 0) == 2, "poll reports two ready descriptors");
     expect((poll_fds[0].revents & POLLIN) != 0, "poll POLLIN on the pipe");
     expect(read(fds[0], buffer, 4) == 4 && buffer[0] == 'p', "pipe read");
+    /* poll blocks when nothing is ready: an empty pipe with a live write
+     * end must wait out the millisecond timeout instead of returning at
+     * once. The tick counter has 10 ms resolution. */
+    poll_fds[0].fd = fds[0];
+    poll_fds[0].events = POLLIN;
+    poll_fds[0].revents = 0;
+    {
+        haku_timeval_t before;
+        haku_timeval_t after;
+        unsigned int elapsed_us = 0;
+        expect(gettimeofday(&before, 0) == 0, "gettimeofday before poll");
+        expect(poll(poll_fds, 1, 40) == 0, "poll times out on an empty pipe");
+        expect(gettimeofday(&after, 0) == 0, "gettimeofday after poll");
+        if (after.tv_sec >= before.tv_sec)
+            elapsed_us = (after.tv_sec - before.tv_sec) * 1000000u +
+                         (after.tv_usec - before.tv_usec);
+        expect(elapsed_us >= 20000u, "poll actually waited for the timeout");
+    }
+    /* select(2), both i386 syscall numbers: 142 (_newselect) and 82. */
+    {
+        unsigned int set[2];
+        haku_timeval_t zero;
+        zero.tv_sec = 0;
+        zero.tv_usec = 0;
+        set[0] = 1u << (fds[0] % 32u);
+        set[1] = 0;
+        expect(haku_syscall5(HAKU_SYS_SELECT, 8, (int)set, 0, 0,
+                             (int)&zero) == 0,
+               "select times out on an empty pipe");
+        expect(write(fds[1], "x", 1) == 1, "write before select");
+        set[0] = 1u << (fds[0] % 32u);
+        set[1] = 0;
+        zero.tv_sec = 0;
+        zero.tv_usec = 0;
+        expect(haku_syscall5(HAKU_SYS_SELECT, 8, (int)set, 0, 0,
+                             (int)&zero) == 1,
+               "select reports the pipe readable");
+        expect((set[0] & (1u << (fds[0] % 32u))) != 0,
+               "select sets the read bit");
+        expect(read(fds[0], buffer, 1) == 1, "read after select");
+        set[0] = 1u << (fds[0] % 32u);
+        set[1] = 0;
+        zero.tv_sec = 0;
+        zero.tv_usec = 0;
+        expect(haku_syscall5(HAKU_SYS_OLDSELECT, 8, (int)set, 0, 0,
+                             (int)&zero) == 0,
+               "select through syscall 82");
+    }
     expect(close(fds[1]) == 0, "close the write end");
     expect(read(fds[0], buffer, 4) == 0, "pipe end of file");
     close(fds[0]);
@@ -159,8 +258,34 @@ static void test_filesystem_abi(void) {
         unlink("ABI3.TXT");
     }
 
-    /* The console answers the termios and window-size requests. */
-    expect(tcgetattr(1, &attributes) == 0, "tcgetattr");
+    /* Scatter/gather I/O: a libc's stdio writes through writev, so both
+     * directions have to move every segment in order. */
+    fd = open("ABI4.TXT", O_CREAT | O_TRUNC | O_RDWR, 0644);
+    expect(fd >= 0, "open for writev");
+    if (fd >= 0) {
+        unsigned int vectors[4];
+        memcpy(buffer, "hello ", 6);
+        memcpy(buffer + 6, "world", 5);
+        vectors[0] = (unsigned int)buffer;
+        vectors[1] = 6;
+        vectors[2] = (unsigned int)(buffer + 6);
+        vectors[3] = 5;
+        expect(haku_syscall3(HAKU_SYS_WRITEV, fd, (int)vectors, 2) == 11,
+               "writev writes both segments");
+        expect(lseek(fd, 0, SEEK_SET) == 0, "rewind after writev");
+        memset(buffer, 0, 16);
+        vectors[1] = 5;
+        vectors[3] = 6;
+        expect(haku_syscall3(HAKU_SYS_READV, fd, (int)vectors, 2) == 11,
+               "readv fills both segments");
+        expect(memcmp(buffer, "hello", 5) == 0 &&
+                   memcmp(buffer + 6, " world", 6) == 0,
+               "readv split the file at the iovec boundary");
+        close(fd);
+        unlink("ABI4.TXT");
+    }
+
+    /* The console answers the termios and window-size requests. */    expect(tcgetattr(1, &attributes) == 0, "tcgetattr");
     expect((attributes.c_lflag & ECHO) != 0, "termios reports ECHO");
     expect(tcsetattr(1, 0, &attributes) == 0, "tcsetattr");
     expect(ioctl(1, TIOCGWINSZ, &window) == 0 && window.ws_col == 80,
@@ -183,6 +308,11 @@ static void test_filesystem_abi(void) {
     expect(getrandom(random_bytes, sizeof(random_bytes), 0) ==
                (int)sizeof(random_bytes), "getrandom");
     expect(sched_yield() == 0, "sched_yield");
+    /* musl's startup registers the thread pointer's address with the kernel
+     * and expects the thread id back; Haku runs one thread per process. */
+    expect(haku_syscall1(HAKU_SYS_SET_TID_ADDRESS, (int)&handler_runs) ==
+               (int)getpid(),
+           "set_tid_address returns the thread id");
 }
 
 /* One round of create/write/read/verify/unlink for a private file name.
@@ -546,6 +676,24 @@ static void test_initramfs_root(void) {
         if (length > 0) buffer[length] = 0;
         expect(length > 0 && strstr(buffer, "MemTotal") != 0,
                "/proc/meminfo reports MemTotal");
+        /* MemTotal must describe installed RAM, not the 3 MiB kernel heap:
+         * the frame pool is sized from E820 at boot, so a regression back to
+         * the heap (3072 kB) or to a fixed tiny value shows up here. The bar
+         * stays low because a 16 MiB guest is a valid configuration. */
+        {
+            char *field = length > 0 ? strstr(buffer, "MemTotal:") : 0;
+            unsigned long kb = 0;
+            if (field) {
+                field += 9;
+                while (*field == ' ') field++;
+                while (*field >= '0' && *field <= '9') {
+                    kb = kb * 10u + (unsigned long)(*field - '0');
+                    field++;
+                }
+            }
+            expect(kb >= 8u * 1024u,
+                   "/proc/meminfo MemTotal covers installed RAM");
+        }
         close(fd);
     }
     expect_errno(open("/proc/version", O_WRONLY), EACCES, "/proc is read-only");
@@ -566,6 +714,74 @@ static void test_initramfs_root(void) {
            "procfs, /disk mount\n");
 }
 
+/* The kernel builds the Linux initial stack: argc, argv[], NULL, envp[],
+ * NULL, then the auxiliary vector. A libc reads AT_PAGESZ and AT_RANDOM
+ * from it before main runs, so the shape has to be right even though this
+ * runtime does not use it. crt0 keeps the entry stack pointer for us. */
+extern unsigned int haku_initial_sp;
+
+static void test_auxiliary_vector(void) {
+    /* haku_initial_sp holds the stack pointer the kernel handed us. */
+    unsigned int *stack = (unsigned int *)haku_initial_sp;
+    unsigned int argc = stack[0];
+    unsigned int *word = stack + 1u + argc + 1u;
+    unsigned int page_size = 0;
+    unsigned int clock_tick = 0;
+    unsigned int random = 0;
+    unsigned int entry = 0;
+    unsigned int phdr = 0;
+    unsigned int phent = 0;
+    unsigned int phnum = 0;
+
+    while (*word) word++;   /* the environment strings */
+    word++;                 /* the NULL that ends them */
+    while (word[0] != HAKU_AT_NULL) {
+        if (word[0] == HAKU_AT_PAGESZ) page_size = word[1];
+        else if (word[0] == HAKU_AT_CLKTCK) clock_tick = word[1];
+        else if (word[0] == HAKU_AT_RANDOM) random = word[1];
+        else if (word[0] == HAKU_AT_ENTRY) entry = word[1];
+        else if (word[0] == HAKU_AT_PHDR) phdr = word[1];
+        else if (word[0] == HAKU_AT_PHENT) phent = word[1];
+        else if (word[0] == HAKU_AT_PHNUM) phnum = word[1];
+        word += 2;
+    }
+    expect(page_size == 4096u, "auxv AT_PAGESZ");
+    expect(clock_tick == 100u, "auxv AT_CLKTCK");
+    expect(entry != 0u, "auxv AT_ENTRY");
+    expect(random != 0u, "auxv AT_RANDOM");
+    if (random) {
+        /* A zero seed would defeat the stack protector. */
+        unsigned int *seed = (unsigned int *)random;
+        expect(seed[0] || seed[1] || seed[2] || seed[3],
+               "auxv AT_RANDOM points at a filled seed");
+    }
+
+    /* A static libc walks these to find its own PT_TLS segment, so they
+     * have to describe the loaded image: entry-size 32, a nonzero count,
+     * and a first segment whose file offset 0 is the ELF header. */
+    expect(phent == 32u, "auxv AT_PHENT");
+    expect(phnum != 0u && phdr != 0u, "auxv AT_PHDR/AT_PHNUM");
+    if (phdr && phnum && phent == 32u) {
+        unsigned int *headers = (unsigned int *)phdr;
+        unsigned int loads = 0;
+        unsigned int i;
+        for (i = 0; i < phnum; i++) {
+            unsigned int *segment =
+                headers + (i * phent) / sizeof(unsigned int);
+            if (segment[0] == 1u) {   /* PT_LOAD */
+                loads++;
+                if (segment[1] == 0u) {   /* p_offset 0 carries the header */
+                    unsigned char *image = (unsigned char *)segment[2];
+                    expect(image[0] == 0x7Fu && image[1] == 'E' &&
+                               image[2] == 'L' && image[3] == 'F',
+                           "auxv AT_PHDR leads to the ELF header");
+                }
+            }
+        }
+        expect(loads != 0u, "auxv AT_PHDR lists a loadable segment");
+    }
+}
+
 int main(void) {
     char buffer[64];
     char copy[32];
@@ -581,6 +797,8 @@ int main(void) {
     int i;
 
     printf("USER-LIB-START pid=%d\n", getpid());
+
+    test_auxiliary_vector();
 
     unlink("LIB.TMP");
     unlink("LIB2.TMP");
@@ -920,17 +1138,37 @@ int main(void) {
                "munmap of a released range");
     }
 
-    /* The thread pointer: set_thread_area moves the user FS base, so
-     * %fs:0 points at the thread block the program set up. */
+    /* The thread pointer. A libc asks for a descriptor with -1, gets the
+     * entry number back (both in the descriptor and as the return value),
+     * loads entry*8+3 into %gs and reads the thread pointer there — that is
+     * exactly what musl and glibc do on i386. The Haku library uses %fs, so
+     * both registers have to point at the same block. */
     {
         static unsigned int thread_block[4];
         haku_thread_area_t area;
         unsigned int seen = 0;
+        unsigned int selector;
+        int entry;
 
         thread_block[0] = (unsigned int)&thread_block[0];
-        area.entry_number = 0;
+        area.entry_number = 0xFFFFFFFFu;
         area.base_addr = (unsigned int)&thread_block[0];
-        expect(set_thread_area(&area) == 0, "set_thread_area");
+        area.limit = 0xFFFFFFFFu;
+        area.seg_32bit = 1;
+        area.contents = 0;
+        area.read_exec_only = 0;
+        area.limit_in_pages = 1;
+        area.seg_not_present = 0;
+        area.useable = 1;
+        area.reserved = 0;
+        entry = set_thread_area(&area);
+        /* Linux returns 0 and hands the chosen entry back through the
+         * structure; a libc then builds the selector from it. */
+        expect(entry == 0, "set_thread_area");
+        expect(area.entry_number == 6u,
+               "the entry number is written back to the caller");
+        selector = area.entry_number * 8u + 3u;
+
         __asm {
             mov eax, 0
             mov ebx, fs:[eax]
@@ -938,8 +1176,36 @@ int main(void) {
         }
         expect(seen == (unsigned int)&thread_block[0],
                "the FS base is the thread pointer");
+
+        seen = 0;
+        __asm {
+            mov ecx, selector
+            mov ax, cx
+            mov gs, ax
+            mov eax, 0
+            mov ebx, gs:[eax]
+            mov seen, ebx
+        }
+        expect(seen == (unsigned int)&thread_block[0],
+               "the GS selector from set_thread_area reaches the thread block");
+
+        /* The descriptor is still valid after a syscall: the kernel keeps
+         * the user segment registers across an interrupt. */
+        seen = 0;
+        getpid();
+        __asm {
+            mov eax, 0
+            mov ebx, gs:[eax]
+            mov seen, ebx
+        }
+        expect(seen == (unsigned int)&thread_block[0],
+               "%gs survives a syscall");
+
+        /* Naming the entry the kernel handed out moves it again. */
+        area.entry_number = 6u;
         area.base_addr = 0;
         expect(set_thread_area(&area) == 0, "set_thread_area reset");
+        expect(area.entry_number == 6u, "the named entry is kept");
     }
 
     /* futex: a task parks on a word until another task wakes it. */
@@ -1051,7 +1317,8 @@ int main(void) {
         printf("USER-LIB-FAIL: %d checks failed\n", failures);
         return 1;
     }
-    printf("USER-FS-ABI-OK: openat getdents64 chdir pipe poll fcntl termios\n");
+    printf("USER-FS-ABI-OK: openat getdents64 chdir pipe poll select fcntl "
+           "termios _llseek readv writev set_tid_address\n");
     printf("USER-SIGNAL-OK: kill tkill tgkill sigaction sigprocmask\n");
     printf("USER-MMAP-OK: mmap2 mprotect mremap madvise set_thread_area\n");
     printf("USER-FUTEX-OK: futex wait wake timeout\n");

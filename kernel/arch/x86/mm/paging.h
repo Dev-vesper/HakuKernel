@@ -47,20 +47,37 @@
 #define PAGING_ENTRIES    1024u
 #define PAGING_USER_LIMIT  0xC0000000u
 
-/* Supervisor-only direct map of all tracked physical memory. It starts
- * above the user limit and is copied into every user directory, so kernel
- * code can touch any frame the allocator hands out with PHYS_TO_VIRT. */
-#define PAGING_DIRECT_MAP_BASE 0xF0000000u
-#define PAGING_DIRECT_MAP_MB   128u
-#define PAGING_DIRECT_MAP_TABLES (PAGING_DIRECT_MAP_MB / 4u)
-#define PAGING_PHYS_LIMIT (PAGING_DIRECT_MAP_MB * 1024u * 1024u)
-#define PHYS_TO_VIRT(phys) ((void *)(PAGING_DIRECT_MAP_BASE + (uint32_t)(phys)))
-
-/* Supervisor window for the linear framebuffer. It sits between the user
- * limit and the direct map and covers one page-directory entry (4 MiB),
- * which is the most a VBE mode may use. */
-#define PAGING_FB_WINDOW  0xD0000000u
+/* Supervisor window for the linear framebuffer. It starts at the user
+ * limit and covers one page-directory entry (4 MiB), which is the most a
+ * VBE mode may use. The direct map follows it so the two never overlap,
+ * whatever size the map grows to. */
+#define PAGING_FB_WINDOW  0xC0000000u
 #define PAGING_FB_WINDOW_BYTES 0x400000u
+
+/* Supervisor-only direct map of all tracked physical memory. It starts
+ * above the framebuffer window and is copied into every user directory, so
+ * kernel code can touch any frame the allocator hands out with
+ * PHYS_TO_VIRT.
+ *
+ * The map is sized at boot from the E820 map instead of a fixed 128 MiB, so
+ * the kernel uses the memory the machine actually has. Its size is bounded
+ * by the 1 GiB kernel half of the 32-bit address space: the window ends at
+ * 0xFFFFFFFF, which leaves 1020 MiB for physical memory once the 4 MiB
+ * framebuffer window is subtracted. A machine with more RAM than that keeps
+ * the extra memory out of the frame pool rather than aliasing it.
+ *
+ * The page tables live in low RAM at physical 0x400000 (DIRECT_TABLE_PHYS in
+ * paging.c), not in .bss: 255 tables would add 1 MiB to the kernel image,
+ * which must stay below the 0x80000 boot stack. */
+#define PAGING_DIRECT_MAP_BASE  0xC0400000u
+#define PAGING_DIRECT_MAP_MAX_MB 1020u
+#define PAGING_DIRECT_MAP_MAX_BYTES (PAGING_DIRECT_MAP_MAX_MB * 1024u * 1024u)
+#define PAGING_PHYS_LIMIT_MAX    PAGING_DIRECT_MAP_MAX_BYTES
+/* Physical memory the allocator tracks and the direct map covers, detected
+ * from E820 by paging_init and rounded up to a 4 MiB page-table boundary. */
+uint32_t paging_phys_limit(void);
+#define PAGING_PHYS_LIMIT (paging_phys_limit())
+#define PHYS_TO_VIRT(phys) ((void *)(PAGING_DIRECT_MAP_BASE + (uint32_t)(phys)))
 
 /* Per-space accounting maintained by the mapping helpers. mapped_pages
  * counts present user PTEs (code, data, stack, heap, and mmap), page_tables
@@ -79,6 +96,11 @@ typedef struct {
 
 void paging_init(void);        /* zero tables, install PDE0 + 1024 identity PTEs */
 void paging_enable(void);      /* load CR3, set CR0.PG (call with IRQs off) */
+/* Size the per-frame reference counters for the detected physical limit.
+ * Call after heap_init and frame_init: it allocates one byte per frame, so
+ * the array grows with the machine instead of sitting in .bss. */
+int paging_frames_init(void);
+uint32_t paging_direct_map_bytes(void); /* size of the supervisor map */
 int paging_is_enabled(void);   /* CR0.PG bit test */
 uint32_t paging_get_cr0(void); /* raw CR0 (panic reports) */
 uint32_t paging_get_cr3(void); /* raw CR3 (== PAGING_DIR_PHYS after enable) */

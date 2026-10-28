@@ -1,8 +1,10 @@
 /* Haku frame allocator: E820-backed physical-page inventory.
  *
- * The bitmap tracks all usable RAM below 128 MiB and every tracked frame
- * is reachable through the supervisor direct map, so allocation is not
- * limited to the first 8 MiB identity window.
+ * The bitmap tracks every usable frame the supervisor direct map can reach
+ * and every tracked frame is reachable through that map, so allocation is
+ * not limited to the first 8 MiB identity window. The tracked size comes
+ * from E820 at boot (paging_init sizes the direct map from the same number)
+ * rather than a fixed 128 MiB.
  */
 #include "frame.h"
 #include "heap.h"
@@ -19,13 +21,20 @@ static spinlock_t frame_lock = SPINLOCK_INIT;
 #define KERNEL_LOAD_END   0x00080000u
 #define KERNEL_HEAP_START 0x00100000u
 #define KERNEL_HEAP_END   0x00400000u
+/* Direct-map page tables: 4 KiB each, one per 4 MiB of mapped RAM, carved
+ * out of low identity-mapped RAM by paging_init. */
+#define DIRECT_TABLE_START 0x00400000u
+#define DIRECT_TABLE_END   0x00500000u
 #define BOOT_STACK_START  0x00080000u
 #define BOOT_STACK_END    0x00090000u
 #define ISA_HOLE_START    0x000A0000u
 #define ISA_HOLE_END      0x00100000u
 
-#define FRAME_PHYS_LIMIT (FRAME_ENTRIES * FRAME_SIZE)
-#define FRAME_HIGH_WATERMARK (8u * 1024u * 1024u)
+/* Frames tracked by this allocator, set once in frame_init from the
+ * direct-map size. Everything below reads the variable, never a constant. */
+static uint32_t frame_limit;
+static uint32_t frame_hint;
+static uint32_t frame_bitmap_words;
 
 typedef struct {
     uint32_t base_low;
@@ -55,21 +64,58 @@ static uint32_t e820_count(void) {
     return *(volatile uint32_t *)0x6FFCu;
 }
 
+uint32_t frame_phys_limit(void) {
+    return frame_limit * FRAME_SIZE;
+}
+
+/* Highest usable E820 address, clipped to the direct-map ceiling. Runs
+ * before the allocator exists (paging_init calls it to size the map), so it
+ * only reads the memory map stage2 left behind. */
+uint32_t memmap_usable_top(void) {
+    volatile e820_entry_t *entries = (volatile e820_entry_t *)E820_MAP_PHYS;
+    uint32_t count = e820_count();
+    uint32_t top = 0;
+
+    if (count == 0 || count > E820_MAX_ENTRIES) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t start;
+        uint32_t end;
+        if (entries[i].type != E820_RAM || !(entries[i].attributes & 1u))
+            continue;
+        if (entries[i].length_low == 0 && entries[i].length_high == 0)
+            continue;
+        /* A range that starts at or above 4 GiB is unreachable on a
+         * non-PAE kernel; a range that crosses 4 GiB ends there. */
+        if (entries[i].base_high != 0) continue;
+        start = entries[i].base_low;
+        if (entries[i].length_high != 0 ||
+            entries[i].length_low > 0xFFFFFFFFu - start) {
+            end = 0xFFFFFFFFu;
+        } else {
+            end = start + entries[i].length_low;
+        }
+        if (end > PAGING_PHYS_LIMIT_MAX) end = PAGING_PHYS_LIMIT_MAX;
+        if (end > top) top = end;
+    }
+    return top;
+}
+
 /* Convert a 64-bit E820 range to the part intersecting our tracked RAM. */
 static int e820_clipped_range(const e820_entry_t *entry,
                               uint32_t *start, uint32_t *end) {
     uint32_t range_end;
+    uint32_t limit = frame_phys_limit();
 
     if (!(entry->attributes & 1u)) return 0;
     if ((entry->length_low | entry->length_high) == 0 ||
         entry->base_high != 0 ||
-        entry->base_low >= FRAME_PHYS_LIMIT)
+        entry->base_low >= limit)
         return 0;
 
     *start = entry->base_low;
     if (entry->length_high != 0 ||
-        entry->length_low > FRAME_PHYS_LIMIT - entry->base_low) {
-        range_end = FRAME_PHYS_LIMIT;
+        entry->length_low > limit - entry->base_low) {
+        range_end = limit;
     } else {
         range_end = entry->base_low + entry->length_low;
     }
@@ -81,7 +127,7 @@ static int e820_clipped_range(const e820_entry_t *entry,
 static void set_usable_range(uint32_t start, uint32_t end) {
     uint32_t first = (start + FRAME_SIZE - 1u) / FRAME_SIZE;
     uint32_t last = end / FRAME_SIZE;
-    if (last > FRAME_ENTRIES) last = FRAME_ENTRIES;
+    if (last > frame_limit) last = frame_limit;
     for (uint32_t frame = first; frame < last; frame++) {
         bitmap_set(frame_usable, frame);
         bitmap_clear(frame_bitmap, frame);
@@ -91,7 +137,7 @@ static void set_usable_range(uint32_t start, uint32_t end) {
 static void reserve_range(uint32_t start, uint32_t end) {
     uint32_t first = start / FRAME_SIZE;
     uint32_t last = (end + FRAME_SIZE - 1u) / FRAME_SIZE;
-    if (last > FRAME_ENTRIES) last = FRAME_ENTRIES;
+    if (last > frame_limit) last = frame_limit;
     for (uint32_t frame = first; frame < last; frame++) {
         bitmap_clear(frame_usable, frame);
         bitmap_set(frame_bitmap, frame);
@@ -122,6 +168,7 @@ static void reserve_kernel_regions(void) {
     reserve_range(PAGING_DIR_PHYS, PAGING_TABLE1_PHYS + 0x1000u);
     reserve_range(BOOT_STACK_START, BOOT_STACK_END);
     reserve_range(KERNEL_HEAP_START, KERNEL_HEAP_END);
+    reserve_range(DIRECT_TABLE_START, DIRECT_TABLE_END);
 }
 
 /* Keep a device range (such as a framebuffer aperture) out of the pool.
@@ -138,18 +185,30 @@ void frame_reserve_range(uint32_t start, uint32_t end) {
 void frame_init(void) {
     uint32_t count = e820_count();
     volatile e820_entry_t *entries = (volatile e820_entry_t *)E820_MAP_PHYS;
+    uint32_t bitmap_bytes;
 
     if (count == 0 || count > E820_MAX_ENTRIES) {
         panic("E820-FAIL: map missing or invalid");
     }
 
-    frame_bitmap = (uint32_t *)kmalloc(FRAME_BMAP_BYTES);
-    frame_usable = (uint32_t *)kmalloc(FRAME_BMAP_BYTES);
+    /* The paging layer already sized the direct map from this same E820
+     * map; track exactly what it covers so PHYS_TO_VIRT never aliases a
+     * frame the map does not reach. */
+    frame_limit = paging_phys_limit() / FRAME_SIZE;
+    if (frame_limit == 0 || frame_limit > FRAME_MAX_ENTRIES) {
+        panic("FRAME-FAIL: direct map size out of range");
+    }
+    frame_bitmap_words = (frame_limit + 31u) / 32u;
+    bitmap_bytes = frame_bitmap_words * 4u;
+    frame_hint = 0;
+
+    frame_bitmap = (uint32_t *)kmalloc(bitmap_bytes);
+    frame_usable = (uint32_t *)kmalloc(bitmap_bytes);
     if (!frame_bitmap || !frame_usable) {
         panic("FRAME-FAIL: no heap for bitmaps");
     }
-    memset(frame_bitmap, 0xFF, FRAME_BMAP_BYTES);
-    memset(frame_usable, 0, FRAME_BMAP_BYTES);
+    memset(frame_bitmap, 0xFF, bitmap_bytes);
+    memset(frame_usable, 0, bitmap_bytes);
 
     /* Start with usable E820 RAM, then let any overlapping reserved range
      * win, independent of the order BIOS returned its entries. */
@@ -207,18 +266,34 @@ void frame_init(void) {
     klog_write(" map entries\n");
 }
 
+/* First free tracked frame at or after `start`, wrapping around. Returns
+ * frame_limit when the pool is exhausted. The caller holds the lock. */
+static uint32_t find_free_from(uint32_t start) {
+    for (uint32_t frame = start; frame < frame_limit; frame++)
+        if (bitmap_test(frame_usable, frame) &&
+            !bitmap_test(frame_bitmap, frame))
+            return frame;
+    for (uint32_t frame = 0; frame < start; frame++)
+        if (bitmap_test(frame_usable, frame) &&
+            !bitmap_test(frame_bitmap, frame))
+            return frame;
+    return frame_limit;
+}
+
 void *frame_alloc(void) {
     void *result = 0;
     irqflags_t flags;
+    uint32_t frame;
     if (!frame_bitmap || !frame_usable) return 0;
     flags = spin_lock_irqsave(&frame_lock);
-    for (uint32_t frame = 0; frame < FRAME_ENTRIES; frame++) {
-        if (bitmap_test(frame_usable, frame) &&
-            !bitmap_test(frame_bitmap, frame)) {
-            bitmap_set(frame_bitmap, frame);
-            result = (void *)(frame * FRAME_SIZE);
-            break;
-        }
+    /* Start where the last allocation succeeded instead of rescanning the
+     * whole bitmap: a 1 GiB pool holds 256k frames, and every boot-time
+     * allocation would otherwise cost a full pass. */
+    frame = find_free_from(frame_hint);
+    if (frame < frame_limit) {
+        bitmap_set(frame_bitmap, frame);
+        frame_hint = frame + 1u;
+        result = (void *)(frame * FRAME_SIZE);
     }
     spin_unlock_irqrestore(&frame_lock, flags);
     return result;
@@ -230,13 +305,17 @@ void frame_free(void *phys) {
     irqflags_t flags;
     if (!frame_bitmap || !frame_usable ||
         (address & (FRAME_SIZE - 1u)) != 0 ||
-        address >= FRAME_PHYS_LIMIT)
+        address >= frame_phys_limit())
         return;
     frame = address / FRAME_SIZE;
     flags = spin_lock_irqsave(&frame_lock);
     if (bitmap_test(frame_usable, frame) &&
-        bitmap_test(frame_bitmap, frame))
+        bitmap_test(frame_bitmap, frame)) {
         bitmap_clear(frame_bitmap, frame);
+        /* Reuse low frames first: they are the ones the hint has already
+         * walked past, so this keeps the pool compact. */
+        if (frame < frame_hint) frame_hint = frame;
+    }
     spin_unlock_irqrestore(&frame_lock, flags);
 }
 
@@ -246,11 +325,11 @@ void *frame_alloc_pages(uint32_t n) {
     void *result = 0;
     irqflags_t flags;
     if (!frame_bitmap || !frame_usable || n == 0 ||
-        n > FRAME_ENTRIES)
+        n > frame_limit)
         return 0;
 
     flags = spin_lock_irqsave(&frame_lock);
-    for (uint32_t frame = 0; frame < FRAME_ENTRIES; frame++) {
+    for (uint32_t frame = 0; frame < frame_limit; frame++) {
         if (bitmap_test(frame_usable, frame) &&
             !bitmap_test(frame_bitmap, frame)) {
             if (run == 0) start = frame;
@@ -276,10 +355,10 @@ void frame_free_pages(void *phys, uint32_t n) {
     irqflags_t flags;
     if (!frame_bitmap || !frame_usable || n == 0 ||
         (address & (FRAME_SIZE - 1u)) != 0 ||
-        address >= FRAME_PHYS_LIMIT)
+        address >= frame_phys_limit())
         return;
     start = address / FRAME_SIZE;
-    if (n > FRAME_ENTRIES - start) return;
+    if (n > frame_limit - start) return;
 
     flags = spin_lock_irqsave(&frame_lock);
     for (uint32_t frame = start; frame < start + n; frame++) {
@@ -291,17 +370,18 @@ void frame_free_pages(void *phys, uint32_t n) {
     }
     for (uint32_t frame = start; frame < start + n; frame++)
         bitmap_clear(frame_bitmap, frame);
+    if (start < frame_hint) frame_hint = start;
     spin_unlock_irqrestore(&frame_lock, flags);
 }
 
-uint32_t frame_total_count(void) { return FRAME_ENTRIES; }
+uint32_t frame_total_count(void) { return frame_limit; }
 
 uint32_t frame_usable_count(void) {
     uint32_t count = 0;
     irqflags_t flags;
     if (!frame_usable) return 0;
     flags = spin_lock_irqsave(&frame_lock);
-    for (uint32_t frame = 0; frame < FRAME_ENTRIES; frame++)
+    for (uint32_t frame = 0; frame < frame_limit; frame++)
         if (bitmap_test(frame_usable, frame)) count++;
     spin_unlock_irqrestore(&frame_lock, flags);
     return count;
@@ -312,7 +392,7 @@ uint32_t frame_free_count(void) {
     irqflags_t flags;
     if (!frame_bitmap || !frame_usable) return 0;
     flags = spin_lock_irqsave(&frame_lock);
-    for (uint32_t frame = 0; frame < FRAME_ENTRIES; frame++)
+    for (uint32_t frame = 0; frame < frame_limit; frame++)
         if (bitmap_test(frame_usable, frame) &&
             !bitmap_test(frame_bitmap, frame))
             count++;
@@ -323,6 +403,7 @@ uint32_t frame_free_count(void) {
 int frame_self_test(void) {
     int pass = 1;
     uint32_t high_frame = 0;
+    uint32_t top_frame = 0;
     uint32_t initial_free = frame_free_count();
     if (frame_usable_count() == 0 || initial_free == 0) {
         pass = 0;
@@ -331,8 +412,8 @@ int frame_self_test(void) {
     void *a = frame_alloc();
     void *b = frame_alloc();
     if (!a || !b || a == b ||
-        (uint32_t)a >= FRAME_PHYS_LIMIT ||
-        (uint32_t)b >= FRAME_PHYS_LIMIT) {
+        (uint32_t)a >= frame_phys_limit() ||
+        (uint32_t)b >= frame_phys_limit()) {
         pass = 0;
         goto done;
     }
@@ -371,7 +452,7 @@ int frame_self_test(void) {
         void *chain = 0;
         void *high = 0;
         uint32_t allocated = 0;
-        while (allocated < FRAME_ENTRIES) {
+        while (allocated < frame_limit) {
             void *page = frame_alloc();
             uint32_t link;
             if (!page) break;
@@ -379,7 +460,7 @@ int frame_self_test(void) {
             *(volatile uint32_t *)PHYS_TO_VIRT(page) = link;
             chain = page;
             allocated++;
-            if ((uint32_t)page >= FRAME_HIGH_WATERMARK) {
+            if ((uint32_t)page >= 8u * 1024u * 1024u) {
                 high = page;
                 high_frame = (uint32_t)page;
                 *(volatile uint32_t *)PHYS_TO_VIRT(page) = 0x33333333u;
@@ -398,9 +479,35 @@ int frame_self_test(void) {
         if (frame_free_count() != initial_free) pass = 0;
     }
 
+    /* The direct map must reach the last usable frame, not just the low
+     * 8 MiB window: without this the allocator would hand out frames the
+     * kernel cannot address on a machine with more than the old fixed
+     * 128 MiB. The frame is free, so poking it cannot corrupt anything. */
+    {
+        uint32_t frame = frame_limit;
+        while (frame > 0) {
+            frame--;
+            if (bitmap_test(frame_usable, frame) &&
+                !bitmap_test(frame_bitmap, frame))
+                break;
+        }
+        if (frame == 0) {
+            pass = 0;
+        } else {
+            top_frame = frame * FRAME_SIZE;
+            *(volatile uint32_t *)PHYS_TO_VIRT(top_frame) = 0x44444444u;
+            if (*(volatile uint32_t *)PHYS_TO_VIRT(top_frame) != 0x44444444u)
+                pass = 0;
+            /* A 128 MiB cap would leave the pool ending at 0x08000000. */
+            if (frame_phys_limit() > 128u * 1024u * 1024u &&
+                top_frame <= 128u * 1024u * 1024u)
+                pass = 0;
+        }
+    }
+
     {
         void *pages = frame_alloc_pages(4);
-        if (!pages || (uint32_t)pages >= FRAME_PHYS_LIMIT) {
+        if (!pages || (uint32_t)pages >= frame_phys_limit()) {
             pass = 0;
             goto done;
         }
@@ -415,8 +522,12 @@ done:
         klog_dec(frame_free_count());
         klog_write(" usable=");
         klog_dec(frame_usable_count());
-        klog_write(" alloc-limit=128MB high=");
+        klog_write(" limit=");
+        klog_dec(frame_phys_limit() / (1024u * 1024u));
+        klog_write("MB high=");
         klog_hex(high_frame);
+        klog_write(" top=");
+        klog_hex(top_frame);
         klog_write("\n");
     } else {
         klog_prefix();

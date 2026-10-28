@@ -8,13 +8,17 @@
 #include "procfs.h"
 #include "ramfs.h"
 #include "scheduler.h"
+#include "sync.h"
 #include "terminal.h"
 #include "fat12.h"
 #include "heap.h"
 #include "vfs.h"
 
 #define USER_ELF_MAX_SIZE (256u * 1024u)
-#define USER_INITRAMFS_MAX_SIZE (192u * 1024u)
+/* Room for the whole initramfs: the Haku test programs plus an externally
+ * built /init, which can be a static libc binary several times larger than
+ * any of them. */
+#define USER_INITRAMFS_MAX_SIZE (384u * 1024u)
 #define USER_EXEC_MAX_ARGUMENTS 64u
 #define USER_EXEC_MAX_BYTES 4096u
 #define USER_STACK_BOTTOM (USER_STACK_TOP - 2u * USER_PAGE_SIZE)
@@ -29,6 +33,12 @@ typedef struct {
     uint32_t argv_offsets[USER_EXEC_MAX_ARGUMENTS];
     uint32_t envp_offsets[USER_EXEC_MAX_ARGUMENTS];
 } exec_arguments_t;
+
+/* Defined with the exec family below; the initial program is started on the
+ * same kind of stack so a binary built for Linux finds argv and the
+ * auxiliary vector where its startup code expects them. */
+static uint32_t build_exec_stack(loaded_elf_t *program,
+                                 const exec_arguments_t *arguments);
 
 /* The console behind the standard descriptors. The terminal layer owns the
  * display/serial split and the keyboard input queue; this device is only the
@@ -211,12 +221,29 @@ static const char *mount_boot_filesystem(void) {
     return "init";
 }
 
+/* Give the first process the stack layout an execve() would build. Linux
+ * starts PID 1 with argv[0] set to the program name, so do the same: a
+ * static libc reads argv[0] and the auxiliary vector before main(). */
+static uint32_t build_initial_stack(const char *name, loaded_elf_t *program) {
+    exec_arguments_t arguments;
+    uint32_t length = 0;
+
+    while (name[length] && length + 1u < USER_EXEC_MAX_BYTES) length++;
+    memset(&arguments, 0, sizeof(arguments));
+    arguments.strings = (uint8_t *)name;
+    arguments.bytes_used = length + 1u;
+    arguments.argv_offsets[0] = 0;
+    arguments.argc = 1;
+    return build_exec_stack(program, &arguments);
+}
+
 int usermode_init(void) {
     uint32_t loaded = 0;
     uint32_t image_size = 0;
     uint8_t *image;
     const char *program;
     int read_result;
+    uint32_t stack_result;
 
     /* Assemble the storage stack: VFS tables, the backends, and the boot
      * namespace. Everything below (syscalls, self-tests) only speaks the
@@ -262,6 +289,15 @@ int usermode_init(void) {
         return 0;
     }
     kfree(image);
+    stack_result = build_initial_stack(program, &initial_program);
+    if (stack_result) {
+        klog_prefix();
+        klog_write("USER-STACK-FAIL: error=");
+        klog_dec(stack_result);
+        klog_write("\n");
+        paging_destroy_user_space(&initial_program.address_space);
+        return 0;
+    }
     klog_prefix();
     klog_write("ELF-LOAD-OK: entry=");
     klog_hex(initial_program.entry);
@@ -303,6 +339,8 @@ static uint32_t sys_mkdirat(uint32_t dirfd, uint32_t user_path);
 static uint32_t sys_renameat(uint32_t olddirfd, uint32_t user_old,
                              uint32_t newdirfd, uint32_t user_new);
 static uint32_t sys_access(uint32_t dirfd, uint32_t user_path, uint32_t mode);
+/* Defined with getrandom below; the initial stack uses it for AT_RANDOM. */
+static uint32_t random_word(void);
 
 static int copy_from_user(void *destination, uint32_t source,
                           uint32_t length) {
@@ -380,8 +418,14 @@ static uint32_t build_exec_stack(loaded_elf_t *program,
                                  const exec_arguments_t *arguments) {
     uint32_t argv_addresses[USER_EXEC_MAX_ARGUMENTS];
     uint32_t envp_addresses[USER_EXEC_MAX_ARGUMENTS];
-    uint32_t words[USER_EXEC_MAX_ARGUMENTS * 2u + 5u];
+    /* argc, argv[], NULL, envp[], NULL, the auxiliary vector (fourteen
+     * (type, value) pairs plus AT_NULL), and the 16 canary bytes that
+     * AT_RANDOM points at. The two vectors can each hold the maximum, so
+     * the block has to cover both plus the trailing pairs. */
+    uint32_t words[USER_EXEC_MAX_ARGUMENTS * 2u + 40u];
     uint32_t word_count = 0;
+    uint32_t random_slot;
+    uint32_t random_words;
     uint32_t stack_pointer = program->user_stack;
     uint32_t error;
 
@@ -401,8 +445,49 @@ static uint32_t build_exec_stack(loaded_elf_t *program,
     for (uint32_t i = 0; i < arguments->envc; i++)
         words[word_count++] = envp_addresses[i];
     words[word_count++] = 0;
-    words[word_count++] = 0; /* AT_NULL */
+
+    /* The auxiliary vector. AT_RANDOM points at the canary seed, whose
+     * address is only known once the block lands on the stack, so the
+     * value slot is filled in below. AT_PHDR/AT_PHNUM/AT_PHENT let a
+     * static libc find its own program headers and PT_TLS segment. */
+    words[word_count++] = HAKU_AT_PHDR;
+    words[word_count++] = program->phdr_address;
+    words[word_count++] = HAKU_AT_PHENT;
+    words[word_count++] = program->phdr_size;
+    words[word_count++] = HAKU_AT_PHNUM;
+    words[word_count++] = program->phdr_count;
+    words[word_count++] = HAKU_AT_PAGESZ;
+    words[word_count++] = USER_PAGE_SIZE;
+    words[word_count++] = HAKU_AT_CLKTCK;
+    words[word_count++] = pit_hz();
+    words[word_count++] = HAKU_AT_BASE;
     words[word_count++] = 0;
+    words[word_count++] = HAKU_AT_FLAGS;
+    words[word_count++] = 0;
+    words[word_count++] = HAKU_AT_ENTRY;
+    words[word_count++] = program->entry;
+    words[word_count++] = HAKU_AT_UID;
+    words[word_count++] = 0;
+    words[word_count++] = HAKU_AT_EUID;
+    words[word_count++] = 0;
+    words[word_count++] = HAKU_AT_GID;
+    words[word_count++] = 0;
+    words[word_count++] = HAKU_AT_EGID;
+    words[word_count++] = 0;
+    words[word_count++] = HAKU_AT_HWCAP;
+    words[word_count++] = 0;
+    words[word_count++] = HAKU_AT_SECURE;
+    words[word_count++] = 0;
+    words[word_count++] = HAKU_AT_RANDOM;
+    random_slot = word_count;
+    words[word_count++] = 0;
+    words[word_count++] = HAKU_AT_NULL;
+    words[word_count++] = 0;
+    /* The canary seed itself: a static musl program reads these 16 bytes
+     * before main, so they live on the stack it reads them from. */
+    random_words = word_count;
+    for (uint32_t i = 0; i < HAKU_AT_RANDOM_BYTES / sizeof(uint32_t); i++)
+        words[word_count++] = random_word();
 
     if (stack_pointer < USER_STACK_BOTTOM ||
         word_count * sizeof(uint32_t) >
@@ -410,6 +495,7 @@ static uint32_t build_exec_stack(loaded_elf_t *program,
         return HAKU_E2BIG;
     stack_pointer = (stack_pointer - word_count * sizeof(uint32_t)) &
                     ~15u;
+    words[random_slot] = stack_pointer + random_words * sizeof(uint32_t);
     if (stack_pointer < USER_STACK_BOTTOM ||
         !paging_copy_to_user_space(&program->address_space, stack_pointer,
                                    words, word_count * sizeof(uint32_t)))
@@ -484,6 +570,31 @@ static uint32_t sys_read(uint32_t fd, uint32_t user_buffer,
         if ((uint32_t)result < amount) break;
     }
     return copied;
+}
+
+/* readv/writev: an i386 iovec is {void *base; size_t length}, eight bytes.
+ * A libc's stdio writes through writev, so a single write per descriptor
+ * would leave a static libc printing nothing. The loop stops at the first
+ * short or failed transfer and reports what it managed to move. */
+static uint32_t sys_iovec(uint32_t fd, uint32_t user_iov, uint32_t count,
+                          int writing) {
+    uint32_t total = 0;
+    uint32_t i;
+
+    if (count > HAKU_IOV_MAX) return copy_from_user_error(HAKU_EINVAL);
+    for (i = 0; i < count; i++) {
+        uint32_t entry[2];
+        uint32_t moved;
+        if (!copy_from_user(entry, user_iov + i * 8u, sizeof(entry)))
+            return total ? total : copy_from_user_error(HAKU_EFAULT);
+        if (!entry[1]) continue;
+        moved = writing ? sys_write(fd, entry[0], entry[1])
+                        : sys_read(fd, entry[0], entry[1]);
+        if ((int32_t)moved < 0) return total ? total : moved;
+        total += moved;
+        if (moved < entry[1]) break;
+    }
+    return total;
 }
 
 static uint32_t sys_open(uint32_t user_path, uint32_t flags) {
@@ -1171,20 +1282,38 @@ static uint32_t sys_madvise(uint32_t address, uint32_t length,
     return scheduler_madvise(address, length, advice);
 }
 
-/* set_thread_area(2): the user passes a pointer to the thread area
- * descriptor { entry_number, base_addr }. The base becomes the user FS
- * base (the thread pointer). */
-static uint32_t sys_set_thread_area(uint32_t user_area) {
-    uint32_t area[2];
+/* set_thread_area(2): the caller passes an i386 "struct user_desc" with the
+ * thread pointer in base_addr. Linux allocates an LDT slot, writes its
+ * number back into entry_number, and returns it; a libc then loads
+ * entry*8+3 into %gs and reads the thread pointer through that register.
+ * Haku owns a fixed GDT entry instead of an LDT, so it reports that entry:
+ * the selector is still valid and resolves to the same base, which is all
+ * musl and glibc need. The FS segment is pointed at the same block for the
+ * Haku user library, which reads %fs:0. */
+#define HAKU_TLS_ENTRY 6u
 
-    if (!copy_from_user(area, user_area, sizeof(area)))
+static uint32_t sys_set_thread_area(uint32_t user_area) {
+    haku_thread_area_t area;
+    int32_t result;
+
+    if (!copy_from_user(&area, user_area, sizeof(area)))
         return copy_from_user_error(HAKU_EFAULT);
-    /* Only the first thread area exists; the kernel ignores the number
-     * when it is the "use the default slot" value. */
-    if (area[0] != 0u && area[0] != 0xFFFFFFFFu)
+    /* -1 asks the kernel to choose; the entry Haku hands out may be named
+     * again to move an existing area. Entry 0 is the null selector. */
+    if (area.entry_number != 0xFFFFFFFFu &&
+        area.entry_number != HAKU_TLS_ENTRY)
         return copy_from_user_error(HAKU_EINVAL);
-    if (area[1] >= 0xC0000000u) return copy_from_user_error(HAKU_EINVAL);
-    return scheduler_set_thread_area(area[1]);
+    if (area.base_addr >= 0xC0000000u)
+        return copy_from_user_error(HAKU_EINVAL);
+    result = (int32_t)scheduler_set_thread_area(area.base_addr);
+    if (result < 0) return (uint32_t)result;
+    area.entry_number = HAKU_TLS_ENTRY;
+    if (!copy_to_user(user_area, &area, sizeof(area)))
+        return copy_from_user_error(HAKU_EFAULT);
+    /* Linux returns 0 here and hands the entry number back through the
+     * structure; musl's i386 stub treats any nonzero result as a failure
+     * and falls back to modify_ldt, so the number must not be returned. */
+    return 0;
 }
 
 /* futex(2): wait on a 32-bit user word or wake the waiters of one. The
@@ -1471,6 +1600,57 @@ static uint32_t sys_getdents64(uint32_t fd, uint32_t user_buffer,
     return copied;
 }
 
+/* getdents(141): the pre-64-bit directory call musl's readdir uses on
+ * i386. Records are { u32 ino, u32 off, u16 reclen, name } aligned to 4
+ * bytes, so each one is shorter than the getdents64 record the VFS
+ * produces and can be rewritten in place. */
+static uint32_t sys_getdents(uint32_t fd, uint32_t user_buffer,
+                             uint32_t count) {
+    uint8_t in[256];
+    uint8_t out[256];
+    uint32_t copied = 0;
+    if (count < VFS_DIRENT_RECORD_MAX) return copy_from_user_error(HAKU_EINVAL);
+    if (!paging_user_range_valid(user_buffer, count, 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    for (;;) {
+        uint32_t chunk = count - copied;
+        uint32_t offset = 0;
+        uint32_t produced = 0;
+        int32_t got;
+        if (chunk > sizeof(in)) chunk = sizeof(in);
+        got = vfs_getdents(scheduler_current_pid(), fd, in, chunk);
+        if (got < 0) return copied ? copied : (uint32_t)got;
+        if (got == 0) break;
+        while (offset + 19u <= (uint32_t)got) {
+            const uint8_t *rec = in + offset;
+            uint32_t wide = (uint32_t)rec[16] | ((uint32_t)rec[17] << 8);
+            uint32_t namelen = 0;
+            uint32_t reclen;
+            uint8_t *dst;
+            while (rec[19u + namelen] && 19u + namelen + 1u < wide) namelen++;
+            reclen = (10u + namelen + 4u) & ~3u;
+            dst = out + produced;
+            for (uint32_t i = 0; i < 4; i++) {
+                dst[i] = rec[i];          /* inode */
+                dst[4 + i] = rec[8 + i];  /* directory offset cookie */
+            }
+            dst[8] = (uint8_t)(reclen & 0xFFu);
+            dst[9] = (uint8_t)((reclen >> 8) & 0xFFu);
+            memcpy(dst + 10, rec + 19, namelen + 1);
+            memset(dst + 11 + namelen, 0, reclen - (11u + namelen));
+            produced += reclen;
+            if (!wide) break;
+            offset += wide;
+        }
+        if (produced == 0) break;
+        if (!copy_to_user(user_buffer + copied, out, produced))
+            return copied ? copied : copy_from_user_error(HAKU_EFAULT);
+        copied += produced;
+        if ((uint32_t)got < chunk || copied >= count) break;
+    }
+    return copied;
+}
+
 /* chdir(12)/getcwd(183): the working directory lives in the task and is
  * stored canonically, so getcwd can hand back "/" plus that path. */
 static uint32_t sys_chdir(uint32_t user_path) {
@@ -1637,34 +1817,154 @@ static uint32_t sys_ioctl(uint32_t fd, uint32_t request, uint32_t user_arg) {
     }
 }
 
-/* poll(168): report readiness for every descriptor now. The timeout is
- * accepted but not waited on (see README "Console and pipes"); a shell
- * that polls its terminal gets an immediate, correct answer. */
-static uint32_t sys_poll(uint32_t user_fds, uint32_t nfds, uint32_t timeout) {
-    haku_pollfd_t entry;
+/* One poll scan over a kernel copy of the descriptor array. Fills revents
+ * and returns the number of descriptors with something to report. */
+static uint32_t poll_scan(haku_pollfd_t *fds, uint32_t nfds) {
+    uint32_t pid = scheduler_current_pid();
     uint32_t ready = 0;
-    (void)timeout;
-    if (nfds > HAKU_FD_SETSIZE) return copy_from_user_error(HAKU_EINVAL);
-    if (nfds == 0) return 0u;
-    if (!paging_user_range_valid(user_fds, nfds * HAKU_POLLFD_SIZE, 1))
-        return copy_from_user_error(HAKU_EFAULT);
     for (uint32_t i = 0; i < nfds; i++) {
-        uint32_t address = user_fds + i * HAKU_POLLFD_SIZE;
         uint32_t revents = 0;
-        if (!copy_from_user(&entry, address, sizeof(entry)))
-            return copy_from_user_error(HAKU_EFAULT);
-        if (entry.fd >= 0) {
-            uint32_t fd = (uint32_t)entry.fd;
-            if (entry.events & HAKU_POLLIN)
-                revents |= vfs_poll_events(scheduler_current_pid(), fd, 0);
-            if (entry.events & HAKU_POLLOUT)
-                revents |= vfs_poll_events(scheduler_current_pid(), fd, 1);
+        if (fds[i].fd >= 0) {
+            uint32_t fd = (uint32_t)fds[i].fd;
+            if (fds[i].events & HAKU_POLLIN)
+                revents |= vfs_poll_events(pid, fd, 0);
+            if (fds[i].events & HAKU_POLLOUT)
+                revents |= vfs_poll_events(pid, fd, 1);
         }
-        entry.revents = (haku_u16)(revents & (entry.events | HAKU_POLLERR |
-                                               HAKU_POLLHUP | HAKU_POLLNVAL));
-        if (!copy_to_user(address, &entry, sizeof(entry)))
+        revents &= (uint32_t)fds[i].events | HAKU_POLLERR | HAKU_POLLHUP |
+                   HAKU_POLLNVAL;
+        fds[i].revents = (haku_u16)revents;
+        if (revents) ready++;
+    }
+    return ready;
+}
+
+/* Wait until one of the descriptors is ready or the timeout expires. The
+ * timer wakes scheduler_activity every tick, so the loop polls at 100 Hz:
+ * no wakeup plumbing is needed from the console or a pipe, and the timer
+ * is also the timeout clock. A timeout of 0 scans once (non-blocking). */
+static uint32_t poll_wait(haku_pollfd_t *fds, uint32_t nfds,
+                          int32_t timeout_ms) {
+    uint32_t start = pit_ticks();
+    uint32_t hz = pit_hz();
+    uint32_t limit = 0;
+    if (timeout_ms > 0) {
+        uint32_t ms = (uint32_t)timeout_ms;
+        limit = ms > 0x00FFFFFFu ? 0xFFFFFFFFu
+                                 : (ms * hz + 999u) / 1000u;
+        if (!limit) limit = 1;
+    }
+    for (;;) {
+        uint32_t ready = poll_scan(fds, nfds);
+        if (ready) return ready;
+        if (timeout_ms >= 0 && pit_ticks() - start >= limit) return 0;
+        /* Park until the next tick without losing the kernel stack: the
+         * timer IRQ saves a ring-0 frame, so this loop resumes here. */
+        (void)irq_lock();
+        wait_queue_sleep(&scheduler_activity);
+        __asm {
+            sti
+            hlt
+        }
+    }
+}
+
+/* poll(168): report readiness for every descriptor, blocking until one is
+ * ready or the millisecond timeout expires (-1 waits forever). */
+static uint32_t sys_poll(uint32_t user_fds, uint32_t nfds,
+                         uint32_t timeout_raw) {
+    haku_pollfd_t fds[HAKU_FD_SETSIZE];
+    int32_t timeout = (int32_t)timeout_raw;
+    uint32_t ready;
+    if (nfds > HAKU_FD_SETSIZE) return copy_from_user_error(HAKU_EINVAL);
+    if (nfds && !paging_user_range_valid(user_fds, nfds * HAKU_POLLFD_SIZE, 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    if (nfds && !copy_from_user(fds, user_fds, nfds * HAKU_POLLFD_SIZE))
+        return copy_from_user_error(HAKU_EFAULT);
+    ready = poll_wait(fds, nfds, timeout);
+    if (nfds && !copy_to_user(user_fds, fds, nfds * HAKU_POLLFD_SIZE))
+        return copy_from_user_error(HAKU_EFAULT);
+    return ready;
+}
+
+/* select(142/82): the i386 form, with three descriptor sets and a relative
+ * timeval. Haku has no exceptional conditions, so the except set always
+ * comes back empty. The readiness scan is the same one poll uses. */
+static int select_test(const uint32_t set[HAKU_FD_SETSIZE / 32u],
+                       uint32_t fd) {
+    return (set[fd / 32u] & (1u << (fd % 32u))) != 0;
+}
+
+static void select_add(uint32_t set[HAKU_FD_SETSIZE / 32u], uint32_t fd) {
+    set[fd / 32u] |= 1u << (fd % 32u);
+}
+
+static uint32_t sys_select(uint32_t nfds, uint32_t user_read,
+                           uint32_t user_write, uint32_t user_except,
+                           uint32_t user_timeout) {
+    uint32_t read_set[HAKU_FD_SETSIZE / 32u] = { 0u };
+    uint32_t write_set[HAKU_FD_SETSIZE / 32u] = { 0u };
+    uint32_t except_set[HAKU_FD_SETSIZE / 32u] = { 0u };
+    uint32_t out_read[HAKU_FD_SETSIZE / 32u] = { 0u };
+    uint32_t out_write[HAKU_FD_SETSIZE / 32u] = { 0u };
+    uint32_t out_except[HAKU_FD_SETSIZE / 32u] = { 0u };
+    haku_pollfd_t fds[HAKU_FD_SETSIZE];
+    uint32_t words;
+    uint32_t bytes;
+    uint32_t count = 0;
+    uint32_t ready = 0;
+    uint32_t waited;
+    int32_t timeout_ms = -1;
+
+    if (nfds > HAKU_FD_SETSIZE) return copy_from_user_error(HAKU_EINVAL);
+    words = (nfds + 31u) / 32u;
+    bytes = words * 4u;
+    if (nfds) {
+        if ((user_read && !copy_from_user(read_set, user_read, bytes)) ||
+            (user_write && !copy_from_user(write_set, user_write, bytes)) ||
+            (user_except && !copy_from_user(except_set, user_except, bytes)))
             return copy_from_user_error(HAKU_EFAULT);
-        if (entry.revents) ready++;
+    }
+    if (user_timeout) {
+        haku_timeval_t tv;
+        uint32_t ms;
+        if (!copy_from_user(&tv, user_timeout, sizeof(tv)))
+            return copy_from_user_error(HAKU_EFAULT);
+        if (tv.tv_sec < 0 || tv.tv_usec < 0 ||
+            tv.tv_usec >= (haku_i32)HAKU_USEC_PER_SEC)
+            return copy_from_user_error(HAKU_EINVAL);
+        ms = tv.tv_sec > 0x00FFFFFFu
+                 ? 0x00FFFFFFu
+                 : (uint32_t)tv.tv_sec * 1000u +
+                       ((uint32_t)tv.tv_usec + 999u) / 1000u;
+        timeout_ms = (int32_t)ms;
+    }
+    for (uint32_t fd = 0; fd < nfds; fd++) {
+        uint32_t events = 0;
+        if (select_test(read_set, fd)) events |= HAKU_POLLIN;
+        if (select_test(write_set, fd)) events |= HAKU_POLLOUT;
+        /* An except set only asks for exceptional conditions, which Haku
+         * never reports; watching the descriptor would block forever. */
+        if (!events) continue;
+        fds[count].fd = (haku_i32)fd;
+        fds[count].events = (haku_u16)events;
+        fds[count].revents = 0;
+        count++;
+    }
+    waited = poll_wait(fds, count, timeout_ms);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t fd = (uint32_t)fds[i].fd;
+        if (!fds[i].revents) continue;
+        ready++;
+        if (fds[i].events & HAKU_POLLIN) select_add(out_read, fd);
+        if (fds[i].events & HAKU_POLLOUT) select_add(out_write, fd);
+    }
+    (void)waited;
+    if (nfds) {
+        if ((user_read && !copy_to_user(user_read, out_read, bytes)) ||
+            (user_write && !copy_to_user(user_write, out_write, bytes)) ||
+            (user_except && !copy_to_user(user_except, out_except, bytes)))
+            return copy_from_user_error(HAKU_EFAULT);
     }
     return ready;
 }
@@ -1830,6 +2130,43 @@ static uint32_t sys_fchmodat(uint32_t dirfd, uint32_t user_path) {
     return result == 1 ? 0u : (uint32_t)result;
 }
 
+/* i386 libc builds reach for _llseek rather than lseek so a 64-bit offset
+ * fits in the argument registers. Haku's descriptors hold 32-bit offsets,
+ * so a high word that is not a sign extension of the low one is out of
+ * range; the resulting position is written back as a 64-bit loff_t. */
+static uint32_t sys_llseek(uint32_t fd, uint32_t offset_high,
+                           uint32_t offset_low, uint32_t user_result,
+                           uint32_t whence) {
+    int32_t offset = (int32_t)offset_low;
+    int32_t position;
+
+    if (offset_high != 0u && offset_high != 0xFFFFFFFFu)
+        return copy_from_user_error(HAKU_EINVAL);
+    if (offset_high == 0xFFFFFFFFu && offset >= 0)
+        return copy_from_user_error(HAKU_EINVAL);
+    if (user_result &&
+        !paging_user_range_valid(user_result, 2u * sizeof(uint32_t), 1))
+        return copy_from_user_error(HAKU_EFAULT);
+    position = vfs_seek(scheduler_current_pid(), fd, offset, whence);
+    if (position < 0) return (uint32_t)position;
+    if (user_result) {
+        uint32_t words[2];
+        words[0] = (uint32_t)position;
+        words[1] = 0u;
+        if (!copy_to_user(user_result, words, sizeof(words)))
+            return copy_from_user_error(HAKU_EFAULT);
+    }
+    return 0;
+}
+
+/* The kernel only stores the pointer so it can clear it when the thread
+ * exits; Haku runs one thread per process and never clears it, so the
+ * address is accepted as-is and the thread id is the pid. */
+static uint32_t sys_set_tid_address(uint32_t user_tidptr) {
+    (void)user_tidptr;
+    return scheduler_current_pid();
+}
+
 regs_t *user_syscall(regs_t *r) {
     scheduler_note_syscall();
     switch (r->eax) {
@@ -1879,6 +2216,15 @@ regs_t *user_syscall(regs_t *r) {
     case HAKU_SYS_LSEEK:
         r->eax = (uint32_t)vfs_seek(scheduler_current_pid(), r->ebx,
                                     (int32_t)r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_LLSEEK:
+        r->eax = sys_llseek(r->ebx, r->ecx, r->edx, r->esi, r->edi);
+        return r;
+    case HAKU_SYS_READV:
+        r->eax = sys_iovec(r->ebx, r->ecx, r->edx, 0);
+        return r;
+    case HAKU_SYS_WRITEV:
+        r->eax = sys_iovec(r->ebx, r->ecx, r->edx, 1);
         return r;
     case HAKU_SYS_UNLINK:
         r->eax = sys_unlink(r->ebx);
@@ -1965,6 +2311,9 @@ regs_t *user_syscall(regs_t *r) {
         return r;
     case HAKU_SYS_GETTID:
         r->eax = scheduler_current_pid();
+        return r;
+    case HAKU_SYS_SET_TID_ADDRESS:
+        r->eax = sys_set_tid_address(r->ebx);
         return r;
     case HAKU_SYS_GETUID:
     case HAKU_SYS_GETEUID:
@@ -2073,6 +2422,13 @@ regs_t *user_syscall(regs_t *r) {
         return r;
     case HAKU_SYS_POLL:
         r->eax = sys_poll(r->ebx, r->ecx, r->edx);
+        return r;
+    case HAKU_SYS_SELECT:
+    case HAKU_SYS_OLDSELECT:
+        r->eax = sys_select(r->ebx, r->ecx, r->edx, r->esi, r->edi);
+        return r;
+    case HAKU_SYS_GETDENTS:
+        r->eax = sys_getdents(r->ebx, r->ecx, r->edx);
         return r;
     case HAKU_SYS_GETRLIMIT:
         r->eax = sys_getrlimit(r->ebx, r->ecx, 0u);

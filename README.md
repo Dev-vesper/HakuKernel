@@ -73,8 +73,16 @@ python build.py                 :: build haku.img only (data image preserved)
 python build.py run             :: build + boot in a QEMU window
 python build.py run --fresh     :: recreate the FAT12 data image, then boot
 python build.py headless        :: fresh data image + boot headless, verify
+python build.py probe --init=X  :: boot an external ELF as /init, check markers
+python build.py --memory=1024   :: guest RAM in MiB (default 512, kernel cap 1020)
 python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
 ```
+
+The kernel does not assume a memory size: it reads the E820 map, sizes the
+supervisor direct map and the frame pool from it, and reports both in the
+boot log (`MEM-OK: usable=…kB free=…kB direct-map=…MB`). `--memory=` only
+changes how much RAM QEMU gives the guest; the kernel uses whatever it finds,
+up to the 1020 MiB the 32-bit address space can map without PAE.
 
 `python build.py headless` verifies ATA detection on both legacy channels
 (`ATA-SCAN-OK devices=2`), the software-reset recovery path
@@ -122,6 +130,18 @@ image, serial/QEMU logs, and any crash screenshots as artifacts even when the
 boot check fails. A missing marker, an unexpected `*-FAIL` marker, or
 `KERNEL PANIC` fails the job.
 
+A second job, `musl`, builds `user/tests/musl_probe.c` with `musl-gcc
+-static` and boots it as `/init` with
+`python build.py probe --init=build/musl_probe --expect=MUSL-PROBE-OK`. This
+is the only check that runs an outside C library on top of the kernel, so it
+is what proves the ABI claims above: musl's own `_start`, auxiliary-vector
+parsing, `%gs`-based TLS, `writev`-backed stdio, and file/directory wrappers
+all have to work for the probe to print `MUSL-PROBE-OK`. The probe binary is
+built outside Haku's toolchain and packed into the initramfs as `/init`; the
+`probe` mode boots it without the keyboard injection the headless suite needs
+and asserts `HAKU-BOOT-OK`, `INITRAMFS-UNPACK-OK`, `INIT-READ-OK name=init`,
+`USERMODE-ENTER`, and the requested marker.
+
 `.github/workflows/release.yml` runs for `v*` tags. It repeats the headless
 check, deletes the mutated test image, rebuilds a pristine
 `build/haku_fs.img`, and publishes `Haku-<tag>.zip` containing `haku.img`,
@@ -156,7 +176,9 @@ Memory map:
 | `0x10000–0x80000` | kernel load window (up to 448 KiB, linked `/BASE:0x10000 /ALIGN:16`) |
 | `0x7000–0x7240` | E820 map from stage2 (INT 15h, count at `0x6FFC`) |
 | `0x9000–0xC000` | page directory + initial tables (8 MiB supervisor identity map) |
-| `0xF0000000–0xF8000000` | supervisor direct map of physical `0–128 MiB` (page tables live in kernel `.bss`) |
+| `0x400000–0x500000` | direct-map page tables (one per 4 MiB of mapped RAM) |
+| `0xC0000000–0xC0400000` | supervisor framebuffer window (one page-directory entry) |
+| `0xC0400000–0xFFFFFFFF` | supervisor direct map of physical `0–1020 MiB`, sized from E820 at boot |
 | `0x100000–0x400000` | kernel heap (kmalloc/kfree, 16 B aligned) |
 | `0x90000` | bootstrap kernel stack top (grows down) |
 | low E820 frames (often 4–8 MiB) | per-process 8 KiB kernel stacks, accessed through the direct map |
@@ -183,13 +205,21 @@ The boot proves the exception path with an `INT3` self-test.
 length fields in the E820 entries. Only complete 4 KiB pages wholly inside
 type-1 usable ranges are admitted; invalid entries and overlapping reserved
 ranges are excluded. The allocator explicitly reserves low boot/firmware
-memory, the kernel's 448 KiB load window, page tables, the boot stack, the ISA
-hole, and the 1–4 MiB heap. `frame_usable_count()` reports E820-usable pages
-tracked up to 128 MiB, and every tracked frame is allocatable: a permanent
-supervisor direct map at `0xF0000000` addresses physical `0–128 MiB`, and its
-PDEs are copied into each user page directory. The self-test chain-allocates
-past the old 8 MiB identity boundary and writes/reads a high frame through
-`PHYS_TO_VIRT`. Freeing validates alignment, usability, and allocation state
+memory, the kernel's 448 KiB load window, page tables, the boot stack, the
+direct-map tables, the ISA hole, and the 1–4 MiB heap. The pool is sized from
+the memory map instead of a fixed limit: `paging_init` reads the highest
+usable E820 address, rounds it up to a 4 MiB boundary, and maps exactly that
+much, so a 512 MiB guest gets a 512 MiB pool and a 2 GiB guest gets the
+1020 MiB the 32-bit address space can address. `frame_usable_count()` reports
+the E820-usable pages inside that window, and every tracked frame is
+allocatable: a permanent supervisor direct map at `0xC0400000` addresses
+physical `0–1020 MiB`, and its PDEs are copied into each user page directory.
+The bitmaps, the direct-map page tables, and the per-frame reference counters
+are all sized at boot (heap allocations and low RAM), so the kernel image does
+not carry a worst-case array. The self-test chain-allocates past the old
+8 MiB identity boundary, writes/reads a high frame through `PHYS_TO_VIRT`,
+and probes the last usable frame, which fails if the map stops short of the
+installed RAM. Freeing validates alignment, usability, and allocation state
 so reserved pages cannot accidentally be released.
 
 ### Processes and preemptive scheduling
@@ -246,7 +276,19 @@ initial user stack containing `argc`, `argv`, `envp`, and a terminating
 changing its PID or open file descriptors. Each vector is limited to 64
 strings; their strings are limited to 4096 combined bytes including NUL
 terminators and must fit the two-page initial stack. Larger inputs return
-`E2BIG`, and invalid user pointers return `EFAULT`. The syscall ABI follows
+`E2BIG`, and invalid user pointers return `EFAULT`. The first process starts
+on a stack built the same way, with `argv[0]` set to the program name, so a
+binary written for Linux finds its arguments where its startup code expects
+them. The auxiliary vector carries `AT_PHDR`, `AT_PHENT`, and `AT_PHNUM`
+(where the program headers are, which a static libc walks to find its own
+`PT_TLS` segment), `AT_PAGESZ`, `AT_CLKTCK`, `AT_BASE`, `AT_FLAGS`,
+`AT_ENTRY`, the identity words, `AT_SECURE`, and `AT_RANDOM` pointing at 16
+seed bytes. Haku's own images start their first segment at a page-aligned
+file offset, so the header table is not part of any segment; the loader maps
+a copy on a page just below the stack and points `AT_PHDR` there, which is
+what keeps the vector meaningful for every image.
+
+The syscall ABI follows
 the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `fork` (2), `read` (3), `write` (4), `open` (5), `close` (6), `waitpid` (7),
 `unlink` (10), `execve` (11), `lseek` (19), `getpid` (20), `rename` (38),
@@ -254,13 +296,19 @@ the i386 Linux syscall numbers for a small POSIX-oriented subset: `exit` (1),
 `symlink` (83), `readlink` (85),
 `gettimeofday` (78), `mmap` (90), `munmap` (91), `stat` (106), `lstat` (107),
 `fstat` (108), `wait4` (114), `clone` (120), `mprotect` (125),
+`_llseek` (140), `readv` (145), `writev` (146),
 `nanosleep` (162), `mremap` (163), `vfork` (190), `mmap2` (192),
 `stat64` (195), `lstat64` (196),
 `fstat64` (197), `madvise` (219), `exit_group` (252), `set_thread_area` (243),
-`get_thread_area` (244), `fstatat64` (300), `uname` (122),
+`get_thread_area` (244), `set_tid_address` (258), `fstatat64` (300),
+`uname` (122),
 `getrusage` (77), `times` (43), `getppid` (64), `getuid` (24), `geteuid` (49),
 `getgid` (47), `getegid` (50), and `statx` (383), with arguments in
 `ebx`, `ecx`, `edx`, `esi`, and `edi` and syscall number/result in `eax`.
+`_llseek` takes and returns a 64-bit offset through a user pointer, and
+`readv`/`writev` walk at most `IOV_MAX` (1024) eight-byte i386 `iovec`
+entries; a libc's stdio writes through `writev`, so a static libc prints
+nothing without it.
 The signal calls use the same numbers: `kill` (37), `rt_sigreturn` (173),
 `rt_sigaction` (174), `rt_sigprocmask` (175), `tkill` (238), and `tgkill`
 (270).
@@ -317,7 +365,15 @@ zeroed memory again; the other advice values are hints and change nothing.
 `set_thread_area` (243) points the user `FS` segment at the thread block the
 program passes, which is the thread pointer a libc reads through `%fs:0`; the
 GDT entry carries the base and every task switch restores the base of the
-task that is about to run. `get_thread_area` (244) returns it again. The
+task that is about to run. `get_thread_area` (244) returns it again. The call
+follows the Linux contract so a foreign libc can use it: the caller passes a
+16-byte i386 `user_desc` with `entry_number` set to `0xFFFFFFFF`, the kernel
+picks a fixed entry (6, selector `0x33`), writes the chosen number back into
+the structure, and returns 0; musl then loads `entry * 8 + 3` into `%gs` and
+reads its thread pointer from `%gs:0`. The nonzero return Linux does *not*
+use matters: musl's stub treats any nonzero result as a failure and falls
+back to `modify_ldt`. The base is also mirrored into `FS`, so Haku's own
+library can keep using `%fs`. The
 library wrappers live in `user/lib/mman.c` behind `include/haku/mman.h`, and
 the ring-3 self-test covers the fixed mapping, the protection changes, the
 fault on a read-only page, the move, the advice call, and the thread pointer
@@ -535,11 +591,22 @@ descriptors with `EINVAL`.
 (`ICRNL|IXON`, `OPOST|ONLCR`, `ISIG|ICANON|ECHO|ECHOE|ECHOK`, erase `0x7F`,
 EOF `^D`), accepts `TCSETS`/`TCSETSW`/`TCSETSF` without changing that mode,
 reports an 80x25 window for `TIOCGWINSZ`, and returns `ENOTTY` for a
-descriptor that is not the console. `poll` reports the readiness of every
-descriptor immediately (a pipe with data is `POLLIN`, a closed write end adds
-`POLLHUP`, a closed read end makes the write side `POLLERR`); its timeout is
-accepted but not waited on, so a caller that needs to block should use
-`read` or `select` over `poll`. `access` checks that the name resolves and
+descriptor that is not the console. `poll` reports readiness per descriptor (a
+pipe with data is `POLLIN`, a closed write end adds `POLLHUP`, a closed read
+end makes the write side `POLLERR`), and it blocks: a zero timeout scans once,
+a negative one waits indefinitely, and a positive one is a millisecond
+deadline. The wait is driven by the timer rather than by per-descriptor
+wakeups — every tick wakes tasks parked on the scheduler's activity queue, so
+they re-scan at 100 Hz and read the same tick counter as the clock. That costs
+at most one tick of latency and one wake per parked poll per tick, and needs
+no console/pipe plumbing. `select` (both i386 numbers, 142 `_newselect` and 82,
+which musl uses) converts its three sets into the same readiness scan; Haku
+has no exceptional conditions, so the except set always comes back empty. The
+legacy `getdents` record format is produced too, by rewriting the `getdents64`
+records in place: each becomes `{ u32 ino, u32 off, u16 reclen, name }` padded
+to four bytes, which is shorter than the 64-bit record, so a caller with a
+fixed buffer keeps calling until the call returns 0. `access` checks that the
+name resolves and
 refuses `X_OK` because nothing is marked executable; `fchmod`, `fchown`,
 and their `*at` forms succeed without changing anything because FAT12 stores
 no mode or owner bits. `getrlimit`/`setrlimit`/`prlimit64` report the fixed
@@ -553,9 +620,8 @@ reports `PER_LINUX`. The C library covers all of it
 `*at` wrappers in `fcntl.h`), and the ring-3 self-test exercises the whole
 path as `USER-FS-ABI-OK`.
 
-Not implemented: `select` (musl builds it on `poll`), the legacy `getdents`
-record format, blocking `poll`, real record locks, and `mremap` with
-`MREMAP_DONTUNMAP`.
+Not implemented: real record locks (`F_GETLK`/`F_SETLK`/`F_SETLKW` are
+accepted without tracking anything) and `mremap` with `MREMAP_DONTUNMAP`.
 
 Before copying, the kernel validates every covered page in the current page
 tables for presence, user access, and write permission where required. It
@@ -615,7 +681,8 @@ userland; conformance is not a goal. What exists, by area:
   `stat`/`lstat`/`fstat` (32- and 64-bit), `fstatat64`, `statx`,
   `symlink`/`readlink` (on the RAM root),
   `truncate`, `ftruncate`, `access`/`faccessat`, `chdir`, `getcwd`,
-  `getdents64`, `poll`, and `chmod`/`chown`/`fchmod`/`fchown` (accepted,
+  `getdents`, `getdents64`, `poll`, `select`, and
+  `chmod`/`chown`/`fchmod`/`fchown` (accepted,
   nothing to change).
 - **Time:** `gettimeofday`, `nanosleep`.
 - **Haku-specific:** `spawn`, `getusage`, `futex`.
@@ -858,7 +925,8 @@ archive still boots the old way with FAT12 as the root.
 - **`ramfs`** (`kernel/fs/ramfs`) is the writable root: long names (48 bytes
   per component), permission bits, timestamps from the PIT, nested
   directories, and symbolic links with a hop limit of 8. Nodes come from a
-  fixed 160-entry table and file data from the kernel heap (96 KiB per file),
+  fixed 160-entry table and file data from the kernel heap (256 KiB per file,
+  enough for a static libc binary),
   so nothing survives a reboot — which is exactly what an initramfs needs.
   Unlinking a file that is still open keeps the data alive until the last
   descriptor closes, the same promise FAT12 makes.
@@ -999,7 +1067,7 @@ Haku/
                         GDT/TSS load, ring-3 transition + syscalls
                         cpu/gdt/idt/pic/pit/kbd: port I/O, descriptor tables,
                         PIC/PIT, and the PS/2 keyboard driver
-      mm/               paging.c/.h: i386 page tables (identity + 128 MiB direct map + user)
+      mm/               paging.c/.h: i386 page tables (identity + sized direct map + user)
                         frame.c/.h: E820-backed physical page inventory
       elf/              elf.c/.h: validated ELF32 PT_LOAD loader + user spaces
       user/             user.asm, child.asm, fault.asm, exec_target.asm,
@@ -1035,6 +1103,7 @@ Haku/
     lib/              errno.c, fsabi.c, memory.c, mman.c, signal.c, stdio.c,
                       string.c, unistd.c, crt0.asm, syscall.asm: user C library
     tests/            libtest.c: C library self-test installed as LIB.ELF
+                      musl_probe.c: portable probe built by the CI musl job
   include/haku/         abi.h + abi.inc: shared user/kernel ABI constants
                         types/errno/string/stdlib/unistd/fcntl/stat/stdio/
                         signal/mman/dirent/poll/termios/resource.h: user

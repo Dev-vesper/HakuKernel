@@ -24,7 +24,9 @@
 
 #define RAMFS_MAX_NODES 160u
 #define RAMFS_MAX_NAME  48u    /* longest component, without the NUL */
-#define RAMFS_MAX_FILE  (96u * 1024u)
+/* Large enough for an externally built static binary unpacked from the
+ * initramfs; contents come from the heap, so this only caps one file. */
+#define RAMFS_MAX_FILE  (256u * 1024u)
 #define RAMFS_MAX_LINK  128u
 #define RAMFS_MAX_HOPS  8u     /* symlink expansions per lookup */
 #define RAMFS_ROOT_INO  1u

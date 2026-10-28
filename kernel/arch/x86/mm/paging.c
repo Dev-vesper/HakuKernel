@@ -4,26 +4,32 @@
  * with PG0 identity entries, loads CR3, then sets CR0.PG. We do the same,
  * except our initial tables live at fixed physical 0x9000/0xA000/0xB000
  * (identity mapped, so virtual == physical and plain C pointers work
- * before and after the switch). After the switch a static supervisor
- * direct map at 0xF0000000 makes every tracked frame addressable without
- * temporary mappings.
+ * before and after the switch). After the switch a supervisor direct map
+ * at PAGING_DIRECT_MAP_BASE makes every tracked frame addressable without
+ * temporary mappings; it is sized from E820 so the kernel addresses the
+ * RAM the machine has rather than a fixed 128 MiB.
  */
 #include "paging.h"
 #include "frame.h"
+#include "heap.h"
 #include "sync.h"
 
 #define DIR  ((uint32_t *)PAGING_DIR_PHYS)
 #define TAB  ((uint32_t *)PAGING_TABLE_PHYS)
 #define TAB1 ((uint32_t *)PAGING_TABLE1_PHYS)
 
-/* Storage for the direct-map page tables. The PDEs need page-aligned
- * table addresses, but the kernel image is linked with 16-byte section
- * alignment; reserve one extra page and round the base up at runtime.
- * .bss is zeroed by the loader and lies in the identity window, so
- * paging_init can fill the tables before the MMU is enabled. */
-#define DIRECT_TABLE_WORDS (PAGING_DIRECT_MAP_TABLES * PAGING_ENTRIES)
-static uint32_t direct_table_storage[DIRECT_TABLE_WORDS + PAGING_ENTRIES];
-static uint32_t *direct_tables;
+/* Storage for the direct-map page tables, carved out of the identity-mapped
+ * 4-5 MiB window instead of .bss: a 1020 MiB map needs 255 tables (1 MiB),
+ * which would push the kernel image past the 0x80000 boot stack. The region
+ * is reserved in the frame allocator by reserve_kernel_regions(). */
+#define DIRECT_TABLE_PHYS 0x00400000u
+#define DIRECT_TABLE_BYTES 0x00100000u
+
+/* Direct-map size detected in paging_init, and how many page tables it
+ * needs. Both are read by the mapping helpers after the MMU is on. */
+static uint32_t direct_map_bytes_;
+static uint32_t direct_map_tables_;
+static uint32_t phys_limit_;
 
 static int alloc_page_table(void) {
     void *frame = frame_alloc();
@@ -36,20 +42,24 @@ static int alloc_page_table(void) {
  * any user space", which is the state of every kernel-owned page (page
  * tables, kernel stacks, heap) and of a frame that was just released, so
  * the table only needs an entry per possible frame. Fork increments the
- * count for every shared page and the last unmap or destroy frees it. */
-#define PAGING_FRAME_SLOTS (PAGING_PHYS_LIMIT / FRAME_SIZE)
-static uint8_t frame_refs[PAGING_FRAME_SLOTS];
+ * count for every shared page and the last unmap or destroy frees it.
+ *
+ * The array is allocated by paging_frames_init() once the detected size is
+ * known: one byte per frame is 256 KiB on a 1 GiB machine, too much to keep
+ * in .bss but cheap from the heap. */
+static uint8_t *frame_refs;
+static uint32_t frame_ref_slots;
 
 static uint32_t frame_slot(uint32_t phys) {
     uint32_t slot = (phys & 0xFFFFF000u) / FRAME_SIZE;
-    return slot < PAGING_FRAME_SLOTS ? slot : PAGING_FRAME_SLOTS;
+    return slot < frame_ref_slots ? slot : frame_ref_slots;
 }
 
 /* First mapping of a frame: user frames start life with one reference. */
 static void frame_ref_first(uint32_t phys) {
     uint32_t slot = frame_slot(phys);
     irqflags_t flags;
-    if (slot >= PAGING_FRAME_SLOTS) return;
+    if (slot >= frame_ref_slots) return;
     flags = irq_lock();
     if (frame_refs[slot] == 0) frame_refs[slot] = 1;
     irq_unlock(flags);
@@ -59,7 +69,7 @@ static void frame_ref_first(uint32_t phys) {
 static void frame_ref_hold(uint32_t phys) {
     uint32_t slot = frame_slot(phys);
     irqflags_t flags;
-    if (slot >= PAGING_FRAME_SLOTS) return;
+    if (slot >= frame_ref_slots) return;
     flags = irq_lock();
     if (frame_refs[slot] == 0)
         frame_refs[slot] = 1;
@@ -73,7 +83,7 @@ static void frame_ref_drop(uint32_t phys) {
     uint32_t slot = frame_slot(phys);
     irqflags_t flags;
     int last = 0;
-    if (slot >= PAGING_FRAME_SLOTS) { frame_free((void *)phys); return; }
+    if (slot >= frame_ref_slots) { frame_free((void *)phys); return; }
     flags = irq_lock();
     if (frame_refs[slot] == 0) {
         /* Not counted (a kernel-owned frame): leave it alone. */
@@ -85,7 +95,21 @@ static void frame_ref_drop(uint32_t phys) {
     if (last) frame_free((void *)(phys & 0xFFFFF000u));
 }
 
+uint32_t paging_phys_limit(void) { return phys_limit_; }
+
+uint32_t paging_direct_map_bytes(void) { return direct_map_bytes_; }
+
+int paging_frames_init(void) {
+    uint32_t slots = phys_limit_ / FRAME_SIZE;
+    if (slots == 0 || slots > FRAME_MAX_ENTRIES) return 0;
+    frame_refs = (uint8_t *)kzalloc(slots);
+    if (!frame_refs) return 0;
+    frame_ref_slots = slots;
+    return 1;
+}
+
 void paging_init(void) {
+    uint32_t usable_top;
     /* Fresh tables: stale TLB state cannot exist yet (PG was off), but
      * zeroing is still required — a leftover non-zero word would alias
      * a random physical page. */
@@ -102,14 +126,26 @@ void paging_init(void) {
         TAB[i] = (i * 0x1000u) | PAGE_PRESENT | PAGE_RW;
         TAB1[i] = ((i + 1024u) * 0x1000u) | PAGE_PRESENT | PAGE_RW;
     }
-    /* Supervisor direct map of every frame the allocator tracks, at
-     * 0xF0000000..0xF8000000. User directories copy these PDEs so the
-     * kernel can dereference any physical frame while a user space is
-     * active. */
-    direct_tables = (uint32_t *)(((uint32_t)direct_table_storage +
-                                 0xFFFu) & 0xFFFFF000u);
-    for (uint32_t t = 0; t < PAGING_DIRECT_MAP_TABLES; t++) {
-        uint32_t *table = direct_tables + t * PAGING_ENTRIES;
+
+    /* Size the direct map from the memory map, rounded up to a page-table
+     * boundary (4 MiB). A machine with less RAM than that still gets one
+     * table so the map always exists. */
+    usable_top = memmap_usable_top();
+    if (usable_top > PAGING_PHYS_LIMIT_MAX) usable_top = PAGING_PHYS_LIMIT_MAX;
+    if (usable_top < 0x00400000u) usable_top = 0x00400000u;
+    direct_map_bytes_ = (usable_top + 0x003FFFFFu) & 0xFFC00000u;
+    direct_map_tables_ = direct_map_bytes_ / 0x00400000u;
+    if (direct_map_tables_ * PAGING_ENTRIES * 4u > DIRECT_TABLE_BYTES) {
+        direct_map_tables_ = DIRECT_TABLE_BYTES / (PAGING_ENTRIES * 4u);
+        direct_map_bytes_ = direct_map_tables_ * 0x00400000u;
+    }
+    phys_limit_ = direct_map_bytes_;
+
+    /* Supervisor direct map of every tracked frame, immediately above the
+     * framebuffer window. User directories copy these PDEs so the kernel
+     * can dereference any physical frame while a user space is active. */
+    for (uint32_t t = 0; t < direct_map_tables_; t++) {
+        uint32_t *table = (uint32_t *)(DIRECT_TABLE_PHYS + t * 4096u);
         for (uint32_t i = 0; i < PAGING_ENTRIES; i++) {
             uint32_t phys = (t * PAGING_ENTRIES + i) * 0x1000u;
             table[i] = phys | PAGE_PRESENT | PAGE_RW;
@@ -197,7 +233,7 @@ int paging_create_user_space(address_space_t *space) {
      * reachable from syscalls and task switches. The framebuffer window
      * is shared too, so the console keeps drawing while a user space
      * is the active address space. */
-    for (uint32_t i = 0; i < PAGING_DIRECT_MAP_TABLES; i++) {
+    for (uint32_t i = 0; i < direct_map_tables_; i++) {
         uint32_t index = (PAGING_DIRECT_MAP_BASE >> 22) + i;
         directory[index] = DIR[index];
     }

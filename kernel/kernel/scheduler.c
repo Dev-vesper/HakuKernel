@@ -80,6 +80,8 @@ static int scheduler_started;
 static int timer_marker_written;
 static int waitq_marker_written;
 
+wait_queue_t scheduler_activity = WAIT_QUEUE_INIT;
+
 /* A fresh task starts at the volume root with the kernel's default name. */
 static void init_task_identity(task_t *task) {
     memset(task->cwd, 0, sizeof(task->cwd));
@@ -361,6 +363,9 @@ regs_t *scheduler_preempt(regs_t *frame) {
 
     reap_completed_tasks();
     wake_expired_sleepers();
+    /* The timer is the clock for a parked poll(2)/select(2): it re-scans
+     * readiness and checks its deadline once per tick. */
+    wait_queue_wake_all(&scheduler_activity);
     if (current_task == SCHEDULER_IDLE_INDEX) {
         idle_task.frame = frame;
     } else if (current_task >= 0 &&

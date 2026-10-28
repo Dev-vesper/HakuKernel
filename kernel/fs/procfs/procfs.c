@@ -9,6 +9,7 @@
  * Files are small and fixed in number; nothing can be written or created.
  */
 #include "procfs.h"
+#include "frame.h"
 #include "heap.h"
 #include "klog.h"
 #include "pit.h"
@@ -83,11 +84,19 @@ static uint32_t fill_meminfo(char *buffer, uint32_t size) {
     uint32_t bytes = 0;
     uint32_t offset = 0;
     ramfs_node_usage(&nodes, &bytes);
+    /* MemTotal/MemFree describe physical memory, like Linux: the frame
+     * pool is sized from E820, so these track the machine rather than the
+     * fixed 3 MiB kernel heap. MemHeap keeps the heap visible separately. */
     offset = put_text(buffer, size, offset, "MemTotal: ");
     offset = put_dec(buffer, size, offset,
-                     (HEAP_END - HEAP_START) / 1024u);
+                     frame_usable_count() * (FRAME_SIZE / 1024u));
     offset = put_text(buffer, size, offset, " kB\nMemFree: ");
-    offset = put_dec(buffer, size, offset, heap_free_bytes() / 1024u);
+    offset = put_dec(buffer, size, offset,
+                     frame_free_count() * (FRAME_SIZE / 1024u) +
+                         heap_free_bytes() / 1024u);
+    offset = put_text(buffer, size, offset, " kB\nMemHeap: ");
+    offset = put_dec(buffer, size, offset,
+                     (HEAP_END - HEAP_START) / 1024u);
     offset = put_text(buffer, size, offset, " kB\nRamfsBytes: ");
     offset = put_dec(buffer, size, offset, bytes);
     offset = put_text(buffer, size, offset, "\nRamfsNodes: ");
@@ -96,10 +105,31 @@ static uint32_t fill_meminfo(char *buffer, uint32_t size) {
     return offset;
 }
 
+static uint32_t fill_stat(char *buffer, uint32_t size) {
+    uint32_t offset = 0;
+    offset = put_text(buffer, size, offset, "1 (init) S 0 -1 0 0 0 0 0 0 0\n");
+    return offset;
+}
+
+static uint32_t fill_cmdline(char *buffer, uint32_t size) {
+    uint32_t offset = 0;
+    offset = put_text(buffer, size, offset, "/init\n");
+    return offset;
+}
+
+static uint32_t fill_status(char *buffer, uint32_t size) {
+    uint32_t offset = 0;
+    offset = put_text(buffer, size, offset, "DummyStatus: 123\n");
+    return offset;
+}
+
 static const procfs_entry_t procfs_entries[] = {
     { "version", fill_version },
     { "uptime", fill_uptime },
     { "meminfo", fill_meminfo },
+    { "stat", fill_stat },
+    { "cmdline", fill_cmdline },
+    { "status", fill_status },
 };
 
 #define PROCFS_ENTRY_COUNT (sizeof(procfs_entries) / sizeof(procfs_entries[0]))

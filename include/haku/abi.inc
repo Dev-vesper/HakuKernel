@@ -10,6 +10,10 @@
 %define HAKU_SYS_UNLINK  10
 %define HAKU_SYS_EXECVE  11
 %define HAKU_SYS_LSEEK   19
+%define HAKU_SYS_LLSEEK  140
+%define HAKU_SYS_READV   145
+%define HAKU_SYS_WRITEV  146
+%define HAKU_IOV_MAX     1024
 %define HAKU_SYS_GETPID  20
 %define HAKU_SYS_GETUID  24
 %define HAKU_SYS_RENAME  38
@@ -77,6 +81,7 @@
 %define HAKU_SYS_PERSONALITY 136
 %define HAKU_SYS_GETDENTS  141
 %define HAKU_SYS_SELECT    142
+%define HAKU_SYS_OLDSELECT 82
 %define HAKU_SYS_SCHED_YIELD 158
 %define HAKU_SYS_MREMAP    163
 %define HAKU_SYS_POLL      168
@@ -370,6 +375,25 @@
 %define HAKU_AT_SYMLINK_NOFOLLOW 0x100
 %define HAKU_AT_EMPTY_PATH 0x1000
 %define HAKU_AT_NO_AUTOMOUNT 0x800
+; Auxiliary vector types: the (type, value) pairs the kernel places after
+; the environment on the initial stack.
+%define HAKU_AT_NULL    0
+%define HAKU_AT_PHDR    3
+%define HAKU_AT_PHENT   4
+%define HAKU_AT_PHNUM   5
+%define HAKU_AT_PAGESZ  6
+%define HAKU_AT_BASE    7
+%define HAKU_AT_FLAGS   8
+%define HAKU_AT_ENTRY   9
+%define HAKU_AT_UID     11
+%define HAKU_AT_EUID    12
+%define HAKU_AT_GID     13
+%define HAKU_AT_EGID    14
+%define HAKU_AT_HWCAP   16
+%define HAKU_AT_CLKTCK  17
+%define HAKU_AT_SECURE  23
+%define HAKU_AT_RANDOM  25
+%define HAKU_AT_RANDOM_BYTES 16
 %define HAKU_STATX_TYPE     0x001
 %define HAKU_STATX_MODE     0x002
 %define HAKU_STATX_NLINK    0x004

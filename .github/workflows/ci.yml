@@ -64,3 +64,48 @@ jobs:
             build/screen.ppm
           if-no-files-found: ignore
           retention-days: 14
+
+  musl:
+    # Boots a binary that was not built with Haku's own library: musl's
+    # startup code, TLS, stdio, and file wrappers all run on top of the
+    # syscall ABI. This is the only check that exercises an outside libc,
+    # so it is a separate job with its own toolchain.
+    name: Static musl userland
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install NASM, LLVM, QEMU, and musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            nasm clang lld qemu-system-x86 musl-tools
+
+      - name: Build the probe against musl
+        run: |
+          mkdir -p build
+          musl-gcc -static -no-pie -fno-pie -Os -Wall -Wextra \
+            -o build/musl_probe user/tests/musl_probe.c
+          file build/musl_probe
+          readelf -h build/musl_probe
+
+      - name: Boot the probe as /init
+        run: python build.py probe --init=build/musl_probe --expect=MUSL-PROBE-OK
+
+      - name: Upload boot artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: haku-musl-${{ github.run_id }}
+          path: |
+            build/serial.log
+            build/qemu.log
+          if-no-files-found: ignore
+          retention-days: 14

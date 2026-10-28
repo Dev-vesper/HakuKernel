@@ -22,6 +22,14 @@
 #define HAKU_SYS_UNLINK  10u
 #define HAKU_SYS_EXECVE  11u
 #define HAKU_SYS_LSEEK   19u
+/* i386 libc builds (musl among them) seek through _llseek, which takes and
+ * returns a 64-bit offset through a user pointer. */
+#define HAKU_SYS_LLSEEK  140u
+/* Scatter/gather I/O. A libc's stdio writes through writev, so this is part
+ * of the surface a foreign libc needs, not an extra. */
+#define HAKU_SYS_READV   145u
+#define HAKU_SYS_WRITEV  146u
+#define HAKU_IOV_MAX     1024u
 #define HAKU_SYS_GETPID  20u
 /* i386 set*id/get*id: Haku has a single user, so every process runs as
  * uid/gid 0 and the setters are not implemented. */
@@ -98,6 +106,9 @@
 #define HAKU_SYS_PERSONALITY 136u
 #define HAKU_SYS_GETDENTS  141u
 #define HAKU_SYS_SELECT    142u
+/* i386 names 142 "_newselect" and keeps 82 as the original select. musl's
+ * select() uses 82, so both numbers route to the same implementation. */
+#define HAKU_SYS_OLDSELECT 82u
 #define HAKU_SYS_SCHED_YIELD 158u
 #define HAKU_SYS_MREMAP    163u
 #define HAKU_SYS_POLL      168u
@@ -401,6 +412,27 @@
 #define HAKU_AT_SYMLINK_NOFOLLOW 0x100u
 #define HAKU_AT_EMPTY_PATH 0x1000u
 #define HAKU_AT_NO_AUTOMOUNT 0x800u
+/* Auxiliary vector types (the i386 Linux numbers). The kernel places these
+ * as (type, value) pairs after the environment on the initial stack, so a
+ * libc can read the page size, the canary seed, and the identity words
+ * before main runs. */
+#define HAKU_AT_NULL    0u
+#define HAKU_AT_PHDR    3u
+#define HAKU_AT_PHENT   4u
+#define HAKU_AT_PHNUM   5u
+#define HAKU_AT_PAGESZ  6u
+#define HAKU_AT_BASE    7u
+#define HAKU_AT_FLAGS   8u
+#define HAKU_AT_ENTRY   9u
+#define HAKU_AT_UID     11u
+#define HAKU_AT_EUID    12u
+#define HAKU_AT_GID     13u
+#define HAKU_AT_EGID    14u
+#define HAKU_AT_HWCAP   16u
+#define HAKU_AT_CLKTCK  17u
+#define HAKU_AT_SECURE  23u
+#define HAKU_AT_RANDOM  25u
+#define HAKU_AT_RANDOM_BYTES 16u
 /* statx(2) mask bits. */
 #define HAKU_STATX_TYPE     0x001u
 #define HAKU_STATX_MODE     0x002u
@@ -452,6 +484,23 @@ typedef unsigned char haku_u8;
 typedef signed int haku_i32;
 typedef unsigned long long haku_u64;
 typedef long long haku_i64;
+
+/* The thread area descriptor of set_thread_area(243): the i386
+ * "struct user_desc" (16 bytes). base_addr is the thread pointer; the
+ * kernel writes the descriptor entry it used back into entry_number and
+ * returns the same number, so a libc can load entry*8+3 into %gs. */
+typedef struct {
+    haku_u32 entry_number;
+    haku_u32 base_addr;
+    haku_u32 limit;
+    haku_u32 seg_32bit : 1;
+    haku_u32 contents : 2;
+    haku_u32 read_exec_only : 1;
+    haku_u32 limit_in_pages : 1;
+    haku_u32 seg_not_present : 1;
+    haku_u32 useable : 1;
+    haku_u32 reserved : 25;
+} haku_thread_area_t;
 
 /* i386 Linux "struct stat" (arch/x86/include/uapi/asm/stat.h): the layout
  * returned by stat(106), lstat(107), and fstat(108). 64 bytes. */

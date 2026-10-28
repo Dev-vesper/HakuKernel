@@ -58,7 +58,9 @@ void kernel_main(void) {
         }
     }
     if (klog_begin(KLOG_INFO)) {
-        klog_write("PAGING-OK: 8MB identity + 128MB direct map, cr3=");
+        klog_write("PAGING-OK: 8MB identity + ");
+        klog_dec(paging_direct_map_bytes() / (1024u * 1024u));
+        klog_write("MB direct map, cr3=");
         klog_hex(paging_get_cr3());
         klog_write(", CR0.PG on\n");
     }
@@ -69,12 +71,24 @@ void kernel_main(void) {
         panic("HEAP-FAIL: kmalloc self-test failed");
     }
 
-    /* E820-backed frame inventory. Every tracked frame below 128 MiB is
-     * reachable through the supervisor direct map, not just the identity
-     * window. */
+    /* E820-backed frame inventory. The pool and the direct map are sized
+     * from the memory map, so every usable frame the 32-bit address space
+     * can reach is allocatable — not just the first 128 MiB. */
     frame_init();
+    if (!paging_frames_init()) {
+        panic("FRAME-FAIL: no heap for the frame reference table");
+    }
     if (!frame_self_test()) {
         panic("FRAME-FAIL: frame allocator self-test failed");
+    }
+    if (klog_begin(KLOG_INFO)) {
+        klog_write("MEM-OK: usable=");
+        klog_dec(frame_usable_count() * (FRAME_SIZE / 1024u));
+        klog_write("kB free=");
+        klog_dec(frame_free_count() * (FRAME_SIZE / 1024u));
+        klog_write("kB direct-map=");
+        klog_dec(paging_direct_map_bytes() / (1024u * 1024u));
+        klog_write("MB\n");
     }
 
     /* Framebuffer console: the bootloader discovered a linear framebuffer

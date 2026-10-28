@@ -15,6 +15,10 @@
 #define ELF_MAX_PHDRS 32u
 #define USER_IMAGE_MIN 0x40000000u
 #define USER_STACK_BOTTOM (USER_STACK_TOP - 2u * USER_PAGE_SIZE)
+/* A copy of the program headers lives here when the image does not map
+ * them itself. It sits below the stack, where the stack overflow check
+ * already refuses to grow, so nothing else can claim the page. */
+#define USER_HEADER_PAGE (USER_STACK_BOTTOM - USER_PAGE_SIZE)
 
 #pragma pack(push, 1)
 typedef struct {
@@ -137,6 +141,7 @@ int elf_load_executable(const uint8_t *image, uint32_t image_size,
     uint32_t ends[ELF_MAX_PHDRS];
     uint32_t load_count = 0;
     int entry_is_executable = 0;
+    uint32_t phdr_address = 0;
 
     if (!image || !loaded || image_size < sizeof(header)) return 0;
     memcpy(&header, image, sizeof(header));
@@ -161,6 +166,14 @@ int elf_load_executable(const uint8_t *image, uint32_t image_size,
         if (!valid_segment(&phdr, image_size, &starts[load_count],
                            &ends[load_count]))
             return 0;
+        /* The header table normally lives in the first read-only segment.
+         * Record where it lands so the auxiliary vector can point AT_PHDR
+         * at it; a libc needs that to find its own PT_TLS. */
+        if (!phdr_address && header.phoff >= phdr.offset &&
+            header.phoff - phdr.offset < phdr.filesz &&
+            (uint32_t)header.phnum * sizeof(elf32_phdr_t) <=
+                phdr.filesz - (header.phoff - phdr.offset))
+            phdr_address = phdr.vaddr + (header.phoff - phdr.offset);
         for (uint32_t j = 0; j < load_count; j++)
             if (starts[load_count] < ends[j] && starts[j] < ends[load_count])
                 return 0;
@@ -185,8 +198,27 @@ int elf_load_executable(const uint8_t *image, uint32_t image_size,
                           USER_STACK_TOP, 1))
         goto fail;
 
+    /* Haku's own images begin their first segment at a page-aligned file
+     * offset, so the header table is not part of any segment. Linux
+     * guarantees AT_PHDR is mapped, and a static libc walks it to find its
+     * PT_TLS segment, so map a copy when the image does not carry one. */
+    if (!phdr_address) {
+        uint32_t table_size =
+            (uint32_t)header.phnum * sizeof(elf32_phdr_t);
+        if (!map_zeroed_pages(&loaded->address_space, USER_HEADER_PAGE,
+                              USER_HEADER_PAGE + USER_PAGE_SIZE, 1) ||
+            !paging_copy_to_user_space(&loaded->address_space,
+                                       USER_HEADER_PAGE,
+                                       image + header.phoff, table_size))
+            goto fail;
+        phdr_address = USER_HEADER_PAGE;
+    }
+
     loaded->entry = header.entry;
     loaded->user_stack = USER_STACK_TOP;
+    loaded->phdr_address = phdr_address;
+    loaded->phdr_count = header.phnum;
+    loaded->phdr_size = sizeof(elf32_phdr_t);
     return 1;
 
 fail:
