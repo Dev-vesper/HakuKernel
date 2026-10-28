@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""pe2bin.py — convert a linked 32-bit PE image into a flat binary.
+"""pe2bin.py — convert a linked PE image (PE32 or PE32+) into a flat binary.
 
 Usage:
     pe2bin.py kernel.pe kernel.bin
 
 The PE must be linked for its load address (link.exe /BASE:0x10000) with a
-fixed entry point (/ENTRY:_entry). This script does NO relocation math — the
+fixed entry point (/ENTRY:...). This script does NO relocation math — the
 real linker already resolved everything. It only copies each section's raw
 bytes to (RVA - ImageBase) and zero-fills BSS-style sections, then reports
 the entry point address for the bootloader (ENTRY=0x...).
+
+Both the i386 kernel (machine 0x14c, magic 0x10b) and the x86-64 image
+(machine 0x8664, magic 0x20b) are supported; the only difference is where
+the 32- or 64-bit ImageBase field lives in the optional header.
 
 Exit codes: 0 = ok, 1 = usage error, 2 = image not convertible (with reason).
 """
@@ -38,13 +42,29 @@ def main():
 
     coff = e_lfanew + 4
     machine, nsec, _, _, _, opt_sz, _ = struct.unpack_from("<HHIIIHH", data, coff)
-    if machine != 0x14C:
-        die(f"not a 32-bit image (machine={machine:#06x})")
+    # PE32 (0x14C) is the 32-bit kernel; PE32+ (0x8664) is the x86-64 image.
+    # Both are flat-loaded the same way: section RVAs are offsets from the
+    # link-time base, and the bootloader puts the image there.
+    if machine == 0x8664:
+        pe32plus = True
+    elif machine == 0x14C:
+        pe32plus = False
+    else:
+        die(f"unsupported machine {machine:#06x} "
+            "(expected 0x14c i386 or 0x8664 x86-64)")
     opt = coff + 20
-    if struct.unpack_from("<H", data, opt)[0] != 0x10B:
-        die("not a PE32 image (expected optional magic 0x10B)")
-    entry_rva = struct.unpack_from("<I", data, opt + 16)[0]
-    image_base = struct.unpack_from("<I", data, opt + 28)[0]
+    magic = struct.unpack_from("<H", data, opt)[0]
+    if pe32plus:
+        if magic != 0x20B:
+            die(f"x86-64 image has optional-header magic {magic:#05x}, "
+                "expected 0x20b (PE32+)")
+        entry_rva = struct.unpack_from("<I", data, opt + 16)[0]
+        image_base = struct.unpack_from("<Q", data, opt + 24)[0]
+    else:
+        if magic != 0x10B:
+            die("not a PE32 image (expected optional magic 0x10B)")
+        entry_rva = struct.unpack_from("<I", data, opt + 16)[0]
+        image_base = struct.unpack_from("<I", data, opt + 28)[0]
 
     sectab = opt + opt_sz
     sections = []

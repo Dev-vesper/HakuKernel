@@ -73,6 +73,7 @@ python build.py                 :: build haku.img only (data image preserved)
 python build.py run             :: build + boot in a QEMU window
 python build.py run --fresh     :: recreate the FAT12 data image, then boot
 python build.py headless        :: fresh data image + boot headless, verify
+python build.py x64             :: build haku64.img (64-bit kernel) and boot it
 python build.py probe --init=X  :: boot an external ELF as /init, check markers
 python build.py --memory=1024   :: guest RAM in MiB (default 512, kernel cap 1020)
 python build.py inspect ...     :: examine a FAT12 image (list/check/extract)
@@ -176,6 +177,7 @@ Memory map:
 | `0x10000–0x80000` | kernel load window (up to 448 KiB, linked `/BASE:0x10000 /ALIGN:16`) |
 | `0x7000–0x7240` | E820 map from stage2 (INT 15h, count at `0x6FFC`) |
 | `0x9000–0xC000` | page directory + initial tables (8 MiB supervisor identity map) |
+| `0x1000–0x4000` | x86-64 boot: PML4, PDPT and PD (1 GiB identity map, 2 MiB pages) |
 | `0x400000–0x500000` | direct-map page tables (one per 4 MiB of mapped RAM) |
 | `0xC0000000–0xC0400000` | supervisor framebuffer window (one page-directory entry) |
 | `0xC0400000–0xFFFFFFFF` | supervisor direct map of physical `0–1020 MiB`, sized from E820 at boot |
@@ -187,6 +189,24 @@ Memory map:
 | `0x60000000–0x70000000` | anonymous `mmap` region (lazily mapped) |
 | `0xBFFFE000–0xC0000000` | two user stack pages |
 | `0xB8000` | VGA text buffer |
+
+### x86-64: boot path only (work in progress)
+
+`python build.py x64` produces `haku64.img` from the same stage1/stage2
+floppy, with a 64-bit kernel entry instead of the 32-bit one. Stage 2 still
+leaves the CPU in 32-bit protected mode; `kernel/arch/x86_64/boot/entry64.asm`
+takes over from there, enables PAE and `EFER.LME`, installs a PML4/PDPT/PD
+identity map of the first 1 GiB with 2 MiB pages, and far-jumps to a 64-bit
+code segment. `kernel/arch/x86_64/kernel/boot64.c` is then the first C code
+that runs in long mode, and it reports `HAKU64-BOOT-OK` on COM1.
+
+That is the whole of the 64-bit path today. It proves the long-mode
+transition, the 64-bit segment setup, the Microsoft x64 calling convention
+across the asm/C boundary, and PE32+ handling in `tools/pe2bin.py`. The heap,
+frame allocator, interrupts, scheduler, syscalls, and userland are still the
+32-bit implementation, and `haku.img` remains the default image; ROADMAP.md
+(Milestone 8) lists the remaining stages. The 64-bit sources are excluded
+from the 32-bit link line, so both targets build from one tree.
 
 ### Interrupts (IDT)
 
@@ -1073,6 +1093,10 @@ Haku/
       user/             user.asm, child.asm, fault.asm, exec_target.asm,
                         vfork_target.asm: ELF32 test programs (syscall,
                         spawn/waitpid, protection faults, execve/vfork)
+    arch/x86_64/
+      boot/             entry64.asm: PAE + EFER.LME + PML4/PDPT/PD, far jump
+                        into a 64-bit code segment, then call into C
+      kernel/           boot64.c: the first 64-bit C code (HAKU64-BOOT-OK)
                         coverage)
     drivers/            ata.c/.h: primary/secondary ATA (master/slave) LBA28/LBA48
                         polling PIO with reset/retry recovery and cache flush

@@ -458,11 +458,46 @@ an initramfs, executes shell builtins and applets, reads and writes files
 in the RAM filesystem, and the headless test asserts its output; glibc,
 dynamic linking, and shared libraries stay out of scope.
 
+### 8. x86-64 (long mode)
+
+The 32-bit kernel remains the default image; this milestone adds a 64-bit
+boot path and ports the kernel onto it in stages. Every stage must leave
+`python build.py headless` green, so the two targets stay independent until
+the port is complete.
+
+- [x] Boot into IA-32e long mode and run 64-bit C.
+  `kernel/arch/x86_64/boot/entry64.asm` sets `CR4.PAE`, `EFER.LME`, builds a
+  PML4/PDPT/PD identity map of the first 1 GiB with 2 MiB pages, and
+  far-jumps to a 64-bit code segment; `kernel/arch/x86_64/kernel/boot64.c` is
+  the first C code the 64-bit path runs, which also proves the Microsoft x64
+  calling convention across the asm/C boundary. `python build.py x64` reuses
+  the existing stage1/stage2 floppy, and `tools/pe2bin.py` now converts PE32+
+  images as well as PE32.
+- [ ] Memory: 4-level paging helpers, a frame allocator over 64-bit physical
+  addresses (no 1020 MiB direct-map ceiling), and the kernel heap rebuilt on
+  the new mapping primitives.
+- [ ] Interrupts: 64-bit IDT and TSS with an IST stack, rewritten ISR stubs,
+  and the PIC/PIT path. MSVC x64 dropped inline `__asm` entirely, so every
+  one of the 26 inline-assembly blocks in `kernel/` becomes a NASM routine or
+  an intrinsic first.
+- [ ] Processes: 64-bit context switch, per-process page tables, ring-3
+  entry, and the syscall gate (`syscall`/`sysret`, or `int 0x80` with a
+  64-bit frame).
+- [ ] Syscall ABI: x86-64 Linux syscall numbers and the
+  `rdi/rsi/rdx/r10/r8/r9` convention, replacing the i386 table in
+  `usermode.c` (97 cases).
+- [ ] Userland: ELF64 loader, a 64-bit build of `user/lib`, and `musl-gcc`
+  binaries in the probe.
+
+**Acceptance criteria:** `python build.py x64` boots to a 64-bit user process
+running the same test suite as the 32-bit image, with its own headless marker
+set; the 32-bit image keeps working from the same tree.
+
 ## Out of Scope for This Roadmap
 
 These features require separate milestones and design decisions:
 
-- SMP, 64-bit/long mode, and architectures other than x86.
+- SMP and architectures other than x86 (x86-64 itself is Milestone 8).
 - Networking, TCP/IP, USB, audio, and a complete graphical interface.
 - Full POSIX and glibc compatibility, a dynamic linker, and shared
   libraries; the userland target is a statically linked musl userland

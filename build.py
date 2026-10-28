@@ -6,6 +6,7 @@ Usage:
     python build.py run             build + boot in a QEMU window
     python build.py run --fresh     recreate the FAT12 data image, then boot
     python build.py headless        fresh data image + boot headless, verify
+    python build.py x64             build haku64.img (64-bit kernel) and boot it
     python build.py --memory=MB     guest RAM (default 512, max 1020)
     python build.py inspect ...     examine a FAT12 image (see --help there)
 
@@ -20,6 +21,11 @@ Pipeline:
     stage1 + stage2 + kernel.bin --mkimg--> haku.img (boot floppy)
     QEMU boots haku.img and attaches haku_fs.img as primary-master ATA disk,
     plus a generated spare disk on the secondary channel for device scanning
+
+`python build.py x64` is a separate pipeline: entry64.asm + boot64.c are
+compiled for x86-64, linked as a PE32+ image, and booted from the same
+stage1/stage2 floppy as haku64.img. It shares nothing with the i386 link
+line, so neither target can break the other.
 
 The data image (build/haku_fs.img) is user data: an existing image is
 reused as-is so files from previous QEMU sessions survive the build, and
@@ -244,6 +250,106 @@ def detect_toolchain():
     return cc, find_lld_link(), "clang-cl/lld-link (i686-pc-windows-msvc)"
 
 
+def find_x64_toolchain():
+    """Return (cc, linker, label) for x86-64, or exit with a clear reason.
+
+    Windows keeps the x64 tools next to the 32-bit ones
+    (bin\\Hostx64\\x64), so the same VS install covers both. Elsewhere
+    clang-cl is retargeted at x86_64-pc-windows-msvc, mirroring the i686
+    path, so NASM win64 objects, the PE32+ image, and pe2bin line up.
+    """
+    if os.name == "nt":
+        cl = find_msvc()                       # ...\bin\Hostx64\x86\cl.exe
+        x64 = os.path.join(os.path.dirname(os.path.dirname(cl)), "x64")
+        cl64 = os.path.join(x64, "cl.exe")
+        link64 = os.path.join(x64, "link.exe")
+        if not (os.path.isfile(cl64) and os.path.isfile(link64)):
+            sys.exit("x64 MSVC tools not found; install "
+                     "'Desktop development with C++' for x64 in the "
+                     "Visual Studio Installer")
+        return [cl64], [link64], "MSVC cl.exe/link.exe (x64)"
+    cc = find_clang_cl() + ["--target=x86_64-pc-windows-msvc"]
+    return cc, find_lld_link(), "clang-cl/lld-link (x86_64-pc-windows-msvc)"
+
+
+def build_x64(nasm, py, memory_mb):
+    """Build and boot haku64.img: the same floppy, with a 64-bit kernel.
+
+    Only the entry path is 64-bit so far — BIOS -> stage2 -> long mode ->
+    C — which is the foundation the rest of the port builds on. The 32-bit
+    kernel is untouched and remains the default image.
+    """
+    cc, linker, label = find_x64_toolchain()
+    log(f"x64 toolchain: {label}")
+
+    arch32 = os.path.join(ROOT, "kernel", "arch", "x86")
+    arch64 = os.path.join(ROOT, "kernel", "arch", "x86_64")
+    entry_asm = os.path.join(arch64, "boot", "entry64.asm")
+    boot_c = os.path.join(arch64, "kernel", "boot64.c")
+    stage1_asm = os.path.join(arch32, "boot", "stage1.asm")
+    stage2_asm = os.path.join(arch32, "boot", "stage2.asm")
+
+    entry_obj = os.path.join(BUILD, "entry64.obj")
+    boot_obj = os.path.join(BUILD, "boot64.obj")
+    kernel_pe = os.path.join(BUILD, "kernel64.pe")
+    kernel_bin = os.path.join(BUILD, "kernel64.bin")
+    stage1_bin = os.path.join(BUILD, "stage1.bin")
+    stage2_bin = os.path.join(BUILD, "stage2_64.bin")
+    serial = os.path.join(BUILD, "serial64.log")
+    img = os.path.join(ROOT, "haku64.img")
+
+    # 1. the 64-bit entry stub and the first 64-bit C code
+    run([nasm, "-f", "win64", entry_asm, "-o", entry_obj])
+    run(cc + ["/nologo", "/c", "/GS-", "/Zl", "/Os", "/W3",
+              "/Fo" + boot_obj, boot_c])
+    run(linker + ["/nologo", "/MACHINE:X64", "/SUBSYSTEM:NATIVE",
+                  "/ENTRY:entry64", "/BASE:0x10000", "/ALIGN:16", "/FIXED",
+                  "/NODEFAULTLIB", "/OUT:" + kernel_pe,
+                  entry_obj, boot_obj])
+    pe = subprocess.run([py, os.path.join(ROOT, "tools", "pe2bin.py"),
+                         kernel_pe, kernel_bin],
+                        capture_output=True, text=True)
+    print(pe.stdout, end="")
+    if pe.returncode != 0:
+        print(pe.stderr, end="")
+        sys.exit(1)
+    m = re.search(r"^ENTRY=(0x[0-9A-Fa-f]+)\s*$", pe.stdout, re.M)
+    if not m:
+        sys.exit("pe2bin.py did not report ENTRY=")
+    entry = m.group(1)
+    log(f"x64 kernel entry: {entry}")
+
+    # 2. the same two boot stages, aimed at the 64-bit entry
+    run([nasm, "-f", "bin", stage1_asm, "-o", stage1_bin])
+    kernel_sectors = (os.path.getsize(kernel_bin) + 511) // 512
+    run([nasm, "-f", "bin", f"-DKERNEL_ENTRY={entry}",
+         f"-DKERNEL_SECTORS={kernel_sectors}", stage2_asm, "-o", stage2_bin])
+    run([py, os.path.join(ROOT, "tools", "mkimg.py"),
+         stage1_bin, stage2_bin, kernel_bin, str(kernel_sectors), img,
+         stage1_asm, stage2_asm])
+
+    # 3. boot it. qemu-system-i386 refuses long mode without a 64-bit CPU
+    #    model, so this mode uses the x86_64 binary.
+    qemu = find_tool("qemu-system-x86_64",
+                     [r"C:\Program Files\qemu\qemu-system-x86_64.exe"], "QEMU")
+    if os.path.exists(serial):
+        os.remove(serial)
+    proc = subprocess.Popen([qemu, "-m", str(memory_mb), "-cpu", "qemu64",
+                             "-drive", f"file={img},format=raw,if=floppy,index=0",
+                             "-boot", "order=a", "-no-reboot",
+                             "-display", "none", "-serial", f"file:{serial}"])
+    reached = wait_for_serial(serial, "HAKU64-BOOT-OK", 30.0)
+    proc.kill()
+    proc.wait()
+    with open(serial, errors="replace") as f:
+        content = f.read()
+    log("--- serial log (x64) ---")
+    log(content)
+    if not reached:
+        sys.exit("X64 CHECK FAILED: HAKU64-BOOT-OK never appeared")
+    log("X64 CHECK PASSED: HAKU64-BOOT-OK, 64-bit C running in long mode")
+
+
 def run(cmd):
     log("+ " + " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -345,12 +451,21 @@ def main():
     elif init_override or expectations:
         sys.exit("--init and --expect only apply to `probe`")
 
+    if mode == "x64":
+        build_x64(nasm, py, memory_mb)
+        return
+
     kernel_dir = os.path.join(ROOT, "kernel")
     arch_dir = os.path.join(kernel_dir, "arch", "x86")
     include_dir = os.path.join(ROOT, "include")
     verify_abi_headers(include_dir)
     c_files = sorted(glob.glob(os.path.join(kernel_dir, "**", "*.c"),
                                 recursive=True))
+    # The 64-bit sources live under kernel/arch/x86_64 and are built by
+    # `build.py x64`; a 32-bit object file and an x64 one cannot share a
+    # link line, so keep them out of this glob.
+    c_files = [p for p in c_files
+               if os.path.join("arch", "x86_64") + os.sep not in p]
     if not c_files:
         sys.exit("no kernel/**/*.c files found")
     entry_asm = os.path.join(arch_dir, "kernel", "entry.asm")

@@ -1,6 +1,7 @@
 # generated build outputs
 build/
 haku.img
+haku64.img
 
 # release packaging (produced on CI runners, but also reproducible locally)
 package/
